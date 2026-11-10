@@ -1,8 +1,8 @@
+import { SessionStore } from "@mharness/session/server";
 import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { localConfig } from "../../../config/local.ts";
 import { createApp } from "./app.ts";
-import { SessionStore } from "./storage/session-store.ts";
 
 const dataDirectory = new URL("../../../data/", import.meta.url);
 mkdirSync(dataDirectory, { recursive: true });

@@ -1,4 +1,4 @@
-import { sessionRecordSchema, type SessionRecord } from "@mharness/protocol";
+import { sessionRecordSchema, type SessionRecord } from "../api/history.ts";
 import { DatabaseSync } from "node:sqlite";
 
 type Unsequenced<T> = T extends SessionRecord ? Omit<T, "seq" | "timestamp"> : never;
@@ -9,6 +9,7 @@ export type SessionUpdate = Exclude<SessionEvent, { type: "user/message" }>;
 
 /** 从同一次读取获得的持久历史，记录按会话序号升序排列。 */
 export interface SessionHistory {
+  /** 按会话序号升序排列的已提交记录。 */
   records: SessionRecord[];
   /** 最后一条已提交记录的序号，空会话为 0。 */
   cursor: number;

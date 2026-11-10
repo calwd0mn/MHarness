@@ -8,7 +8,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@mharness/protocol": "workspace:*",
+    "@mharness/session": "workspace:*",
     "fastify": "^5.7.0"
   },
   "devDependencies": {

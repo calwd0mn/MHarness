@@ -2,11 +2,11 @@ import {
   createSessionResponseSchema,
   sessionHistoryResponseSchema,
   submitMessageResponseSchema,
-} from "@mharness/protocol";
+} from "@mharness/session/contracts";
+import { SessionStore } from "@mharness/session/server";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createApp } from "./app.ts";
-import { SessionStore } from "./storage/session-store.ts";
 
 test("创建会话仅持久化空会话，历史游标为零", async (t) => {
   const store = new SessionStore(":memory:");

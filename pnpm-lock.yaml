@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
     devDependencies:
       typescript:
         specifier: ~5.9.3
@@ -14,9 +18,9 @@ importers:
 
   apps/server:
     dependencies:
-      '@mharness/protocol':
+      '@mharness/session':
         specifier: workspace:*
-        version: link:../../packages/protocol
+        version: link:../../packages/session
       fastify:
         specifier: ^5.7.0
         version: 5.12.8
@@ -30,9 +34,6 @@ importers:
 
   apps/web:
     dependencies:
-      '@mharness/protocol':
-        specifier: workspace:*
-        version: link:../../packages/protocol
       react:
         specifier: ^19.2.0
         version: 19.3.1
@@ -58,9 +59,22 @@ importers:
 
   packages/protocol:
     dependencies:
+      '@mharness/session':
+        specifier: workspace:*
+        version: link:../session
       zod:
         specifier: ^4.0.0
         version: 4.6.7
+
+  packages/session:
+    dependencies:
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.19.2
 
 packages:
 

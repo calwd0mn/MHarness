@@ -1,0 +1,18 @@
+{
+  "name": "@mharness/session",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": "./src/api/contracts.ts",
+    "./server": "./src/server.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.contracts.json && tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  }
+}

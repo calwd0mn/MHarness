@@ -1,5 +1,6 @@
+/** Session follow 流的业务帧契约。 */
 import { z } from "zod";
-import { attemptIdentitySchema, attemptOutcomeSchema, sessionRecordSchema } from "./records.ts";
+import { attemptIdentitySchema, attemptOutcomeSchema, sessionRecordSchema } from "./history.ts";
 
 const toolCallChunkData = {
   callId: z.string().min(1),
@@ -7,6 +8,7 @@ const toolCallChunkData = {
   arguments: z.string(),
 };
 
+/** 模型尝试的流式片段。工具参数可先分段到达，完整调用用 tool/call 表达。 */
 export const assistantChunkSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("text/delta"), text: z.string() }),
   z.strictObject({ type: z.literal("tool/arguments-delta"), ...toolCallChunkData }),
@@ -18,6 +20,7 @@ const activeAttemptSchema = attemptIdentitySchema.extend({
   nextIndex: z.int().nonnegative(),
 });
 
+/** 按 type 校验单个业务帧。快照包含公开历史，可携带当前草稿。跨帧顺序由消费者处理。 */
 export const followFrameSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("snapshot"),

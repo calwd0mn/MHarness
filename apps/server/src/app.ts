@@ -1,17 +1,16 @@
 import {
   createSessionRequestSchema,
   createSessionResponseSchema,
-  healthPath,
-  healthResponseSchema,
   sessionHistoryResponseSchema,
   sessionParamsSchema,
   submitMessageRequestSchema,
   submitMessageResponseSchema,
-} from "@mharness/protocol";
+} from "@mharness/session/contracts";
+import type { SessionStore } from "@mharness/session/server";
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
+import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
-import type { SessionStore } from "./storage/session-store.ts";
 
 /**
  * 组装会话 HTTP 接口，并在开始处理请求前结算遗留 Turn。

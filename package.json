@@ -10,6 +10,9 @@
     "dev": "pnpm --parallel --filter @mharness/web --filter @mharness/server run dev",
     "typecheck": "pnpm -r run typecheck"
   },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
   "devDependencies": {
     "typescript": "~5.9.3"
   }

@@ -1,11 +1,15 @@
+/** Session 的公开持久记录与历史查询结果。 */
 import { z } from "zod";
+import { sessionParamsSchema } from "./submission.ts";
 
+/** 将一次模型尝试关联到所属 Turn 和 Step。 */
 export const attemptIdentitySchema = z.strictObject({
   attemptId: z.string().min(1),
   turnId: z.string().min(1),
   stepId: z.string().min(1),
 });
 
+/** 单次模型尝试的结局，与整个 Turn 的状态分别表达。 */
 export const attemptOutcomeSchema = z.enum(["completed", "cancelled", "failed", "truncated"]);
 
 const recordHeader = {
@@ -58,6 +62,7 @@ const attemptTerminationSchema = z.discriminatedUnion("outcome", [
   }),
 ]);
 
+/** 公开持久记录按 type 区分载荷，seq 从 1 起，timestamp 为 ISO 日期时间。 */
 export const sessionRecordSchema = z.discriminatedUnion("type", [
   z.strictObject({
     ...recordHeader,
@@ -119,5 +124,13 @@ export const sessionRecordSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+/** 读取时的完整持久历史。cursor 为末条记录的序号，空历史为 0，尚无 Turn 时 latestTurn 为 null。 */
+export const sessionHistoryResponseSchema = sessionParamsSchema.extend({
+  cursor: z.int().nonnegative(),
+  records: z.array(sessionRecordSchema),
+  latestTurn: turnStatusDataSchema.nullable(),
+});
+
 export type AttemptOutcome = z.infer<typeof attemptOutcomeSchema>;
+/** 历史查询和 follow 共用的公开记录。 */
 export type SessionRecord = z.infer<typeof sessionRecordSchema>;

@@ -1,4 +1,5 @@
-import { sessionHistoryResponseSchema } from "@mharness/protocol";
+import { sessionHistoryResponseSchema } from "@mharness/session/contracts";
+import { SessionStore } from "@mharness/session/server";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtempSync, rmdirSync, rmSync } from "node:fs";
@@ -7,7 +8,6 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { createApp } from "../app.ts";
-import { SessionStore } from "./session-store.ts";
 
 function temporaryDatabase(t: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), "mharness-storage-"));
@@ -113,7 +113,7 @@ test("独立进程同时提交时只持久化一个 Turn 和一条用户消息",
     store.createSession("s1");
 
     const submit = `
-      import { SessionStore } from ${JSON.stringify(new URL("./session-store.ts", import.meta.url).href)};
+      import { SessionStore } from "@mharness/session/server";
       const [, databasePath, turnId] = process.argv;
       const store = new SessionStore(databasePath);
       try {

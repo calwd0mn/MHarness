@@ -1,3 +1,2 @@
-export * from "./follow.ts";
-export * from "./http.ts";
-export * from "./records.ts";
+export { approvalParamsSchema, decideApprovalRequestSchema } from "./http.ts";
+export type { ApprovalParams, DecideApprovalRequest } from "./http.ts";

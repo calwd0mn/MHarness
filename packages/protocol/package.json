@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@mharness/session": "workspace:*",
     "zod": "^4.0.0"
   }
 }

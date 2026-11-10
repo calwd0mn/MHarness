@@ -1,6 +1,6 @@
-import { healthPath, healthResponseSchema } from "@mharness/protocol";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
 
 function App() {
