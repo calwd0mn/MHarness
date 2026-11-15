@@ -7,16 +7,16 @@
 ## ADDED Requirements
 
 ### Requirement: 串行批次与配对结果记录
-系统 SHALL 将已提交 assistant 消息中的完整调用按模型顺序串行调度，并为调用保存调度记录与匹配结果。调度记录 SHALL 只表示进入调度，可早于审批，不证明正文已经执行。取消、派发异常或结果未知 SHALL 停止后续派发；成功结果的批次结束意向 SHALL 不提前跳过剩余调用。工具执行与审批 SHALL 不自行推进下一模型步。
+系统 SHALL 将已提交 assistant 消息中的完整调用按模型顺序串行调度，并为调用保存调度记录与匹配结果。调度记录 SHALL 只表示进入调度，可早于审批，不证明正文已经执行。取消、派发异常或满足下文副作用工具超时中止条件时 SHALL 停止后续派发；成功结果的批次结束意向 SHALL 不提前跳过剩余调用。工具执行与审批 SHALL 不自行推进下一模型步。
 
-同一 Session 内的调用键为 `(turnId, stepId, callId)`。`tool/call.data` SHALL 保存调用键，工具名和原始参数由同一 Step 中正式 assistant 消息的匹配调用取得。调度记录可早于参数校验，此时可尚无 `operationId`。每个已提交的调用 SHALL 最终有一个按该键配对的 `tool/result`。
+同一 Session 内的调用键为 `(turn, step, callId)`。调度器 SHALL 从正式 Assistant 消息的同一调用块复制 `id`、`name` 和原始 `arguments` 到 `tool/call.data`，其中 `id` 保存为 `callId`。该事件 SHALL 在工具参数校验前追加。日志重放 SHALL 核对声明、名称及原始参数，拒绝冲突。每个已提交的调用 SHALL 有一个按该键配对的结算。
 
 #### Scenario: 调用正在等待审批
 - **WHEN** 调用已进入调度但审批仍未决定
 - **THEN** 可以观察到调度记录，但工具效果次数为零，不将其显示或解释为正文已执行
 
 #### Scenario: 后续调用尚未派发
-- **WHEN** 前序调用因取消或结果未知触发中止
+- **WHEN** 前序调用因取消或副作用工具超时触发中止
 - **THEN** 不派发后续调用，并为已提交但未执行的调用保存配对结局，结果按模型顺序记录
 
 ### Requirement: 工具能力声明与参数校验
@@ -28,7 +28,7 @@
 
 #### Scenario: JSON 无法解析或参数无效
 - **WHEN** 模型生成的 arguments 不是有效 JSON，或解析后不符合工具输入 Schema
-- **THEN** 系统不创建审批、不执行工具，为原 callId 保存可区分解析或校验失败的结构化工具错误，供模型在后续请求中修正参数
+- **THEN** 系统为原调用保存可区分解析或校验失败的配对错误，跳过该调用的操作登记、审批和执行。同批次后续调用可继续，模型可在下一 Step 修正参数
 
 #### Scenario: 本地工具收到未知字段或错误类型
 - **WHEN** 模型为严格对象传入未声明字段，或传入可转换但与声明类型不同的值
@@ -46,7 +46,7 @@
 - **THEN** 系统保存该调用的结果契约错误，不把无效数据作为成功结果交给模型
 
 ### Requirement: 成功值与展示内容的单向派生
-自有结构化工具 SHALL 先返回并校验成功 value，再从已验证参数和值派生模型 content 及可选 presentationMeta，不接受相互独立的两份成功事实。外部 MCP SHALL 允许 content-only 成功，有结构化结果时保留并按已声明的输出 Schema 校验，不将文本伪装为业务值。只有成功结果 SHALL 能携带 concludeTurn。
+自有结构化工具 SHALL 先返回并校验成功 value，再从已验证参数和值派生模型 content 及可选 presentationMeta，不接受相互独立的两份成功事实。外部 MCP SHALL 允许 content-only 成功，有结构化结果时在运行期保留并按已声明的输出 Schema 校验，不将文本伪装为业务值。只有成功结果 SHALL 能携带 concludeTurn。
 
 #### Scenario: 自有工具返回无效值
 - **WHEN** 成功候选 value 不符合输出 Schema
@@ -58,35 +58,37 @@
 
 #### Scenario: 成功渲染失败
 - **WHEN** 值已校验但模型 content 或展示元数据派生失败
-- **THEN** 保存可区分的契约或渲染错误，不把原值伪装为已成功发布的结果，也不推断副作用已撤销
+- **THEN** 保存 `INVALID_TOOL_OUTPUT` 工具失败。仅当相应派生成功时才可使用其输出，错误不得被解释为副作用已撤销
 
 #### Scenario: 非成功结果携带结束意向
 - **WHEN** 错误、超时、取消或未知候选结果携带 concludeTurn
 - **THEN** 不据此产生成功的批次结束意向，该结局按其错误或中止规则处理
 
-### Requirement: 统一结局与模型可见内容
-系统 SHALL 区分成功、工具错误、超时、取消及结果未知，并分别保存原因与可确认的执行事实。所有结局 SHALL 有与事实一致的模型 content，错误另有结构化 error。timeout 或 cancelled SHALL 能作为 unknown 的原因，不能仅据原因推断未执行。最终 content SHALL 随结局持久化，重放不重新生成；展示元数据 SHALL 不自动进入模型上下文。
+### Requirement: 工具结果与错误归一化
+自有结构化工具的输出契约 SHALL 由输出 JSON Schema、模型内容转换函数 `render` 和可选的展示数据转换函数 `presentationMeta` 组成。Harness SHALL 用同一份已校验的业务值派生模型内容和展示数据。
 
-#### Scenario: 工具业务失败
-- **WHEN** 工具返回可确认的业务错误
-- **THEN** 保存结构化错误及模型可见错误 content，不同时发布成功值或成功结束意向，不把失败视为无副作用证明
+内存工具结果 SHALL 以 `isError` 区分成功和失败。自有结构化工具成功分支 SHALL 携带已校验的 `value`。失败分支 SHALL 携带 `error.message`，可附 `error.info: { name, code }`。成功和失败均 SHALL 提供模型可见的 `content`，均可附展示用 `meta`。继承 `HarnessError` 的工具业务错误可提供稳定错误码，普通异常及策略拒绝可只提供说明文字。
 
-#### Scenario: 远程写操作超时
-- **WHEN** 远程副作用调用已发出，等待超时且无最终结果确认
-- **THEN** 保存 unknown、timeout 原因、可确认的派发事实及准确 content，不只记录一个丢失未知语义的超时标签
+#### Scenario: 输出契约失败
+- **WHEN** 输出 Schema 校验、`render` 或 `presentationMeta` 失败
+- **THEN** 以 `isError: true`、`INVALID_TOOL_OUTPUT` 和模型可见失败内容结算，不携带成功业务值
 
-#### Scenario: 重放未知结局
-- **WHEN** 历史重建遇到已保存的 unknown 结果
-- **THEN** 使用原有 content 与原调用配对，不重新渲染；此前 Turn 已结束时不为解释错误额外请求模型
+#### Scenario: 普通工具错误
+- **WHEN** 工具抛出没有结构化分类的普通错误，或策略仅返回拒绝说明
+- **THEN** 保存失败工具结果和模型可见说明，省略事件级结构化错误，不泄漏凭据或异常堆栈
 
 ### Requirement: 工具结算记录的字段
-`tool/result.data` SHALL 包含调用键、`outcome`、`execution` 和 `content`。已有对应操作时 SHALL 保存其 `operationId`。`outcome` 取 `success`、`tool-error`、`timeout`、`cancelled` 或 `unknown`。非成功结局 SHALL 另存 `reason`，`tool-error` SHALL 另存结构化 `error`。`success` 可带 `presentationMeta` 和 `concludeTurn`，自有结构化工具的成功结果 SHALL 保存已验证的 `value`。
+`tool/result.data` SHALL 保存 `turn`、`step`、可重放的 `message` 和已有的 `operationId`，以及可用的 `meta`、`error: { name, code }`。消息 SHALL 保存稳定 ID、工具来源与调用标识，结果块保存匹配的 `toolCallId`、`isError`、`content`。事件外层的 `sourceEventSeqs` SHALL 引用对应的 `tool/call`，尚未调度时引用 Assistant 声明，替换时引用当前工具结果。替换保留消息身份。持久投影省略原始业务 `value`、输出 Schema 及转换函数。
 
-`execution.dispatch` SHALL 取 `not_started`、`dispatched` 或 `unknown`。只有存在相应证据时 SHALL 写入 `stopConfirmed: true` 或 `resultConfirmed: true`，分别表示执行端停止或最终结果获得确认。
+首版持久工具结果通过 `isError` 及可用的错误码表达结算，不要求 `outcome`、`reason` 或 `execution` 字段。重建模型历史 SHALL 使用已保存消息，展示数据 SHALL 不自动进入模型上下文。
 
 #### Scenario: 参数校验失败时尚无操作标识
 - **WHEN** 进入调度后参数校验失败，尚未生成操作
-- **THEN** 按原调用键保存 `tool-error`、可区分校验失败的原因、错误与模型内容，记录 `execution.dispatch: not_started` 并省略 `operationId`
+- **THEN** 按原调用保存 `isError: true` 和校验失败内容，省略 `operationId`，工具正文不执行
+
+#### Scenario: 重放带展示数据的成功工具结果
+- **WHEN** 自有文件更新工具成功结算并保存了模型内容和 diff 展示数据
+- **THEN** 模型历史直接使用已保存消息，页面读取事件的 `meta`，普通持久结果中没有原始业务值，也不重新运行转换函数
 
 ### Requirement: 审批绑定确切操作
 参数通过校验后 SHALL 写入 `tool/operation`，保存调用键、`operationId`、`toolName`、`toolVersion` 与不可变的 `validatedArgs`。免审批的操作也 SHALL 写入此事件。审批 SHALL 绑定该操作的工具身份、定义版本和参数，执行时 SHALL 使用同一份绑定。
@@ -127,6 +129,25 @@
 - **WHEN** 对已有持久化决定的审批再次提交答复
 - **THEN** 保留该审批原决定，工具正文不会因重复答复再次执行
 
+### Requirement: 审批答复的 HTTP 契约
+审批答复 SHALL 以会话和审批 `id` 定位。服务端 SHALL 从已保存的审批取得绑定的 `operationId`。客户端可提交同意一次或拒绝。首次答复持久化后及同决定重发时 SHALL 返回 `200` 和已保存决定。相反决定、因取消或渠道不可用而关闭的审批 SHALL 返回 `409` 和已保存决定。审批不存在 SHALL 返回 `404`。对已有审批请求但因相应工具结果或 Turn 终态关闭且无已保存决定的审批，SHALL 返回 `409 { code: "approval_not_active" }`。
+
+#### Scenario: 同意响应丢失后重复答复
+- **WHEN** 同意已持久化，客户端重发同意
+- **THEN** 返回 `200` 与原 `allowed-once` 决定，不追加第二条决定或重新触发派发
+
+#### Scenario: 迟到答复与已有决定冲突
+- **WHEN** 已保存同意后收到拒绝，或在审批取消后收到同意
+- **THEN** 返回 `409` 与已有决定，原审批和执行结果保持不变
+
+#### Scenario: 恢复后收到已关闭审批的答复
+- **WHEN** 崩溃修复已结算关联工具或 Turn，只有原 `approval/asked`，旧页面提交答复
+- **THEN** 返回 `409 { code: "approval_not_active" }`，工具正文调用次数保持不变
+
+#### Scenario: 审批标识不存在
+- **WHEN** 在指定会话中找不到对应审批
+- **THEN** 返回 `404`，不创建审批或派发工具
+
 ### Requirement: 工具执行前持久化检查点
 系统 SHALL 在工具正文执行前确认对应 assistant 调用、操作信息及调度调用记录已持久化。需审批时还 SHALL 确认对应的 `approval/decided` 已持久化且为 `allowed-once`。检查点失败 SHALL 阻止工具执行。检查点完成后 SHALL 再次检查取消，再通过原子状态门进入派发。
 
@@ -136,10 +157,10 @@
 
 #### Scenario: 等待检查点时取消
 - **WHEN** 等待工具执行前检查点期间用户取消，检查点随后成功
-- **THEN** 工具仍不执行，系统保存对应调用的未执行取消结果；若在结果保存前崩溃，恢复根据持久调度记录保守结算为未知
+- **THEN** 工具仍不执行，系统保存对应调用的未执行取消结果；若在结果保存前崩溃，恢复根据持久调度记录补写 `TOOL_OUTCOME_UNKNOWN` 失败，不断定工具正文已执行
 
 ### Requirement: 按工具调用结算取消
-系统 SHALL 原子协调取消与工具派发。取消成功阻止派发时，系统 SHALL 按原调用标识保存结构化结果 `outcome: cancelled`、`execution.dispatch: not_started`。调用已发出时 SHALL 发送取消请求并按已确认结果结算，无法确认结果时记为 unknown。多个调用 SHALL 分别结算，已确认结果保留并与原调用配对。
+系统 SHALL 原子协调取消与工具派发。取消成功阻止派发时，系统 SHALL 按原调用标识保存失败结果，错误码为 `ABORTED_BEFORE_DISPATCH`。调用已发出时 SHALL 发送取消请求，保留已确认的工具结果，取消等待且没有最终结果时保存 `ABORTED` 失败。多个调用 SHALL 分别结算，已确认结果保留并与原调用配对。
 
 #### Scenario: 等待审批时用户取消
 - **WHEN** 用户取消尚未获得派发资格的工具调用
@@ -151,7 +172,7 @@
 
 #### Scenario: 已派发工具的取消结果未确认
 - **WHEN** 用户取消已发出的调用，但工具未确认停止或最终结果
-- **THEN** 系统保留已请求取消的事实，工具结算为结果未知，不标记为确认未执行
+- **THEN** 系统保存 `ABORTED` 工具失败，模型内容说明取消经过，不声称工具正文未执行
 
 ### Requirement: 稳定操作标识
 Harness SHALL 为每个逻辑操作生成并持久化稳定的 operationId，并关联模型 toolCallId。相同操作的重复传输 SHALL 复用原标识；模型重新生成调用 SHALL 不被默认判定为原操作。幂等操作的相同标识 SHALL 绑定相同工具和参数。
@@ -176,7 +197,7 @@ Harness SHALL 为每个逻辑操作生成并持久化稳定的 operationId，并
 - **THEN** 工具返回冲突且不产生第二次效果
 
 ### Requirement: 工具批次结束意向
-系统 SHALL 在当前 Step 的工具批次结算完毕后汇总成功结果中的 concludeTurn。明确的工具错误 SHALL 作为已知结局保存，已存在的成功结束意向仍然有效。用户取消、派发异常及结果未知等中止条件 SHALL 优先按各自的规则结算。
+系统 SHALL 在当前 Step 的工具批次结算完毕后汇总成功结果中的 concludeTurn。明确的工具错误 SHALL 作为已知结局保存，已存在的成功结束意向仍然有效。用户取消、派发异常及副作用工具超时等中止条件 SHALL 优先按各自的规则结算。
 
 #### Scenario: 前序工具请求结束且后续工具明确失败
 - **WHEN** 同一批次中工具 A 成功返回 concludeTurn=true，随后工具 B 返回明确错误
@@ -184,10 +205,10 @@ Harness SHALL 为每个逻辑操作生成并持久化稳定的 operationId，并
 
 #### Scenario: 请求结束后发生副作用工具超时
 - **WHEN** 本批已有成功结果请求结束，但后续副作用工具超时且结果未知
-- **THEN** Turn 按工具结果未知结算，不标记为工具批次正常完成
+- **THEN** 保存 `TOOL_TIMEOUT` 工具失败，Turn 按超时中止策略结算，不标记为工具批次正常完成
 
 ### Requirement: 超时按副作用分类结算
-只读工具超时 SHALL 记录 timeout 及模型 content，允许在有限模型步数及只读超时预算内继续。有副作用或能力未知的工具在超时后无法确认最终结果时 SHALL 记 unknown、原因 timeout 并结束本轮，不自动重试、不等待核实、不恢复执行；仅确认停止不能证明此前效果撤销。幂等或结果查询声明 SHALL 不改变此策略。
+只读工具超时 SHALL 保存 `TOOL_TIMEOUT` 失败及模型内容，允许在有限模型步数及只读超时预算内继续。有副作用或能力未知的工具在超时后无法确认最终结果时 SHALL 保存 `TOOL_TIMEOUT` 失败并结束本轮，不自动重试、不等待核实、不恢复执行；仅确认停止不能证明此前效果撤销。幂等或结果查询声明 SHALL 不改变此策略。
 
 #### Scenario: 只读调用超时
 - **WHEN** 只读工具超时且继续预算尚未耗尽
@@ -199,7 +220,7 @@ Harness SHALL 为每个逻辑操作生成并持久化稳定的 operationId，并
 
 #### Scenario: 幂等写工具超时
 - **WHEN** 声明支持幂等与状态查询的副作用工具超时且最终结果未确认
-- **THEN** 调用仍记为 unknown，本轮结束，不查询状态、不自动重试、不继续其他工具
+- **THEN** 调用保存 `TOOL_TIMEOUT` 失败，本轮结束，不查询状态、不自动重试、不继续其他工具
 
 #### Scenario: 超时后迟到结果
 - **WHEN** 本轮因副作用工具超时结束后收到迟到响应
@@ -221,4 +242,4 @@ Harness SHALL 为每个逻辑操作生成并持久化稳定的 operationId，并
 
 #### Scenario: 远程取消没有停止确认
 - **WHEN** 已派发远程调用收到取消请求，但无法确认停止或最终结果
-- **THEN** 记录 unknown、cancelled 原因及模型 content，不标记确认未执行，不自动重试
+- **THEN** 保存 `ABORTED` 失败及模型内容，不声称工具未执行，不自动重试

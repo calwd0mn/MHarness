@@ -369,3 +369,15 @@ DSH 的 `SessionCommandController` 中，command 表示创建会话、提交消�
 5. 为什么模型重试不能默认重放已有副作用的工具？
 6. 为什么 Agent 不直接注入 `Retriever`，而通过 MCP Client 调用 RAG Tool？
 7. 为什么前端 SSE 与 MCP Streamable HTTP 必须使用不同的状态与取消语义？
+
+## 8. Session 内存事件日志的源码映射
+
+以下以 DSH 提交 `d347e703908d0406b7a7ef80e3a0e594d86b2215` 为准，对应 MHarness 任务 1.5。
+
+| 主题 | DSH 来源 | MHarness 落点 |
+| --- | --- | --- |
+| 会话元数据与日志 | `SessionHeader` 将 `id`、创建时间、谱系和格式信息放在事件以外。 `Session` 按 `seq` 定位事件。 [会话类型](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/core/session/src/types.ts#L91) | `session.ts` 的 header 使用 `sessionId`、`createdAt`，分支保存 `parentSession` 和 `isSeeded`。 `session.seq` 是当前事件数，`snapshot(start, end)` 的游标指向完整前缀的末条记录。 |
+| 准备、发布和订阅 | `SessionStore.prepare` 准备实例，`enter` 安装发布钩子并注册实例，`announce` 发创建通知。分支构造向继承前缀追加标记。 [内存 Session 与 Store](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/core/session/src/index.ts#L958) | `SessionStore.prepare` 校验初始日志，`publish` 注册后通过同步监听器发布 `session/created`。普通追加通过 Session 的 `session/event` 通知交付。继承数量由当前会话持有，继承内容及本次标记随初始快照读取。 |
+| 请求配置与消息 | `request/header` 记录生效的请求快照，`user/message` 保存消息本体，`assistant/message` 和 `tool/result` 保存嵌套消息。 `tool/call` 保留原始参数字符串。 [事件定义](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/core/session/src/types.ts#L260) | `events.ts` 保留上述载荷分层和原始参数。自有真实用户消息另含 `requestId`；工具治理补充操作与审批事件，工具结果保留来源引用和已有的 `operationId`。 |
+| 紧凑流与结算 | `assistant/message` 与 `assistant/attempt` 保存带时序的紧凑流，避免逐分片持久化。 [Assistant 结算事件](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/core/session/src/types.ts#L299) | 1.5 在事件边界保留 `stream` 的完整 JSON 内容，结算事件另记录上下文纳入标记。压缩编码、结算及回放消费由 2.5 实施。 |
+| 持久化和检查点 | 持久化服务通过每会话句柄读取和追加。JSONL 提供具体存储，检查点策略在模型或工具调用前等待持久化。 [持久化接口](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/session/session-persistence/README.md) · [JSONL](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/session/session-persistence-jsonl/README.md) · [检查点](https://github.com/deepseek-ai/deepseek-harness/blob/d347e703908d0406b7a7ef80e3a0e594d86b2215/packages/session/session-checkpoint-policy/README.md) | MHarness 按 1.8、1.9、1.10 实施持久化接口、SQLite 和检查点。1.5 的追加和通知代表内存接受。 |

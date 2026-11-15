@@ -8,7 +8,7 @@
 
 **Goals:** 对齐 DSH 的追加日志、历史派生、请求重建、fork、存储 handle、写入所有权和崩溃修复，提供显式 `session.flush()` 检查点；保持连接、Turn、工具操作和会话事实独立，验证审批前不执行、模拟工具幂等及超时结算。
 
-**Non-Goals:** 不引入 Cordis、动态插件加载、serial/waterfall 调用链或 JSONL 编码与历史格式迁移。不保证任意外部工具恰好执行一次，不推断语义相同调用必定是同一操作，不实现等待核实、迟到结果结算、自动重试或跨进程续跑。保留 DSH 的结算后紧凑流记录，不承诺硬崩溃前未结算 token 的恢复或原始网络包回放。权限体系后置，审批不替代身份授权。
+**Non-Goals** 第一期采用固定装配与 SQLite 新格式。工具结果核实、迟到结果结算、工具自动重试、跨进程续跑、权限体系与旧历史格式迁移留待后续。紧凑流保留已结算的统一流分片及时间，硬崩溃时仍在生成的草稿随进程退出。
 
 ## Decisions
 
@@ -23,7 +23,7 @@
 | `packages/session` | Session 业务模块，维护会话核心、持久化能力和 Session API；通过独立入口向浏览器暴露公开契约，向后端暴露服务端能力。目标架构移除 `packages/protocol`。 |
 | `apps/mock-mcp` | 工具接入阶段加入的本地模拟 MCP 服务，独立启动，用于验证工具调用、超时及幂等。 |
 
-后端启动入口固定装配 SessionStore、SessionPersistence、AgentManager、Model Adapter、工具批次调度器、工具执行服务、ApprovalService 与 MCP Client。SessionStore 管理内存 Session，Session 持有不可变日志和派生缓存；AgentManager 管理每会话 ReActAgent 及写 handle 的释放权。ReActAgent 驱动 Turn/Step，协调输入、活跃草稿和订阅顺序。工具执行服务负责参数与结果校验、策略和正文，审批服务负责等待及返回审批决定，批次调度器负责派发顺序和配对结果写日志。HTTP/SSE 负责请求与连接，网络等待在会话提交串行区外执行。
+后端启动入口固定装配 SessionStore、SessionPersistence、AgentManager、LlmRuntime、Provider Adapter、工具批次调度器、工具执行服务、ApprovalService 与 MCP Client。SessionStore 管理内存 Session，Session 持有不可变日志和派生缓存；AgentManager 管理每会话 ReActAgent 及写 handle 的释放权。ReActAgent 驱动 Turn/Step，协调输入、活跃草稿和订阅顺序。工具执行服务负责参数与结果校验、策略和正文，审批服务负责等待及返回审批决定，批次调度器负责派发顺序和配对结果写日志。HTTP/SSE 负责请求与连接，网络等待在会话提交串行区外执行。
 
 事件连接只提供类型化 `on/emit`：监听器同步接收通知，不通过返回值控制流程，不等待异步监听器。注册返回取消订阅函数；emit 按本次派发开始时的监听器快照顺序调用，单个监听器异常独立报告，不阻断其余监听器或撤销已接受事件。持久化监听器同步复制事件并入缓冲，异步数据库错误在 flush 时报告。Session.append 的日志接受与发布过程禁止重入。初始化先绑定持久化再开放生产；关闭先停止生产、排空缓冲、解除监听，再释放 handle 所有权和数据库资源。
 
@@ -32,7 +32,7 @@
 ```text
 React --> HTTP / SSE --> AgentManager --> ReActAgent
                               |              |
-                              v              +--> Model Adapter --> Provider
+                              v              +--> LlmRuntime --> Adapter --> Provider
                        Session / Event Log   |
                               |              +--> Tool Scheduler --> Tool Service --> Tools
                          emit |                     |
@@ -50,19 +50,21 @@ React --> HTTP / SSE --> AgentManager --> ReActAgent
 
 Turn 完成回到 idle，浏览器断线不销毁 Agent。AgentManager 显式关闭时先拒绝新输入、取消当前活动并等待驱动退出，再排空并关闭 handle、解绑和移除实例。空闲 Agent 继续持有写入权，不在每个 Turn 结束时释放；初期省略自动空闲回收、inbox、steering 和自动后台维护调度。
 
-浏览器首次发送时生成 `requestId`，与 `text` 一起提交。重试同一次发送复用原编号和原文，主动再发一条消息使用新编号。后端在会话串行区内先按 `(sessionId, requestId)` 查询已提交记录。命中且正文与校验后保存的正文一致时，返回 `200 {sessionId, turnId}`，即使原 Turn 已结束；正文不同时返回 `409 submission_conflict`。`200` 确认原提交已落盘，执行状态由历史和 SSE 提供，重复请求不创建或重新调度 Turn。
+应用层在 `commands.ts` 提供 `SessionCommandController`，集中承载会话命令并在每个方法显式选择 Agent 激活策略。Session 路由通过装配时注入的命令入口调用 `prompt`。读取和订阅不激活 Agent，创建空会话只写元数据。诸如 fork、rename、selectModel 的命令各自声明激活条件，具体入口依其所属阶段交付。
 
-首次接受时，已有活动 Turn 则返回 `409 turn_active`，等待审批及取消尚未结算均算活动。拒绝时不保存编号或消息，也不排队。会话空闲时，完成 Agent 加载与所有权取得后，按 §2.2 原子提交编号、用户消息与 Turn 开始事件。提交成功后才发布到 Session 并接管调度，之后返回 `202 {sessionId, turnId}`，无需等待 Provider 响应。确认事务未提交时返回未接受，存储恢复和后台排空也不会启动原 Turn。
+`prompt(request: SessionPromptRequest): Promise<SessionPromptValue>` 接收 `sessionId`、客户端生成的 `requestId` 和 `content`。首版 `content` 使用文本块，内部用户消息保存校验后的内容。首版不声明 `mode` 或 `clientTimeZone`。现有消息 HTTP 路径 `POST /api/sessions/:sessionId/messages` 从路径取得 `sessionId`，请求体提供 `requestId` 和 `content`，由路由校验后交给命令。首次受理和重发命中统一返回 `202 { accepted: true }`，Turn 标识与执行状态从 Session 原始事件取得。
 
-事务已提交后，持久日志是接受事实的依据。提交后内存发布或调度交接失败时，若连接仍可响应，返回 `200 {sessionId, turnId}` 确认已提交。后端从持久前缀恢复会话，无法安全接管的 Turn 按故障路径结算，崩溃遗留的 Turn 按中断修复。历史和 SSE 提供执行结局。
+例如，请求体 `{ "requestId": "req-1", "content": [{ "type": "text", "text": "你好" }] }` 首次受理后返回 `202 { accepted: true }`。原响应丢失时，即使原 Turn 仍在运行，重发 `req-1` 也返回相同结果。此时发送新编号 `req-2` 则返回 `409 { code: "agent_busy" }`。
 
-若提交结果暂时未知，关闭该会话的新任务和外部效果准入。先确认原事务已终止，再按 `(sessionId, requestId)` 核对可靠的持久记录。若发送响应时仍不能确认，返回 `503 {code: "submission_pending"}`。同编号重发在未核对前也返回待确认，不再次写入或调度。确认回滚时返回 `503 {code: "submission_not_accepted"}`，释放本次暂存，恢复后可以按原编号重试。客户端遇到响应丢失或待确认响应时保留本次编号和正文。
+会话命令完成必要的恢复校验并取得写入权后，在同一 Session 串行区内先查 `requestId`，再执行新请求的状态检查和受理。命中直接确认首次受理，即使当前内容不同或 Agent 非空闲也沿用首次内容。客户端改动内容后使用新编号。未命中时仅 `idle` 可受理，其他 Agent 状态返回 `409 { code: "agent_busy" }`。被拒绝的新编号不占用，也不排队。
 
-取消入口为 `POST /api/sessions/:sessionId/turns/:turnId/cancel`，只作用于指定活动 Turn。成功表达已接受取消请求，不保证已经终态；重复取消不产生额外效果，旧 Turn 的迟到请求不能取消新 Turn。最终结算由历史与 SSE 确认。具体取消响应状态码及错误字段留待 HTTP 协议讨论，不在本轮补定。
+首次受理时依次调用 `Session.append()` 追加 `turn/start`、首个 `step/start` 和真实用户的 `user/message`。每次追加独立接受并发布 `session/event`。用户消息已追加且执行循环接管后才确认受理。该响应无需等待 Provider 或磁盘写入。首次模型请求前显式 flush，失败时阻止模型调用，后续执行失败沿 Turn 的故障路径处理。编号从本会话已接受的用户消息派生，重启后从已提交前缀重建，继承消息不登记为子会话自身受理。若原事件在进程退出时尚未落盘，重开后原编号按未命中处理。
+
+取消入口为 `POST /api/sessions/:sessionId/cancel`。命令按 `sessionId` 查找已挂载的 Agent 并调用 `agent.cancel(cause, options)`，返回 `202 { accept: true }`。`running` 时取消处理请求那一刻的当前 Turn，`maintenance` 时触发 `runMaintenance()` 持有的信号，`idle` 时直接确认受理。未挂载时返回 `404 { code: "session/not-found" }`。该入口只查找现有实例。任务结算由历史与 SSE 确认。
 
 #### 1.2 标识来源
 
-sessionId、turnId、stepId、attemptId 由后端生成，消息提交的 requestId 由客户端生成并在所属 Session 内使用。callId 保留模型返回值，在所属 Step 内关联，不单独作为全局键。参数校验后由后端生成 operationId，绑定工具、版本与不可变参数。前端引用后端已返回标识，模型不得指定 operationId；调度和历史重建始终携带所属 Session/Turn/Step，避免跨会话或跨 Step 误配。
+`sessionId` 由后端生成。`turn` 在 Session 内从 1 递增，`step` 在每个 Turn 内从 1 递增。重启从已提交日志继续分配，fork 保留继承前缀中的编号，再从子日志已有的最大轮次继续。崩溃时尚未落盘的编号可重新分配。新消息的 `message.id` 使用 UUID，继承和工具结果替换保留原值。同一消息 ID 可出现在父子会话中，数据库不得给 `message.id` 添加跨会话唯一约束。事件以 `(sessionId, seq)` 定位。`requestId` 由客户端生成，仅用于同会话自有用户消息的查重。`attemptId` 由 `AssistantStreamAttempt` 用于关联 Agent 生命周期内的实时流。`callId` 保留模型返回值，按 `(turn, step, callId)` 在所属 Session 内关联。参数校验后由后端生成 `operationId`，绑定工具、定义版本与不可变参数。Provider 要求请求内调用 ID 唯一时，由 Adapter 成对转换发出的调用 ID 和结果引用。
 
 #### 1.3 业务模块拥有契约与预期组织
 
@@ -75,10 +77,11 @@ flowchart LR
 
     subgraph SESSION["Session 业务模块"]
         CONTRACT --> DATA["api/ 下的公开 Schema 与类型"]
-        SERVER --> ROUTES["路由与公开映射"]
+        SERVER --> ROUTES["路由与事件封装"]
         ROUTES --> DATA
         ROUTES --> SERVICE["Session 服务与核心"]
-        SERVICE --> EVENTS["内部事件"]
+        SERVICE --> EVENTS["Session 事件数据"]
+        DATA --> EVENTS
         SERVICE --> PORT["持久化接口"]
         SQLITE["SQLite 实现"] --> PORT
     end
@@ -93,9 +96,11 @@ apps/
     app.ts                       固定装配、注册业务路由
     agent/
       agent-manager.ts           Agent 实例与生命周期
+      commands.ts                会话命令与显式 Agent 激活策略
       react-agent.ts             执行循环
     model/
-      adapter.ts                 模型接入接口及相关参数、结果
+      runtime.ts                 统一模型入口、配置与失败流归一化
+      adapter.ts                 厂商接入接口及相关参数、结果
       providers/                 具体模型接入
   web/src/features/session/
     session-api.ts               HTTP 调用与响应解析
@@ -106,14 +111,13 @@ packages/
   session/src/
     api/
       submission.ts              消息提交请求、响应 Schema 与类型
-      history.ts                 公开历史记录与查询结果
+      history.ts                 原始事件记录封装与历史查询结果
       follow.ts                  SSE 业务帧
       contracts.ts               选择性导出浏览器可用契约
       routes.ts                  Session 路由注册
-      public-record.ts           内部日志到公开记录的映射
     session.ts                   Session 行为及相关参数、结果
     events.ts                    内部持久事件及边界校验
-    service.ts                   创建、提交等会话用例
+    service.ts                   创建、读取等 Session 用例
     persistence.ts               持久化接口及相关参数、结果
     storage/sqlite.ts            SQLite 实现及专有结构
     server.ts                    服务端公共入口
@@ -124,9 +128,9 @@ packages/
 | 定义 | 所有者与位置 | 消费方式 |
 | --- | --- | --- |
 | 消息提交请求、响应 | Session API 的 `api/submission.ts` | 运行时边界用 Zod 4 定义并用 `z.infer` 推导类型；路由和浏览器共用。 |
-| 公开历史记录 | Session API 的 `api/history.ts` | 历史查询与 `api/follow.ts` 共用，不能充当内部事件定义来源。 |
+| 历史记录封装 | Session API 的 `api/history.ts` | 历史查询与 `api/follow.ts` 共用 `{ type: "event", event }`，事件正文沿用 Session 事件的数据契约。 |
 | SSE 业务帧 | Session API 的 `api/follow.ts` | 服务端发布与浏览器消费共用。 |
-| 内部 Session 事件 | `events.ts` | 日志、派生和持久化使用；公开映射按需要转换。 |
+| Session 事件 | `events.ts` | 日志、持久化、模型派生和历史契约共用纯数据定义。 |
 | Session 操作选项与结果 | 默认共置于 `session.ts` 或使用它的功能文件 | 已校验的进程内结构直接用 TypeScript 类型。 |
 | SessionPersistence、SessionHandle 及相关约定 | `persistence.ts` | 由会话能力定义，调用方与 SQLite 实现共同遵守。 |
 | SQLite 行结构与事务辅助类型 | `storage/sqlite.ts` | 不上提到公共契约。 |
@@ -135,7 +139,7 @@ packages/
 
 前端从 `@mharness/session/contracts` 导入公开 Schema 与类型，后端装配从 `@mharness/session/server` 导入服务端能力，模块内部直接相对导入具体功能文件。`api/contracts.ts` 只选择性导出，定义保留在所属功能文件。内部存在类型文件不自动产生 `/types` 公共入口；纯类型依赖使用 `import type`、`export type`。`types.ts` 默认承载纯类型声明，运行时解析和校验留在具体功能模块。
 
-浏览器契约入口的完整运行时与类型依赖链均不能引入 Fastify、SQLite、Node.js 资源或服务端实现；仅使用 `import type` 不足以保证隔离。包的 `exports`、依赖声明和编译配置应与这两个入口一致。Session 核心不依赖其 API 层，内部事件不从公开记录反向推导；表示与语义相同时可复用稳定数据定义，出现字段可见性、序号或生命周期差异时由 API 显式映射。
+浏览器契约入口的完整运行时与类型依赖链均不能引入 Fastify、SQLite、Node.js 资源或服务端实现；仅使用 `import type` 不足以保证隔离。包的 `exports`、依赖声明和编译配置应与这两个入口一致。Session 核心独立拥有事件契约，Session API 复用其可在浏览器加载的 Schema 和推导类型，并负责传输封装。追加和重放所用的关联校验若依赖会话运行状态，留在核心行为中。
 
 后续审批等能力按相同所有权原则组织，形成独立职责和消费者时再确定是否建立独立包，不复制空目录层级。本设计不引入 DSH 的声明合并、插件装配或 RPC 机制。
 
@@ -143,37 +147,85 @@ packages/
 
 ### 2. Session 事件日志与派生状态
 
-会话层级采用 Session → Turn → Step → Attempt。Turn 由 `turnId` 标识，涵盖用户输入到本轮结算。Step 包含为同一次模型决策发起的一个或多个 Attempt，以及模型成功提交后产生的工具批次。Attempt 对应一次模型调用尝试，可在准备阶段结束。同一 Step 内重试会生成新 `attemptId`，沿用原 `stepId`。第一版不自动重试。当前 Step 完成本批工具后，如果 Turn 仍需模型续答，下一次请求属于新 Step 的第一个 Attempt。
+会话层级采用 Session → Turn → Step。Step 包含同一次模型决策的一次或多次模型尝试及成功后产生的工具批次。当前 Step 完成工具批次后，模型续答属于下一 Step。输入上下文超限后的压缩重试仍属于同一 Step，每次开启实时流时分配新的 `attemptId`。
 
-Session 事实来源是只追加事件日志，Session 创建时的元数据 header 独立保存。append 在改动日志前完成无损 JSON 校验、脱离调用方引用的深快照和 surface 校验，接受后事件深度冻结。事件位置 `seq` 为从 0 开始的安全整数，`cursor` 为日志长度及下一事件位置，范围读取采用半开区间。用户消息、assistant 消息、工具调用与结果、Turn/Step 边界、Attempt 结算、`request/header`、`request/prepared` 和审批均由类型化事件表达。HTTP 状态摘要由这些事件投影，不形成另一份独立可写事实。
+Session 的事实来源是只追加日志，会话元数据 header 独立保存。事件外壳为 `{ type, seq, time, data }`，由 `type` 决定 `data`。`seq` 从 0 连续递增，`session.seq` 是事件数及下一条的位置。`time` 与 `createdAt` 使用非负安全整数 Unix 毫秒。内存范围快照的 `cursor` 是完整前缀的最后位置，空前缀为 `-1`。追加前验证无损 JSON、关联和 surface 操作，并取得独立深快照，接受后递归冻结。接受失败时序号、日志和通知均保持原样。
 
-surface 对用户消息、assistant 消息和工具结果维护有序模型历史，支持 append 与位置替换，并校验来源事件及被覆盖节点。替换只改变后续模型输入，不删除原日志；人类历史保留原发生事实，不把替换副本显示为新的交互。`deriveMessages()` 从 surface 派生消息，复用不可变节点并返回独立数组。完整日志快照、按位置读取、范围快照及替换后的缓存失效均与参考基线对照验证。`includeInModelContext` 保留为本项目结算选择属性，与 surface 共同决定模型输入。
+进程内写入方通过类型化的 `Session.append()` 提交事件。`type` 在编译期约束 `data`，输入和返回类型均由 Session 核心维护的共享事件 Schema 推导。返回的不可变事件保留输入的事件类别。例如，追加 `tool/call` 的调用方可以直接读取返回事件的 `data.callId`。输入涵盖多个事件类别时，返回相应类别的联合。`seq` 由 Session 分配。追加继续校验实际载荷，依赖当前日志的关联规则由 Session 判断。持久化重放接收未经信任的原始记录，按同一事件 Schema 校验，并核对记录原有序号与重放位置。
 
-fork 复制稳定历史前缀。首批 fork 验收使用已提交的 `turn/end`，压缩阶段加入独立压缩的 `compaction/end` 截点，两者均要求此前没有未闭合的 Turn 或压缩。子会话保存父会话、分支位置等 lineage 和准确的继承事件数量。继承部分与子会话自有事件可分别读取，双方后续追加互不影响。此处交付核心 API 和测试，不增加 fork 页面或 HTTP 入口。
+只有 `user/message`、`assistant/message` 和 `tool/result` 参与 surface。它们在事件外层声明 `surfaceOp: "append"` 或 `surfaceOp: { op: "replace", start, end }`，替换用外层 `sourceEventSeqs` 引用被覆盖节点。`user/message.data` 直接保存消息的 `id`、`role`、`source` 和 `content`。真实用户消息另带 `turn` 和 `requestId`。压缩摘要使用 `source: { kind: "compact", compactionId }` 并分配新消息 ID。Assistant 和工具结果的消息本体放在 `data.message`。工具结果替换在日志追加完整结果，保留原消息身份与关联，仅改动模型可见 `content`。`deriveMessages()` 复用不可变节点并返回独立数组。普通追加增量扩展缓存，替换使缓存失效并递增 `replaceGeneration`。聊天视图继续显示原始交互。
+
+`SessionCommandController.fork({ sessionId, atSeq? })` 从同一份父会话快照选取稳定前缀。已加载父会话用内存快照，未加载时用 `handle.read()`。锚点在 Turn 内时选该 Turn 的 `turn/end`，锚点在两轮之间时归到上一轮。省略锚点或超过已观察到的末尾时，选最近已经结束的 Turn。选定后包含直到下一轮 `turn/start` 之前的事件。遇到未闭合的独立压缩时回退到该次 `compaction/start` 前。没有已结束的 Turn，或锚点在尚未结束的 Turn 内时，返回 `session/fork-unavailable`。fork 只依赖这份父快照，父会话无需写入或 flush。
+
+`cut` 是排他的父日志结束位置。子 Session 加载 `source.events.slice(0, cut)`，并保存 `inheritedEventCount: cut` 和 header 中的 `parentSession`、`isSeeded: true`。子会话自己的 `session/end-seed { inherited: true }` 在 `seq=cut`，是第一条自有事件。多层 fork 可能复制祖先的标记，各会话按自己的 `inheritedEventCount` 划界。继承事件保留 `seq`、原标识和关联，包括继承用户消息的 `requestId`。
+
+`commands.create()` 负责空会话，`commands.fork()` 计算 seed 并交给 Agent 初始化。初始化通过 `persistence.create(childHeader, { inheritedEventCount: cut, signal })` 取得准备中的写 handle，首次 `append()` 原子提交子 header、继承数量、seed、标记和初始化新增事件。成功后绑定普通写入器，发布子 Session 和 Agent，再发出 `session/created`。初始化事件由初始快照交付。子会话重启直接读取自己的持久日志，即使父会话实际落盘的前缀更短。
 
 运行协调器持有活动任务、AbortController 和订阅者，在持有写入所有权的前提下串行接受输入，同一会话最多有一个活动 Turn。数据库若保留 Turn/审批等查询索引，必须与事件在同一事务更新且可从日志重建，不允许绕过日志单独改变业务状态。
 
-Turn 状态包括 running、awaiting_approval、succeeded、truncated、failed、cancelled、interrupted。成功原因区分 model_completed 与 tool_concluded，截断原因记录 output_limit，失败原因包含 tool_result_unknown、provider_error、budget_exhausted 等。tool_run 使用 pending、awaiting_approval、running、succeeded、failed、cancelled、unknown，reason 单独表达 timeout、connection_lost、process_interrupted 等原因。未发出调用可以确认取消，已发出但无法确认是否中止的调用记为 unknown。只读超时可记 failed / timeout，表示本次查询未取得有效结果，不推断远端已停止。
+`turn/start.data` 为 `{ turn }`，`step/start.data` 与 `step/end.data` 为 `{ turn, step }`，`turn/end.data` 为 `{ turn, reason }`。`reason` 按 `kind` 区分 `completed`、`aborted`（附 `reason: TurnEndCancelCause`）、`blocked`、`error`（附 `error: LlmFailure`）、`max-tokens` 和 `interrupted`。正常回答与工具批次主动结束都用 `completed`。`interrupted` 由崩溃修复写入。`running` 和 `awaiting_approval` 等展示状态由活动范围与审批记录派生，浏览器派生规则见 §8。
 
-这些状态是对日志的投影。单一 failed 无法区分明确失败和结果未知；并行维护独立消息和状态事实则会偏离 DSH 的 Session 设计。
+公开状态由会话日志投影，不另设可独立修改的消息或状态事实。
 
 #### 2.1 存储服务与每会话 handle
 
-SessionPersistence 提供 `create/open/stat/list` 及所有活跃写 handle 的统一 flush，create/open 返回 SessionHandle；handle 提供 `id/header/access/inheritedEventCount`、`read/append/flush/close`。read handle 不取得写入权，可在写入者存活时观察；write handle 是会话的唯一修改者。读取不倒退，append 接受后在同一后端上后发起的读取至少看到该前缀；并发读取只保证有效连续前缀。stat/list 返回 header、变更标记和可廉价取得的事件数，不扫描完整正文。统一 flush 尝试处理所有活跃写 handle 并汇总失败，不因一个会话失败跳过其余会话。
+持久化接口归 Session 模块。每个 handle 绑定一个会话并持有只读元数据 `id`、`header`、`access`、`inheritedEventCount`。`SessionHeader` 包含 `sessionId`、`createdAt`，分支还包含 `parentSession` 和 `isSeeded: true`。以下是约定的签名，其中 `SessionAccess` 为 `"read" | "write"`。
+
+```ts
+interface SessionPersistenceCreateOptions {
+  readonly inheritedEventCount?: number
+  readonly signal?: AbortSignal
+}
+
+interface SessionPersistenceSnapshot {
+  readonly header: SessionHeader
+  readonly inheritedEventCount: number
+  readonly eventCount: number
+}
+
+abstract class SessionPersistence {
+  abstract create(header: SessionHeader, options?: SessionPersistenceCreateOptions): Promise<SessionHandle>
+  abstract open(sessionId: SessionId, access: SessionAccess): Promise<SessionHandle | undefined>
+  abstract stat(sessionId: SessionId): Promise<SessionPersistenceSnapshot | undefined>
+  abstract list(): Promise<readonly SessionPersistenceSnapshot[]>
+  abstract flush(): Promise<void>
+}
+
+interface SessionHandle {
+  readonly id: SessionId
+  readonly header: SessionHeader
+  readonly access: SessionAccess
+  readonly inheritedEventCount: number
+  read(offset?: number, length?: number): Promise<readonly SessionEvent[]>
+  append(events: readonly SessionEvent[]): Promise<void>
+  flush(): Promise<void>
+  close(): Promise<void>
+}
+```
+
+`create()` 取得写入权并准备元数据，根会话的继承数默认是 0。创建参数的 `signal` 用于取消取得写 handle 的过程。`open()` 显式指定访问模式，普通打开和 `stat()` 查询不到已提交会话时返回 `undefined`。已有写入者时仍可用只读 handle，写入打开报可区分的所有权冲突。只读 handle 调用写操作时拒绝。`stat()`、`list()` 以已提交元数据和事件总数回答查询，无需扫描事件正文。`eventCount` 包含继承事件、seed 标记及新增事件。
+
+`handle.read()` 默认返回完整的已提交事件数组，供 HTTP 持久历史、恢复及未加载会话的 fork 使用。`offset` 默认 0，省略 `length` 时读到该次截点的末尾。参数须为非负安全整数，`offset` 不能超过此次读取的已提交事件数。提供 `length` 时，完整区间 `[offset, offset + length)` 须落在该前缀内。已提交 `0..7` 时，`read()` 返回 8 条，`read(8, 0)` 返回空数组，`read(0, 10)` 报范围未覆盖。读取无需排空缓冲。实时 follow 和已加载会话的 fork 直接取内存快照，例如内存另外接受 `8..9` 时可读到 10 条。HTTP 查询和 follow 的 cursor 直接取所读取前缀末条事件的序号。
 
 SQLite 使用 `node:sqlite`，SQL 集中在后端。header 与事件分开保存，事件以 `(sessionId, seq)` 唯一，事务校验并追加连续批次与必要查询索引，成功后才推进持久游标。schema 使用单调版本号；未知版本、事件词汇或无效记录拒绝读取，不跳过损坏记录。JSONL 压缩、尾行截断与文件世代迁移不移植到数据库。
 
-create 可先登记内存空会话，flush 必须使空 header 在数据库中可被其他进程观察。HTTP 创建在返回 201 前显式 flush，保留创建成功即可持久读取的约定。通用 append 只保证有序接受和同后端可见性，flush 才保证此前接受的追加持久化；SQLite append 可以直接提交事务，提供更强保证。关闭后操作均拒绝；close 幂等且不可取消，写 handle 完成待持久化工作并释放所有权，失败仍释放资源并报告。
+创建写 handle 时先校验 ID、取得写入权并暂存 header 和继承数量，普通 `stat/list/open` 只观察已提交的会话。首次 `await handle.append(events)` 在同一 SQLite 事务写入 header、继承数量和整个初始批次，提交成功后才返回。后续 append 各自在事务中校验并提交连续批次。直接调用写 handle 的 append 已提供持久化确认；普通运行的 `session.flush()` 仍负责排空尚在写入器缓冲中的事件。
+
+普通创建用写 handle 的显式 `flush()` 提交空 header，成功后 HTTP 返回 201。已发布会话关闭时先处理待写事件，再释放资源和所有权，失败时同样释放并报告错误。读写 handle 均由持有者 `close()`，关闭幂等且不可取消，关闭后其他操作拒绝。放弃准备中的会话时，关闭只释放资源和写入权。后端统一 flush 只处理已接入活跃写入器的会话。
 
 #### 2.2 缓冲、串行写入与显式检查点
 
-Session.append 同步更新内存日志并 emit，持久化模块按会话复制并缓冲事件，以 DSH 的 200ms 批处理等待窗口为初始策略；计时器只触发排空，不承诺 200ms 内落盘。每个 write handle 的追加、flush 和关闭排空走同一串行队列，并发排空共享在途任务。失败批次保序保留，错误对 flush 可见，不静默丢弃；成功提交前不清除需重试的缓冲。
+`Session.append()` 同步更新内存日志，已发布的 Session 发出 `session/event`。每个写入器只订阅所属 Session，并在自己的队列中缓冲这些事件。初始化期间经写 handle 提交的事件已由初始快照交付，后续写入队列从新事件开始。
 
-对外入口为 `await session.flush()`，内部委托绑定 handle 排空事件并确认提交，持久游标须覆盖调用开始时的日志位置；未绑定、入队失败或未覆盖该位置均报错。创建成功响应前、模型请求前、工具正文前、结算通知前及关闭时均设检查点。工具调度记录、操作信息和有效审批先 flush，再检查取消并进入正文。对应检查点失败时不启动模型生成或工具正文，不发布引用未持久记录的完成帧。Adapter 不负责调用 Session 检查点。
+首个待写事件启动固定窗口，初始值为 200ms，后续到达的事件加入缓冲且不重置截止时间。到期时把当前待写事件交给该 handle 的串行写入链，写入期间到达的事件进入下一批。窗口仅决定何时开始排空，各批始终按事件序号写入。
 
-对已进入内存日志的事件，检查点失败时协调器停止会话的新任务和外部效果，保持日志与批次顺序，供显式 flush 重试。确认提交后才能恢复相关发布。只读历史和订阅快照从已确认持久前缀构建。硬崩溃可能丢失检查点之后的缓冲尾部，恢复不能凭空补造。
+显式 `session.flush()` 取消等待窗口，等待在途写入，调用 `drainLive()` 排空路由缓冲，再执行写入器的持久性屏障 `writer.flush()`。后端统一 `flush()` 捕获调用时的活跃 writer 列表，逐个执行相同步骤。某个 writer 失败时继续处理余下会话，最后抛出 `AggregateError`，每项保留 `sessionId` 和原错误。确认回滚的失败批次回到队首，暂停自动定时重试，显式 flush 或关闭时可重试。屏障失败时，已确认提交的批次保持原提交状态。
 
-消息接受使用独立的暂存路径。在会话串行区内先确认此前已接受的前缀落盘，再校验并暂存携带 `requestId` 的用户消息和 Turn 开始事件，以同一 SQLite 事务提交两条记录、持久游标和去重索引。索引以 `(sessionId, requestId)` 为唯一键，指向原 `turnId`，可从当前会话自身接受的日志事件重建；fork 继承的消息不登记为子会话的提交。提交前暂存批次不进入内存日志、普通持久化缓冲或订阅。确认回滚时丢弃该批次，编号仍可用于重试，消息、Turn、历史与游标保持原状。提交成功后按持久序号发布到内存一次，持久化监听器跳过这批已提交事件，避免重复入队。
+对外入口为 `await session.flush()`，内部委托绑定 handle 排空事件并确认提交，持久游标须覆盖调用开始时的最后事件位置 `session.seq - 1`；未绑定、入队失败或未覆盖该位置均报错。创建成功响应前、模型请求前、顶层工具正文前及关闭时均设检查点。工具调度记录、操作信息和有效审批先 flush，再检查取消并进入正文。对应检查点失败时不启动模型生成或工具正文，若检查点失败导致当前 Turn 停止，向前端报告执行失败。Adapter 不负责调用 Session 检查点。
+
+检查点失败时协调器暂停该会话的新任务和外部效果，保持日志与缓冲顺序。持久化后端负责确认事务结局，提交成功后才确认相应位置。确认整批回滚且写入权仍有效时允许重试原批次。结果有待核对时，先确认原事务已结束，再读取已提交事件，初次创建同时核对 header 和继承数。完整批次一致时按成功处理，确认整批未提交时可重试。读取失败、部分匹配或内容冲突时向调用方报告并保持写入阻塞，下一次显式 flush 先重新核对。现有已确认历史和实时内存状态仍可观察。
+
+prompt 受理的三条事件依次进入普通缓冲，可进入不同批次。首次模型调用前的检查点覆盖当次消息快照以及生效的配置 header。压缩等先提交再发布的操作使用独立的暂存批次。
 
 #### 2.3 所有权与崩溃修复
 
@@ -191,29 +243,33 @@ Session.append 同步更新内存日志并 emit，持久化模块按会话复制
 
 在 Windows 11（构建 22631）、Node.js 24.13.0 和 SQLite 3.50.4 上，进程 A 用相对路径取得实例锁与会话 A 的锁。业务库创建前后，进程 B 用绝对路径、大小写别名和 junction 路径申请实例锁均得到 `SQLITE_BUSY`。进程 B 申请会话 A 的锁失败，申请会话 B 和另一业务库的实例锁成功。进程 A 持锁期间，进程 B 用只读连接取得业务库中已提交的 `seq=0` 记录。强制结束进程 A 后，锁文件仍在，进程 B 能重新取得实例锁和会话 A 的锁。
 
-持有实例锁后，启动阶段检查遗留活动会话，逐个取得临时 write handle、修复并 flush，随后关闭，不创建 ReActAgent 或恢复执行，使用户无需先发消息即可查询中断历史。首次加载也按同一恢复规则检查。所有权冲突的会话不修改，真实存储或修复错误不能伪装成已恢复。数据库负责物理事务完整性，Session 恢复负责语义完整性。
+持有实例锁后，启动阶段检查遗留活动会话，逐个取得临时 write handle，提交修复批次后关闭，不创建 ReActAgent 或恢复执行，使用户无需先发消息即可查询中断历史。首次加载也按同一恢复规则检查。所有权冲突的会话不修改，真实存储或修复错误不能伪装成已恢复。数据库负责物理事务完整性，Session 恢复负责语义完整性。
 
-修复扫描最后未闭合 Turn/Step，以 assistant 消息中的调用为全集，按 Step 和 callId 关联 `tool/call` 与 `tool/result`。无调度调用记录的未配对调用补充 `cancelled / not_started`、原因为 `process_interrupted`；有 tool/call 而无结果的一律保守补充 `unknown / process_interrupted`，即使可能仍在等待审批，也不从调度记录推断正文已经执行或未执行。已有结果保持原样，未决审批作废。随后关闭遗留 Step 和 Turn，经同一 handle append 并 flush 后才发布恢复成功；重复恢复不重复追加，不重新执行工具或自动续跑。
+恢复通过 `handle.read()` 取得已提交日志，由 `interruptedTurnClosers()` 按 `(turn, step, callId)` 从 Assistant 调用声明匹配调度及结果。缺结果时按原声明顺序补 `isError: true` 的 `tool/result`。已有 `tool/call` 时用 `TOOL_OUTCOME_UNKNOWN` 并引用该调度事件，尚无调度事件时用 `TOOL_NOT_STARTED` 并引用 Assistant 声明。已有 `tool/operation` 时沿用其 `operationId`。调度与结果需引用更早的有效声明，重放时校验调度保存的工具名和原始参数。冲突或孤立引用导致加载失败，修复批次保持未提交。工具结果的 surface 替换沿用同一次调用的结算身份。
+
+恢复把缺失工具结果、实际打开的 `step/end` 和 `turn/end { turn, reason: { kind: "interrupted" } }` 合在一次写 handle 的 `append()`。前缀止于 `turn/start` 时只关闭 Turn。缺失的 `user/message` 保持缺失，对应 `requestId` 仍可受理。待决 `approval/asked` 保留，由对应结果或 Turn 终态关闭待审批状态。重复恢复只读到已结算前缀，模型与工具调用次数保持不变。
+
+只读查询可从已提交前缀临时推导中断和缺失结果。临时结果只属于查询视图。`handle.read()`、HTTP 持久历史及历史游标反映真实已提交的事件。同进程 live Session 按实时事实展示活动 Turn。
 
 #### 2.4 会话压缩
 
-纯文本问答验收前只交付 `surface` 替换及重放。后续阶段通过内部入口触发摘要压缩。独立压缩在会话串行区取得 `maintenance` 占用。Turn 内压缩由现有 Turn 在已闭合 Step 与下一次模型请求之间发起，继续占用 `running`。任务占用与存储准入分别维护。独立压缩期间，同编号已提交消息仍可确认，新编号返回 `409 {code: "session_busy"}`。Turn 内压缩沿用 `turn_active`。
+纯文本问答阶段交付 `surface` 替换及重放。压缩阶段的手动入口通过 `agent.runMaintenance()` 从 `idle` 取得 `maintenance` 占用，取消信号传给实际压缩。自动压缩由正在运行的 Turn 在输入上下文超限的 Assistant 失败结算后触发，压缩和重试留在原 Step 并继续占用 `running`。独立压缩和 Turn 内压缩期间，同编号已受理消息仍可确认，新编号返回 `409 { code: "agent_busy" }`。
 
-在串行区确认 `compaction/start` 落盘，取得选区节点序列及对应的不可变模型输入，再在区外调用摘要模型。历史与 follow 仍可读已提交事实。提交时回到串行区重新定位选区，比较完整节点序列并复用 `surface` 替换与工具配对校验。只有选区本身变化或替换校验失败才因冲突拒绝。
+在串行区确认 `compaction/start` 落盘，取得选区节点序列及对应的不可变模型输入，再在区外调用摘要模型。HTTP 历史可读已提交日志，follow 可观察已接受的内存事件。提交时回到串行区重新定位选区，比较完整节点序列并复用 `surface` 替换与工具配对校验。只有选区本身变化或替换校验失败才因冲突拒绝。
 
-复用暂存提交路径，将 `compaction/summary`、摘要替换和成功 `compaction/end` 放在同一事务。提交确认后才更新内存视图。已确认的终态优先于迟到取消。结果待核对时维持存储阻塞，等原事务终止后读取持久日志，只有确认本次写入未提交且已提交的开始记录仍无终态时才补写结算。启动修复先结算遗留压缩，再关闭实际打开的 Step 和 Turn。重放与 fork 共用持久记录，公开历史继续显示原始交互。
+复用暂存提交路径，将 `compaction/summary`、摘要替换和成功 `compaction/end` 放在同一事务。提交确认后才更新内存视图。已确认的终态优先于迟到取消。结果待核对时维持存储阻塞，等原事务终止后读取持久日志，只有确认本次写入未提交且已提交的开始记录仍无终态时才补写结算。启动修复先结算遗留压缩，再关闭实际打开的 Step 和 Turn。重放与 fork 共用持久记录，聊天继续显示原始交互。
 
 ### 3. 从日志重建模型输入与已结算流
 
-沿用 DSH 的 `request/header` 作为不可变配置快照，保存渲染后的 Prompt、工具定义、已解析的有效生成参数（含 Adapter 默认值）和实际选定的非敏感路由（含 Provider 和模型）。初始、重新装载、配置变化和消息系列边界写入新快照，同一系列内未变化的后续请求复用上一份。凭据只随本次调用在内存中使用。
+`request/header.data` 保存 `{ header, reason, startsSeries? }`。`EpochHeader` 包含生效的 `config`，以及可选的 `adapterDefaults`、渲染后的 `system` 和组装后的 `tools`。`config` 包含 `provider`、`model` 和可选的 `reasoningEffort`、`temperature`、`maxTokens`、`stop`。调用方省略 `maxTokens` 且 Adapter 模型信息提供 `defaultMaxTokens` 时补入该值，`reasoningEffort` 根据模型支持值解析默认，显式传入不支持的值报错。`temperature` 和 `stop` 保留显式配置或保持缺省。由 Adapter 模型信息补入的值同时保存于 `config` 和 `adapterDefaults`。每个 Provider 配置一个入口，凭据只随调用在内存中使用。
 
-MHarness 为每次准备发起的 Attempt 追加 `request/prepared`，记录 `turnId`、`stepId`、`attemptId` 和 `headerSeq`。`headerSeq` 指向同一 Session 日志中位置更早的 `request/header`，准备事件自身的 `seq` 就是历史截点。按 `attemptId` 找到准备事件后，重放内部日志 `[0, seq)` 的 `surface` 得到当时的消息，再读取所指快照。即使后来替换历史或更新配置，仍能恢复原输入。工具调用与结果保留模型标识关联。
+Agent 生命周期的第一次请求使用 `initial`，从已有日志恢复或 fork 后使用 `resume`。配置、系统提示词或工具 schema 变化写 `change`，同时开始新消息系列时附 `startsSeries: true`。配置相同但开始新消息系列或 surface 已替换时写 `series`。其余请求复用最近的 header。每次调用都重新取 `deriveMessages()` 的独立数组快照，再将配置与消息组成请求。
 
-先解析路由和有效配置，再在会话串行区内从同一日志边界派生消息、追加必要的 header 和 `request/prepared`。显式 `await session.flush()` 成功后才在串行区外用同一份已解析输入启动 Adapter 生成。准备事件落盘只证明输入已记录，Provider 是否收到请求需要独立证据。重启后即使没有 Attempt 结算也能查回已准备的输入，遗留 Turn 仍按中断修复且不续跑。
+构造请求时在会话串行区确定配置、必要的 header 及消息快照。`session.flush()` 成功后在串行区外使用同一份输入调用 Adapter。验证已结算请求时，用持久日志中对应 Assistant 结算事件之前的前缀重放新的 Session，分别用 `deriveMessages()` 和 `foldRequestHeader()` 核对实际捕获的模型消息与配置。含附件的请求若需重放，还需要日志所引用的附件对象及对应的代码版本。结算前崩溃时日志保留已提交的配置和消息历史，恢复关闭遗留 Turn。每个已结算的失败请求或重试使用各自的结算位置。
 
-成功 Attempt 先 append 一条 assistant/message，保存正文、完整工具调用与该 Attempt 的紧凑带时序流，flush 成功后才进入工具阶段。非成功 Attempt 用不进入模型历史的结算事件保存类别和紧凑诊断流，失败草稿不作为回答展示。紧凑流在结算时写入，不逐 token 写库；未结算活动草稿只在内存。需要续答时，当前 Step 工具结果先通过检查点才启动下一 Step。Turn 完成通知以相关事实 flush 成功为前提。
+成功生成追加 `assistant/message`，在 `data` 中保存 `turn`、`step`、`message`、`finishReason`、`stream`、可用时的 `usage` 及 `includeInModelContext: true`。`message` 包含 ID、角色、来源和有序内容块。完整工具调用块保存 `id`、`name` 及原始 `arguments`。成功消息落盘后才进入工具阶段。非成功生成追加 `assistant/attempt`，保存 `turn`、`step`、`outcome`、`reason`、`stream` 及 `includeInModelContext: false`。取消或截断可保存非空展示文字，失败流只用于诊断。表中列出的结算共同使用紧凑流格式。
 
-Attempt 结算记录保存 `attemptId` 和明确的 `includeInModelContext` 属性。上下文组装器按记录属性选择 assistant 输出，前端根据结算类型展示标签。结算只影响当前 Attempt 的输出。此前提交的 assistant 消息、工具调用及配对结果仍可进入上下文。
+紧凑流将可合并的连续文本及工具分片成组保存，保留组内每段原边界、顺序及相对时序，其余 chunk 保留单条记录。独立分片用 `{ time, chunk }` 表示，其中 `time` 是相对流起点的毫秒数。重放可以无损恢复统一流。Runtime 将 Provider 给出的展示用 reasoning 归一为 `{ type: "reasoning", delta }`。成功结算时按生成顺序把可用 reasoning 保存为消息的 `{ type: "reasoning", text }` 块，页面的折叠状态与消息重放独立。`deriveMessages()` 从已结算的正式消息派生模型历史，Provider 请求按 Adapter 的编码规则构造，实时 `attemptId` 随 `AssistantStreamAttempt` 管理。
 
 | Attempt outcome | 持久结算 | includeInModelContext |
 | --- | --- | --- |
@@ -226,17 +282,26 @@ Attempt 结算记录保存 `attemptId` 和明确的 `includeInModelContext` 属�
 
 ### 3.1 Turn 驱动统一决定继续或结算
 
-Model Adapter 将 Provider 的结束原因映射为统一的 `finishReason`，由 Turn 驱动结合 Step 结果决定下一步。无工具调用且正常结束时，提交回答并以 model_completed 结算。tool_calls 结束当前 Attempt，随后进入同一个 Step 的工具阶段。达到输出上限时先提交 Attempt 截断记录，再以 truncated / output_limit 结束 Turn。用户取消和请求失败仍走各自的结算路径。
+Adapter 映射厂商结束原因，`LlmRuntime` 将异常归一为终止 `finish` chunk。正常无工具的模型回答以 `{ kind: "completed" }` 结算 Turn。`tool_calls` 结束当前模型尝试并进入同一 Step 的工具阶段。达到输出上限时先保存 Assistant 截断结算，再以 `{ kind: "max-tokens" }` 结束 Turn。用户取消以 `aborted` 结算，请求失败以结构化 `error` 结算。
 
-工具批次默认完成后继续请求模型。任一成功工具结果携带 `concludeTurn: true` 时，当前 Step 仍派发并结算本批剩余调用，再把结束意向交给 Turn 驱动。剩余工具返回明确错误也算已结算，错误与成功结果一起持久化。Turn 以 tool_concluded 完成，不开启下一 Step，也不额外生成总结。用户取消、派发异常或副作用工具结果未知等原有中止条件优先于该意向。当前 Session 有活动 Turn 时拒绝新提交，第一版在批次结束后无需检查待处理输入队列。
+工具批次默认完成后继续请求模型。任一成功工具结果携带 `concludeTurn: true` 时，当前 Step 仍派发并结算本批剩余调用，再把结束意向交给 Turn 驱动。剩余工具返回明确错误也算已结算，错误与成功结果一起持久化。Turn 以 `reason.kind: "completed"` 完成，不开启下一 Step，也不额外生成总结。用户取消、派发异常或满足副作用工具超时规则等原有中止条件优先于该意向。当前 Session 有活动 Turn 时拒绝新提交，第一版在批次结束后无需检查待处理输入队列。
 
-#### 3.2 Model Adapter 的完整接入职责
+#### 3.2 LlmRuntime 与 Provider Adapter
 
-ReActAgent 决定何时调用模型、组装统一请求、保存可重建事实并显式 await session.flush；Adapter 只接收统一请求和取消信号，不修改 Session、不执行工具、不决定 Turn/Step 结算。Adapter 将消息、工具定义和生成配置序列化成 Provider 请求，发送并解析 HTTP/流协议，将文本、工具分片、用量与结束原因归一化；序列化不表示对多个请求排队。
+Agent 负责检查点、Session 事件追加、工具调度、Step/Turn 推进和实时流。`LlmRuntime` 解析校验生效配置并选择 Adapter。检查点成功后创建 `AssistantStreamAttempt`，取得异步流对象，检查取消，再发 `start` 并读取第一个 chunk。准备或检查点失败、创建流同步抛错、发 `start` 前取消时，使用相应的 Agent 结算路径。`start` 表示实时发布开始，网络请求是否已到达 Provider 取决于底层流。Adapter 负责厂商请求序列化、鉴权、流协议转换、超时和取消清理。
 
-连接配置与鉴权材料由后端配置提供。请求准备时取得一致的端点与凭据快照，Adapter 发送时复用它并构造鉴权头；凭据不进入 Session、前端或普通日志。错误区分鉴权、限流、网络、协议、超时与调用方取消，并保留安全的 Provider 状态/请求标识等诊断。用户取消不包装成普通 Provider 失败，Adapter 只返回或抛出统一请求结局，由 ReActAgent 结算 Attempt 和 Turn。
+| Adapter 观察到的情况 | `LlmError` 代码 |
+| --- | --- |
+| 流结束但缺少厂商协议要求的结束标记，例如 `[DONE]` | `STREAM_CLOSED` |
+| 网络传输异常 | `TRANSPORT` |
+| 请求等待或流空闲超时 | `TIMEOUT` |
+| 调用方取消 | `ABORTED` |
 
-请求级超时由 Adapter 执行，区分连接/响应等待和流空闲等已配置预算；Turn 总预算由 ReActAgent 管理。上游取消和请求超时传播至实际 HTTP 请求与流读取，调用方提前停止消费也须取消并清理底层流、计时器和监听器。初期不自动重试，所选 SDK 的隐式重试须关闭。超时值按集中配置提供，具体数值在模拟 Adapter 验证时确定。
+Runtime 捕获异常并输出一个终止 chunk。例如 `{ type: "finish", reason: { kind: "error", failure: { code: "STREAM_CLOSED", message: "SSE stream ended without [DONE]" } } }`。调用方取消使用 `reason.kind: "aborted"`。失败可以附 HTTP 状态、Provider 请求 ID 和建议重试间隔，诊断信息需排除敏感数据。Runtime 不修改 Session 或推进 Turn。
+
+Agent 收到错误终止后追加失败 `assistant/attempt` 及已接收的紧凑流。已发送 `start` 时，追加成功后发 `end` 并引用该结算。会话压缩里程碑中，只有 Adapter 明确报告输入上下文超限才触发压缩恢复，每个 Turn 最多重试一次。先结算原失败，再在同一步执行压缩，成功后写 `series` header、重新派生 surface 消息并通过检查点后重试。压缩失败、取消或重试仍超限时结算 Turn。Runtime 和 Adapter 每次生成只调用一次，SDK 的隐式重试关闭。
+
+请求级超时与 Agent 的 Turn 总预算独立。调用方取消、超时或提前结束消费时，Adapter 须中止实际请求及读取，释放流、计时器和监听器。超时值按集中配置提供，具体数值在模拟 Adapter 验证时确定。
 
 ### 4. 工具能力由注册信息决定
 
@@ -246,7 +311,7 @@ ReActAgent 决定何时调用模型、组装统一请求、保存可重建事实
 
 #### 4.1 工具 Schema 与校验边界
 
-本地工具以 Zod 4 定义输入 Schema，处理函数接收解析后的类型。模型使用的 JSON Schema 由同一份定义以 `z.toJSONSchema(schema, { io: "input" })` 导出。本地工具的对象默认使用严格对象，拒绝未知字段，参数不隐式转换。工具输入 Schema 只使用可等价导出为 JSON Schema 的结构和约束，不在公开合约中使用无法导出的自定义校验或转换。
+本地工具以 Zod 4 定义输入 Schema，处理函数使用从该定义推导的解析结果类型。模型使用的 JSON Schema 由同一份定义以 `z.toJSONSchema(schema, { io: "input" })` 导出。本地工具的对象默认使用严格对象，拒绝未知字段，参数不隐式转换。工具输入 Schema 只使用可等价导出为 JSON Schema 的结构和约束，不在公开合约中使用无法导出的自定义校验或转换。验收时，用同一组代表性 JSON 输入分别验证发给模型的 JSON Schema 和执行入口使用的 Zod Schema，确认两者对合法输入、缺失必填字段、未知字段、错误类型和已声明值域的判断一致。
 
 模型提交完整调用后，将 `arguments` 用 JSON.parse 解析为未知值，再用对应工具的 Schema 校验。JSON 无法解析或参数不符合 Schema 时，为原 `callId` 保存结构化工具错误并交回模型，不创建审批、不派发。参数校验成功后才应用审批策略，执行时使用已验证并绑定到本次操作的参数。
 
@@ -256,25 +321,61 @@ ReActAgent 决定何时调用模型、组装统一请求、保存可重建事实
 
 #### 4.2 批次调度与结果所有权
 
-ReActAgent 保存完整 assistant 消息后交给批次调度器。调度器按模型顺序处理调用，追加 `tool/call` 表示进入调度，再调用工具执行服务；该记录可先于参数决策和审批，不表示正文开始，不要求此时已有 operationId。无效参数仍产生配对错误，但不创建审批或派发。执行服务处理注册、参数/结果校验、策略和执行，独立 ApprovalService 等待用户决定；MCP Client 承担远程协议接入。调度器保存规范化的 `tool/result`，ReActAgent 根据批次结局决定续答或结束，执行服务不自行推进 Turn。
+调度器从已接受并通过持久化检查点的 `assistant/message` 读取完整 tool-call blocks，按模型顺序复制 `id → callId`、`name` 和原始 `arguments`，连同 `turn`、`step` 写入 `tool/call`，再由工具执行服务校验参数。记录关联校验以 Assistant 声明为准，重放时核对工具名和原始参数。`tool/call` 表示进入调度。无效参数只结束该调用并产生配对错误，后续批次调用仍可处理，模型可在下一 Step 根据错误修正参数。执行服务处理注册、校验、策略及执行，独立 ApprovalService 等待决定。调度器保存规范化 `tool/result`，ReActAgent 根据批次结局决定续答或结束。
 
-工具初期全部串行，取消、派发异常或结果未知停止后续派发，为尚未执行的已提交调用补齐对应结局。`concludeTurn` 仅是成功结果的批次结束意向，本批剩余工具仍结算；明确业务错误不撤销已有意向，中止条件优先。
+工具初期全部串行，取消、派发异常或满足副作用工具超时中止条件时停止后续派发，为尚未执行的已提交调用补齐对应结局。`concludeTurn` 仅是成功结果的批次结束意向，本批剩余工具仍结算；明确业务错误不撤销已有意向，中止条件优先。
 
-自有结构化工具正文只返回 value，执行服务先按输出 Schema 校验并取得不可变快照，再通过纯 `render(args, value)` 派生模型 content，可选 presentationMeta 也从已验证参数和值派生，不允许工具独立返回互相矛盾的成功数据。MCP 成功可以只有 content；有 structuredContent 时保留，有 outputSchema 时校验，不强制把文本包装为业务 value。有效 MCP 错误 content 可保留，协议/传输错误由接入层归一化。
+自有结构化工具正文只返回 value，执行服务先按输出 Schema 校验并取得不可变快照，再通过纯 `render(args, value)` 派生模型 content，可选 presentationMeta 也从已验证参数和值派生，不允许工具独立返回互相矛盾的成功数据。MCP 成功可以只有 content；有 structuredContent 时在内存保留，有 outputSchema 时校验，不强制把文本包装为业务 value。有效 MCP 错误 content 可保留，协议/传输错误由接入层归一化。
 
-结果按 success、tool-error、timeout、cancelled、unknown 区分，同时保存原因和可确认的派发、停止及结果事实。timeout/cancelled 也可作为 unknown 的原因，不把五个分类当作互斥的执行事实。success 携带自有工具必需的 value、content、可选 presentationMeta/concludeTurn；content-only MCP success 不要求 value。tool-error 携带结构化 error 和 content；其他结局也必须有基于同份结算事实生成的 content，不能暴露凭据或异常堆栈。成功与失败结构可区分，非成功结果不能携带 concludeTurn。
+工具定义的 `output` 由 JSON Schema `schema`、模型内容转换函数 `render` 和可选的展示数据转换函数 `presentationMeta` 组成。Harness 在内存组装结果。成功分支带 `isError: false` 和经校验的业务 `value`，content-only MCP 成功可省略值。失败分支带 `isError: true` 和 `error: { message, info? }`。两支均提供 `content`，可带 `meta`。普通异常及策略拒绝可以只有文字。框架错误和继承 `HarnessError` 的工具业务错误可提供稳定的 `info: { name, code }`。
 
-调度器将最终模型 content 与规范化结局一起持久化，历史重建使用已保存内容，不在重放时重新 render。unknown 等中止本轮时只保存，不为解释错误而额外请求模型；后续允许的新 Turn 可读取与原调用配对的结局。展示元数据不自动进入模型上下文。详细 HTTP/SSE 字段名称和结果联合类型的最终线格式在后续协议讨论中统一，本轮不新增外部接口。
+| 框架错误码 | 触发条件 |
+| --- | --- |
+| `UNKNOWN_TOOL` | 工具不存在或无法直接调用 |
+| `INVALID_TOOL_OUTPUT` | 输出 Schema、`render` 或 `presentationMeta` 失败 |
+| `ABORTED_BEFORE_DISPATCH` | 取消先于工具正文派发 |
+| `ABORTED` | 派发后取消等待且没有可保留的最终结果 |
+| `TOOL_TIMEOUT` | 工具等待截止时间触发 |
+
+`tool/result` 保存可重放的消息和可选展示数据。从失败的 `error.info` 投影 `data.error: { name, code }`，失败说明进入工具结果块的 `content`。追加结果的 `sourceEventSeqs` 引用对应 `tool/call`，尚无调度时引用声明该调用的 Assistant 事件。替换结果引用当前被替换的事件。批次结束意向通过成功结果交给调度器。文件更新成功时可保存如下事件。
+
+```yaml
+type: tool/result
+surfaceOp: append
+sourceEventSeqs: [20]
+data:
+  turn: 1
+  step: 2
+  operationId: op-123
+
+  message:
+    id: msg-123
+    role: user
+    source: { kind: tool, callId: call-123 }
+    content:
+      - type: tool-result
+        toolCallId: call-123
+        isError: false
+        content:
+          - { type: text, text: "已更新 /project/config.txt" }
+  meta:
+    diffs:
+      - { path: /project/config.txt, oldText: "旧内容", newText: "新内容" }
+```
+
+例如，超时失败的消息块保存 `isError: true` 和「等待工具响应超时」的模型内容，事件附 `error: { name: "ToolTimeoutError", code: "TOOL_TIMEOUT" }`。普通异常或只有说明文字的策略拒绝只保存失败消息。首版使用 `isError`、模型内容和可用的错误码重放失败。可选的 `execution: { result: "unknown" }` 及对应页面状态留作后续扩展。
+
+调度器将最终模型 content 与规范化结局一起持久化，历史重建使用已保存内容，不在重放时重新 render。unknown 等中止本轮时只保存，不为解释错误而额外请求模型；后续允许的新 Turn 可读取与原调用配对的结局。展示元数据不自动进入模型上下文。HTTP 历史和 SSE 直接交付该结果事件，见 §8.1。
 
 ### 5. 审批绑定操作，不绑定模糊意图
 
 参数完整且校验通过后生成 `operationId`，用 `tool/operation` 保存工具身份、定义版本和不可变参数。工具执行服务直接调用 `pre-execute` 判断 `allow`、`deny` 或 `ask`。`allow` 进入执行前检查点，`deny` 为原调用结算拒绝结果，`ask` 交给 ApprovalService。
 
-ApprovalService 先确认 `approval/asked` 已提交，再直接调用 `approval/request` 向审批渠道发起请求并等待答复。审批 `id` 用于配对 `asked` 和 `decided`，`operationId` 用于定位批准所绑定的操作。前端从持久记录恢复审批详情，通过普通接口提交答复。等待期间释放 Session 串行区，Turn 继续占用执行权和写 handle。浏览器断开后可从已提交记录恢复待审批界面。
+ApprovalService 先确认 `approval/asked` 已提交，再直接调用 `approval/request` 向审批渠道发起请求并等待答复。审批 `id` 用于配对 `asked` 和 `decided`，`operationId` 用于定位批准所绑定的操作。前端通过原始审批与操作事件恢复审批详情，通过普通接口提交答复。等待期间释放 Session 串行区，Turn 继续占用执行权和写 handle。浏览器重连后可从 follow 快照恢复待审批界面。
 
-收到答复后先提交 `approval/decided`，使用状态条件更新保证一个审批 `id` 只结算一次。只有 `allowed-once` 进入执行前检查点，拒绝结束本轮，没有可用渠道时以 `unavailable` 结算并阻止派发。相同操作的重复传输沿用原审批，新工具定义或参数必须创建新操作并重新审批。重启时以 `cancelled / process_interrupted` 关闭未决审批。
+收到答复后先提交 `approval/decided`，用状态条件更新保证一个审批 `id` 只结算一次。`POST /api/sessions/:sessionId/approvals/:approvalId/decision` 接收 `{ outcome: "allowed-once" | "rejected" }`。首次答复已持久化或同决定重发返回 `200 { id, outcome }`，与已保存决定冲突时返回 `409` 和已有决定。找不到审批时返回 `404`。崩溃修复保留原 `approval/asked`，对应工具结果或 Turn 终态使请求退出待审批列表。没有保存决定的已关闭审批收到迟到答复时返回 `409 { code: "approval_not_active" }`。只有 `allowed-once` 可进入执行前检查点。用户明确拒绝结束本轮，没有可用渠道则以 `unavailable` 结算并阻止派发。相同操作的重复传输沿用原审批，新工具定义或参数须创建新操作并重新审批。
 
-检查点成功后重新检查取消，实际派发与取消通过同一原子状态门协调。取消先赢得状态转换时，为原调用保存 `outcome: cancelled`、`execution.dispatch: not_started`。派发已开始时向工具传递取消请求，按已确认的执行事实结算。无法确认是否已中止或执行完毕时保存 `unknown`。多个调用分别结算，已保存的结果保持原样。后续模型输入将结果与原 assistant 调用配对。
+检查点成功后重新检查取消，实际派发与取消通过同一原子状态门协调。取消先赢得状态转换时，为原调用保存 `ABORTED_BEFORE_DISPATCH` 失败。派发已开始时向工具传递取消请求，按已确认的执行事实结算。取消等待时若尚无最终结果，保存 `ABORTED` 失败。多个调用分别结算，已保存的结果保持原样。后续模型输入将结果与原 assistant 调用配对。
 
 ### 6. 幂等由 Harness 与工具共同保证
 
@@ -290,73 +391,136 @@ operationId 是逻辑操作标识，toolCallId 是模型协议标识，分别保
 
 本地且保证协作取消后退出的工具采用 DSH 方式：截止时发送取消信号，等待正文退出及清理后结算，不用 Promise.race 丢下本地任务；取消收敛前 Turn 仍活动。确认停止只证明执行结束，不能证明此前副作用撤销，结果按已确认事实保守判断。该策略可能因工具违约而长时间等待，必须由工具与适配器合约测试验证其保证。
 
-远程或无可靠退出保证的工具，到期后传播取消并停止等待，持久结算不冒充执行端已停止。只读调用可保存 timeout 并在最大模型步数和只读超时预算内继续；副作用或未知能力调用无结果确认时记录 unknown、reason=timeout，Turn 进入 failed / tool_result_unknown，停止后续模型与工具。用户取消但未获停止/结果确认时同样记录 unknown、reason=cancelled。没有进入正文或实际派发的调用，才可根据现场事实记录 cancelled / not_started。
+远程或无可靠退出保证的工具，到期后传播取消并停止等待。超时保存 `TOOL_TIMEOUT`，只读调用可在最大模型步数和只读超时预算内继续。副作用或未知能力调用超时且未取得最终结果时，调度器按既有 Turn 策略结束本轮，停止后续模型与工具。已派发调用取消等待后尚无最终结果时保存 `ABORTED`。失败内容依据已确认事实生成。
 
 执行事实不简化成一个 started 布尔值：分别记录调度、实际派发及停止/结果确认。tool/call 不是派发证据，恢复也不能因等待审批就覆盖既定的保守 unknown 规则。所有结局都有准确 content；幂等或查询能力不授权自动重试。迟到响应不改写已结算 Turn、不恢复执行，异步观察回调须被收束并防止未处理异常。结果核实、迟到入账和续跑仍在后续设计范围。
 
-### 8. 前端 Session 合并持久历史与活跃草稿
+### 8. Web 同步 Session 事件并重建会话视图
 
-后端 Session 提供持久历史，运行管理保留活跃 Attempt 的内存 chunk 数组。前端从快照中的持久记录重建视图、Turn 和审批状态，并安装快照提供的当前草稿，不拼接前一订阅的旧草稿。首次打开、重连、切回已关闭订阅的会话均执行 follow → snapshot → replace 重建视图 → 顺序消费后续帧，不额外 GET 首屏历史。GET 历史保留作独立持久查询，不承担实时页面初始化或断线接续。
+参考 DSH 的 Session Controller，Web 先同步连续的原始事件，再从事件构建消息、工具卡片、Turn 和审批状态。模型历史由 Session 的 surface 另行派生。HTTP 历史独立读取已提交前缀。实时页面首次打开、重连或切回时，通过 follow 的全量快照原子安装新窗口和活动草稿。第一版只订阅当前选中的会话，切走后 Turn 继续。等待新快照时可显示标有「正在同步」的旧画面。分页留到后续。
 
-第一版只订阅当前选中的会话；切走关闭订阅，后端 Turn 继续，切回重新 follow。等待期间可显示该会话缓存并标明“正在同步”，但它不是新连接的接续基线；新快照成功安装后以其为准。首帧包含完整公开历史，历史分页后置；以后增加分页仍须保持快照截点与后续增量的交接规则。
+#### 8.1 原始事件、历史和 SSE 帧
 
-#### 8.1 Session.follow 帧格式
+`GET /api/sessions/:sessionId` 成功返回 `{ sessionId, inheritedEventCount, cursor, records }`。成功的 follow 首帧为 `{ type: "snapshot", sessionId, inheritedEventCount, cursor, records, assistantStream }`。`records` 是完整前缀 `[0, cursor + 1)`，`cursor` 为末条事件的 `seq`，空前缀为 `-1`。普通会话的 `inheritedEventCount` 为 0。fork 取子会话自身的继承事件数量。
 
-每次 `Session.follow` 的首帧是 `type: snapshot`，携带 `sessionId`、`records`、`cursor` 与 `assistantStream`。`records` 包含 `[0, cursor)` 的全部已提交公开记录，`cursor` 是公开记录数及下一公开位置，空窗口为 0，首条记录 `seq` 为 0。`assistantStream.revision` 是实时基线。有尚未结算的 Attempt 时，`assistantStream.activeAttempt` 包含 `attemptId`、`turnId`、`stepId`、已生成的统一 `chunks` 数组及 `nextIndex`。前端可直接用该数组恢复草稿。
+历史、快照的记录及实时事件帧使用同一个封装 `{ type: "event", event }`。`event` 保留 Session 日志的 `type`、`seq`、`time`、`data` 和事件实际带有的 `surfaceOp`、`sourceEventSeqs`。`seq` 在 Session 内从 0 开始连续递增，`time` 为 Unix 毫秒，`data` 由 Session 事件契约按类型校验。HTTP 和 follow 的共同前缀逐条相同。原始请求头、seed、压缩及替换都随序列交付。系统提示和工具定义与原始请求头一起可读。凭据仍只随调用在内存中使用。
 
-HTTP 历史、SSE 快照和增量共用 Session 业务模块维护的公开记录映射，将已提交日志转换为 `@mharness/session/contracts` 暴露的公开记录。`request/header` 和 `request/prepared` 留在内部日志，公开 `seq` 按映射后的记录从 0 连续编号。`headerSeq` 与请求重建截点使用内部序号，`assistant/end.recordSeq` 使用公开序号。
-
-本会话自身接受的公开 `user/message` 携带 `requestId`，fork 继承消息在子会话的公开投影中省略该字段。浏览器收到 `202` 或提交接口的 `200` 后确认提交。响应丢失或收到 `submission_pending` 时显示发送结果待确认，收到 `submission_not_accepted` 时显示本次未提交。两种情况都保留原编号和正文用于用户重试。当前有效的 SSE 增量或重连快照中出现同一会话、同一编号且正文匹配的已提交消息时，用该记录替换本地占位。迟到响应不能把已确认的提交退回待确认或未提交，也不能重复显示正式消息。
-
-已提交的 `tool/operation` 投影为公开记录，携带 `turnId`、`stepId`、`callId`、`operationId`、`toolName` 和 `validatedArgs`。免审批工具卡片默认显示关键参数，完整参数可展开查看。该记录表示参数已校验并绑定到本次操作，派发与结果仍按执行事实展示。待审批卡片继续从公开 `approval/asked` 读取审批绑定的工具详情。
-
-验收示例：免审批工具查询设备 `A-17` 最近 24 小时的告警。实时卡片从 `tool/operation` 显示已校验参数，刷新后的 SSE 快照和独立 HTTP 历史查询提供相同参数。参数校验失败时，按原调用键显示 `tool/result` 的校验错误，此时没有 `tool/operation` 记录或可展开的已校验参数。
-
-后续帧沿用本次订阅的 Session 标识，按同一个队列顺序交付。
-
-| 帧类型 | 必需字段 |
+| 事件 | `data` 字段来源 |
 | --- | --- |
-| record | `record`，内含 `seq`、事件 `type`、`timestamp` 和 `data` |
-| assistant/start | `revision`、`attemptId`、`turnId`、`stepId` |
-| assistant/chunk | `revision`、`attemptId`、`index`、`chunk` |
-| assistant/end | `revision`、`attemptId`、`nextIndex`、`outcome`、`recordSeq` |
+| `turn/start`、`step/start`、`step/end`、`turn/end` | 沿用 §2 的 `{ turn }`、`{ turn, step }` 与 `{ turn, reason }`。Turn 失败原因携带已归一的错误数据。 |
+| `user/message` | 沿用 §2 的消息本体 `{ id, role, source, content }`，真实用户消息另带 `turn`、`requestId`。 |
+| `assistant/message`、`assistant/attempt` | 沿用 §3 的成功消息及非成功结算，保留紧凑流、消息块或可展示的部分文字等现有字段。 |
+| `tool/call`、`tool/operation`、`tool/result` | 沿用 §4.2 和 tool-governance 的调用键、原始参数、操作绑定、结果消息及可选 `error`、`meta`。 |
+| `approval/asked`、`approval/decided` | 沿用 §5 和 tool-governance 的 `{ id, operationId, toolName, reason, callId? }` 和 `{ id, outcome, reason? }`。浏览器通过 `operationId` 查找完整操作。 |
+| 请求、seed、压缩和替换 | 沿用 §2、§3 的原始事件契约。客户端消费序号和相关上下文。 |
 
-前端期望的下一 `record.seq` 等于当前 `cursor`，接受后 `cursor` 加 1。Turn/Step 边界、审批与其他恢复事实均在日志中。`recordSeq` 为非负公开记录位置，0 是有效引用；结算记录自身带 `attemptId` 供双向匹配。`outcome` 为 completed、cancelled、failed 或 truncated，只结算当前 Attempt。Turn 终态独立记录。
+| SSE 帧 | 字段 |
+| --- | --- |
+| `snapshot` | `sessionId`、`inheritedEventCount`、`cursor`、`records`，以及 `assistantStream: { revision, activeAttempt? }`。活动草稿为 `{ attemptId, turn, step, chunks, nextIndex }`。 |
+| `event` | `event` 为原始 Session 事件。 |
+| `assistant-stream` | `frame` 为下表的 `start`、`chunk` 或 `end`，共用 `attemptId`、`revision`。 |
+| `agent/error` | `turn`、可展示的 `message`。执行失败的即时通知，详见 §8.3。 |
+| `error` | `error: { code: "follow_sync_failed", message, details }`。当前 follow 的终止错误，详见 §8.3。 |
 
-实时 `revision` 跨 Assistant 的 start、chunk、end 连续递增。传输层从首帧初始化 `assistantRevision`。持久记录与本地窗口变更各有自己的进度。每个 Attempt 的 chunk `index` 从 0 开始，`end.nextIndex` 等于该 Attempt 已发送的 chunk 数。前端分别检查持久 `seq`、Assistant 实时 `revision`、Attempt 身份和 chunk 序号。
+| `assistant-stream.frame.type` | 除 `type`、`attemptId`、`revision` 外的字段 |
+| --- | --- |
+| `start` | `turn`、`step`。 |
+| `chunk` | `index`、`chunk`。 |
+| `end` | `turn`、`step`、`index`、`outcome`。追加成功为 `{ kind: "committed", eventType, seq }`，其中 `eventType` 为 `assistant/message` 或 `assistant/attempt`，`seq` 为结算事件的日志位置。追加未成功为 `{ kind: "abandoned" }`。 |
 
-#### 8.2 快照截点与结算顺序
+`chunk` 及快照中的 `chunks` 使用同一结构。
 
-实时 follow 由持有数据库实例锁的在线后端提供，活动草稿和订阅队列由该进程共同维护。客户端重连同一仍在运行的后端可恢复活动草稿。独立只读进程仅提供已提交历史读取，不以缺少草稿的快照替代实时 follow。
+| `chunk.type` | 载荷 |
+| --- | --- |
+| `text` | `delta` 为正文分片。 |
+| `reasoning` | `delta` 为 Provider 提供的 reasoning 展示分片。 |
+| `tool-call-delta` | `toolIndex`、`argumentsDelta`、可选的 `callId`、`name`。同一工具的首片提供 `callId` 和 `name`，后续片重带时与首片一致。Runtime 的 `tool_call.index` 对应线上的 `toolIndex`。 |
 
-已有 Agent 时，快照与观察注册共用会话串行协调机制：先注册 follower 并缓冲，显式 flush 已接受尾部，取得一致持久历史、游标、草稿和实时版本后确定截点；flush 失败不发布快照。未加载 Agent 时从只读 handle 取得一致持久快照，不调用只读 handle 的 flush、不为观察创建 Agent；与后续首次加载的观察交接也须避免遗漏重复。先发快照再按同一队列交付截点之后更新。内存 emit 不直接成为持久 record，适配层等待相应持久前缀并维持相对 start/chunk/end 的顺序；网络发送在串行区外进行。
+Runtime 的 usage 和 finish 由结算事件携带。SSE 的实时 `revision` 从基线 0 跨所有已发布的 `start`、`chunk`、`end` 连续推进，同一 Agent 内跨 Attempt 延续。每个 Attempt 的帧 `index` 从 0 开始，`end.index` 等于已发布的 chunk 数。活动草稿的 `nextIndex` 等于 `chunks.length`，也是下一帧的预期 `index`。事件、执行错误和终止错误各自按订阅队列顺序交付。
 
-Attempt 结算在同一协调机制下 append 并显式 flush。确认持久化后再清除活动 Attempt、分配 end 版本，按 record、end 入队，之后才允许新快照进入。快照要么包含未结算草稿，要么包含持久结算且实时基线覆盖 end；失败时保留同步错误状态，不发布成功 end。后端通过检查点后可进入工具阶段，无需等待前端确认。
+#### 8.2 快照截点、草稿交接和视图
 
-前端收到当前 Attempt 的结算记录时先暂存，匹配 end 后一次替换草稿并保留 UI 节点标识。例如快照 cursor=10 表示已有 seq 0–9；A 的 start 与两个 chunk 占 revision 1、2、3，随后结算 record.seq=10，end 引用 recordSeq=10，revision=4、nextIndex=2。工具记录继续推进持久游标，下一 Step 的 start 接续 revision=5。
+已加载会话的观察注册、缓冲和快照读取共用会话串行协调机制，从同一截点取得日志、活动草稿及实时 `revision`。未加载会话使用只读 `handle.read()` 获取已提交前缀，实时基线为 0。首次加载 Agent 通过同一观察交接保住快照截点后的事件。读操作无需 flush，订阅无需创建 Agent，网络发送在串行区外进行。
 
-#### 8.3 异常恢复
+快照发送后，服务端跳过已由快照覆盖的缓冲事件，按从 `cursor + 1` 开始的顺序发送事件。客户端按 `event.seq` 去重，接受下一条事件时才推进 `cursor`。实时帧按 `revision` 验证连续性，客户端按 `attemptId`、`turn`、`step` 校验所属范围，按 `index` 校验分片和结束。快照中活动范围与事件边界一致。新 Attempt 的 `start` 对应已打开的 Turn 和 Step。
 
-有效代次收到缺少匹配记录的 end、序号或身份不匹配时，保留现有画面，先使代次失效再关闭连接，按退避及次数上限重新 follow；旧代次的异常直接忽略，不触发当前订阅恢复。若记录已提交但 end 到达前断线，丢弃旧订阅暂存状态，新快照直接展示结算结果。
+已开始的 Attempt 在同一协调边界追加结算事件、发布 `end` 和清理活动草稿。每个 `start` 都有 `end`，包括零 chunk 的流。同进程重连的快照直接提供截点前已接受的结算及实时基线，数据库重开后从已提交前缀恢复。已追加的结算可在 flush 前发布。
 
-结算写入失败时报告订阅错误，无持久记录不发送 end。重新 follow 只能恢复已提交事实；存储持续不可用或重试达到上限时保留旧画面并显示同步失败，停止自动重连。后端重启按调度记录与结果保守修复，前端从持久记录恢复中断状态。
+实时草稿交接时，前端按 `attemptId` 定位草稿。`end: committed` 与对应结算事件可以任一先到，齐备后按 `(eventType, seq)` 核对原始事件的 `(type, seq)`，并校验其 Turn 和 Step。正式事件以同一 UI 节点替换草稿一次。结算对在下一 `start` 或所属 `turn/end` 前交付完毕。`end: abandoned` 清除暂态草稿。开始实时发布前就生成的结算事件按普通历史事件处理。失败结算展示终态，诊断流供诊断。取消或截断的非空正文保留未完成标记。
+
+浏览器按日志顺序派生状态和视图。真实用户追加消息依据 `surfaceOp: "append"` 与 `source.kind: "user"` 建立消息节点。收到 `{ accepted: true }`，或收到当前会话中 `seq >= inheritedEventCount` 且 `requestId` 匹配的真实用户消息，均可确认提交。继承消息保留其原编号并作为历史显示。请求头、压缩、替换和轮次边界可用于上下文或状态计算，聊天保留原始交互。Tool 相关节点按 `(turn, step, callId)` 关联。
+
+实时正文单独渲染。reasoning 可在独立区域折叠，正式消息从原有内容块恢复。参数分片在数据层累积，页面保留整体忙碌提示。只有工具声明的 Assistant 消息没有正文气泡。收到 `tool/call` 时建立「准备调用」卡片，展示完整原始参数的摘要和可展开详情。收到 `tool/operation` 后展示其已校验参数。收到 `approval/asked` 时按 `operationId` 读取工具名、版本、已校验参数并显示「等待审批」。同一 `approval/decided`、关联 `tool/result` 或所属 `turn/end` 关闭等待状态。`tool/result` 更新同一张卡片。恢复时若只有 `TOOL_NOT_STARTED` 结果，从 Assistant 调用声明取工具名并建立「未开始」卡片。
+
+#### 8.3 执行错误、终止错误和本地恢复
+
+执行检查点失败传播到 Agent 时，发送 `agent/error`，携带数字 `turn` 和安全文案，再追加 `turn/end`。失败终态用 `reason: { kind: "error", error: { code, message } }` 表达，有稳定分类时保留代码，其他使用 `UNKNOWN`。已接受的事件与 `end: committed` 保持有效。后台写入失败留在服务端告警并保留待写批次。`agent/error` 只更新执行反馈，`cursor` 和 `revision` 由各自对应的帧推进。
+
+进入 follow 后，服务端无法构建一致快照，或发送下一事件前发现缺号，发送终止 `error` 并结束 SSE。`details` 在缺号时为 `{ expectedSeq, actualSeq }`，快照构建失败时为 `{}`。向客户端提供安全文案，完整错误留在服务端日志。缺号的事件在发送前拒绝。若首帧即为 `error`，客户端将其视为打开失败。安装快照后收到 `error` 则保留当前窗口并显示同步失败。两种情况都结束该代次，等待用户主动重试。
+
+意外断线和客户端自行检测的协议缺口走有界重同步。检测到缺口时先保留现有画面、使当前代次失效并关闭连接，再按退避重新 follow。新快照校验通过后整体替换。重试次数和最大等待集中配置，分配新代次或建立连接不重置本次恢复预算。达到上限时保留画面并显示同步失败。
 
 #### 8.4 前端订阅代次与串行消费
 
-每次新建订阅，包括每次自动重连，均分配新的本地 subscriptionGeneration，回调捕获代次和 sessionId。切换、重连或释放时先使旧代次失效，再取消连接。所有回调先检查代次有效且会话匹配，再检查订阅状态或处理帧；覆盖 snapshot、增量、错误、关闭、重连定时器及延迟渲染，异步等待后和提交状态前再次检查。旧代次只能释放自己持有的资源，不能清空新订阅、覆盖其错误状态或发起重连。该代次不写入 Session、不作为后端字段，不与持久 cursor 或实时 revision 混用。
+每次新建订阅分配本地 `subscriptionGeneration`，回调捕获代次和会话 ID。切换、重连或释放时先使旧代次失效，再关闭连接。连接、错误、关闭、定时器、延迟渲染等回调先检查代次和会话，异步等待结束后与提交前再次校验。旧代次只释放自身资源。`subscriptionGeneration`、日志 `cursor` 和实时 `revision` 分别属于本地订阅、原始事件和 Assistant 实时流。
 
-每代次从等待 snapshot 开始；SSE 心跳注释不算业务帧。解析后的业务帧进入单一串行消费流程，接收顺序必须保持到处理与状态提交顺序。如果 snapshot 是先收到的业务帧但尚在安装，后续增量排队等待，不能并行处理或误判为无快照；若本代次首个业务帧确为增量，则是协议异常。
+业务帧按接收顺序串行处理。忽略 SSE 心跳注释后，等待中的首帧接受 `snapshot` 或终止 `error`，普通增量先到属于协议异常。构建快照时，后续帧排队等待。先校验完整事件前缀、继承边界、会话身份、活动范围和实时分片，再在临时状态中构建窗口、视图、游标和活动草稿。校验成功且代次仍有效时整体替换，失败保留旧画面。
 
-快照安装先在临时状态中完成结构与关联校验，构建新窗口、cursor、revision、Attempt 与 nextIndex，再检查代次并一次 replace 提交。任何步骤失败或代次失效都不提交部分状态；失败保留缓存，旧缓存绝不作为新连接基线。只有完整安装后才从该基线消费排队增量。
+#### 8.5 完整帧样例
 
-协议异常、传输或同步错误的自动重连统一采用递增退避、最大等待与有限重试次数，参数集中配置，具体数值在前端模拟验证时确定。重试预算属于该恢复流程，不因新建连接或分配新代次而清零；每次重试也必须等待并成功安装新 snapshot。达到上限后终止自动重连，保留画面并标记同步失败。旧代次的关闭/错误和过期定时器不能消耗当前预算、启动重连或改变当前画面。
+每行是一个独立的 SSE `data` JSON 载荷。各组从一次新的 follow 开始。
+
+**空快照与首条事件。** 首条事件将 `cursor` 从 -1 推进到 0。没有继承内容的空会话做 HTTP 查询时返回 `{"sessionId":"s1","inheritedEventCount":0,"cursor":-1,"records":[]}`。
+
+```jsonl
+{"type":"snapshot","sessionId":"s1","inheritedEventCount":0,"cursor":-1,"records":[],"assistantStream":{"revision":0}}
+{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}}
+```
+
+**活动草稿及 end 先到。** 快照覆盖 `start` 和前两条实时分片，恢复后的下一条分片为 `index=2`。结算用同一个 `seq=4` 交接。紧凑流的独立分片按相对毫秒保存。
+
+```jsonl
+{"type":"snapshot","sessionId":"s2","inheritedEventCount":0,"cursor":3,"records":[{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}},{"type":"event","event":{"type":"step/start","seq":1,"time":1700000000001,"data":{"turn":1,"step":1}}},{"type":"event","event":{"type":"user/message","seq":2,"time":1700000000002,"surfaceOp":"append","data":{"turn":1,"requestId":"req-1","id":"1692aee5-495e-4a65-a350-62e3da31b3d2","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"查询设备 A-17"}]}}},{"type":"event","event":{"type":"request/header","seq":3,"time":1700000000003,"data":{"reason":"initial","header":{"config":{"provider":"mock","model":"test-model"}}}}}],"assistantStream":{"revision":3,"activeAttempt":{"attemptId":"a-1","turn":1,"step":1,"nextIndex":2,"chunks":[{"type":"reasoning","delta":"需要查询设备资料。"},{"type":"text","delta":"我来查询。"}]}}}
+{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a-1","revision":4,"index":2,"chunk":{"type":"tool-call-delta","toolIndex":0,"callId":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}}}
+{"type":"assistant-stream","frame":{"type":"end","attemptId":"a-1","revision":5,"turn":1,"step":1,"index":3,"outcome":{"kind":"committed","eventType":"assistant/message","seq":4}}}
+{"type":"event","event":{"type":"assistant/message","seq":4,"time":1700000000017,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"1692aee5-495e-4a65-a350-62e3da31b3d3","role":"assistant","source":{"kind":"model","provider":"mock","model":"test-model"},"content":[{"type":"reasoning","text":"需要查询设备资料。"},{"type":"text","text":"我来查询。"},{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}]},"finishReason":{"kind":"tool_calls"},"includeInModelContext":true,"stream":[{"time":0,"chunk":{"type":"reasoning","delta":"需要查询设备资料。"}},{"time":4,"chunk":{"type":"text","delta":"我来查询。"}},{"time":7,"chunk":{"type":"tool_call","index":0,"callId":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}},{"time":8,"chunk":{"type":"finish","reason":{"kind":"tool_calls"}}}]}}}
+{"type":"event","event":{"type":"tool/call","seq":5,"time":1700000000018,"data":{"turn":1,"step":1,"callId":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}}}
+{"type":"event","event":{"type":"tool/operation","seq":6,"time":1700000000019,"data":{"turn":1,"step":1,"callId":"call-1","operationId":"op-1","toolName":"lookup","toolVersion":"1","validatedArgs":{"device":"A-17"}}}}
+```
+
+反向交接样例将上述 `end` 与 `seq=4` 事件交换，后续事件顺序相同。两种顺序的最终游标、实时版本和 UI 节点相同。工具卡片在 `seq=5` 建立，`seq=6` 更新已校验参数。如果此时 SQLite 只提交到 `seq=3`，HTTP 历史返回同样的前四条原始事件和 `cursor: 3`。
+
+**abandoned 与执行错误。** 快照中 Attempt 已开始，仍无实时分片。追加失败时以 `abandoned` 清除草稿，随后交付执行错误及失败终态。
+
+```jsonl
+{"type":"snapshot","sessionId":"s3","inheritedEventCount":0,"cursor":3,"records":[{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}},{"type":"event","event":{"type":"step/start","seq":1,"time":1700000000001,"data":{"turn":1,"step":1}}},{"type":"event","event":{"type":"user/message","seq":2,"time":1700000000002,"surfaceOp":"append","data":{"turn":1,"requestId":"req-2","id":"1692aee5-495e-4a65-a350-62e3da31b3d4","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"你好"}]}}},{"type":"event","event":{"type":"request/header","seq":3,"time":1700000000003,"data":{"reason":"initial","header":{"config":{"provider":"mock","model":"test-model"}}}}}],"assistantStream":{"revision":1,"activeAttempt":{"attemptId":"a-2","turn":1,"step":1,"nextIndex":0,"chunks":[]}}}
+{"type":"assistant-stream","frame":{"type":"end","attemptId":"a-2","revision":2,"turn":1,"step":1,"index":0,"outcome":{"kind":"abandoned"}}}
+{"type":"agent/error","turn":1,"message":"本轮执行失败"}
+{"type":"event","event":{"type":"step/end","seq":4,"time":1700000000100,"data":{"turn":1,"step":1}}}
+{"type":"event","event":{"type":"turn/end","seq":5,"time":1700000000101,"data":{"turn":1,"reason":{"kind":"error","error":{"code":"UNKNOWN","message":"本轮执行失败"}}}}}
+```
+
+**快照失败。** 本帧是该连接的第一帧和最后一帧。
+
+```json
+{"type":"error","error":{"code":"follow_sync_failed","message":"无法读取会话快照","details":{}}}
+```
+
+**服务端检测到缺号。** 发送首条事件后，下一条来源事件为 `seq=2`。服务端发送终止帧并关闭，客户端游标留在 0。
+
+```jsonl
+{"type":"snapshot","sessionId":"s4","inheritedEventCount":0,"cursor":-1,"records":[],"assistantStream":{"revision":0}}
+{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}}
+{"type":"error","error":{"code":"follow_sync_failed","message":"会话事件不连续","details":{"expectedSeq":1,"actualSeq":2}}}
+```
+
 
 ## Risks / Trade-offs
 
 - 工具能力可能声明错误 → 原型使用受控配置与模拟工具验证；未声明默认未知，不信任模型自报能力。
 - 审批不能消除响应丢失或重复效果 → 审批、幂等和超时状态分别验证，不相互替代。
 - 持久化与真实远端副作用不能天然原子提交 → 第一版仅保证模拟工具的事务幂等，真实工具需声明自己的保证。
-- 暂不核实未知结果 → 用户得到明确终态但可能需要外部检查，不提供一键重试未知副作用的入口。
+- 远程调用可能在 Harness 停止等待后仍有外部效果 → 首版重放已保存的通用失败，并保持现有的无自动重试策略。
 - 断线继续消耗资源、审批可能长期等待 → 提供显式取消、Turn 状态查询和有限模型/工具预算。审批期间不触发模型请求。
 - 权限体系后置 → 以本地受控原型运行，不将审批当作生产授权。
 - 异步接受与落盘之间存在窗口 → 明确持久游标、关键动作检查点和失败后的会话停止状态，不用内存通知代替提交成功。
@@ -366,7 +530,7 @@ Attempt 结算在同一协调机制下 append 并显式 flush。确认持久化�
 
 现有 1.1–1.4 是旧架构完成记录，不代表新设计已经实现。先完成 Session 重构任务，再继续模型与工具开发。事件序号、词汇与数据库布局发生不兼容变化：新版检查 schema 版本，对无版本旧库或未知版本拒绝启动并说明原因，不自动删除、重建或覆盖；使用显式指定的新数据库路径运行新格式，旧库原样保留。此 change 不承诺旧格式转换或 DSH JSONL 导入；如需保留旧历史在新系统中可读，另行设计显式迁移。回退使用旧程序及保留的旧库，不能让旧程序打开新库。
 
-重构交付时同步 README、HTTP 示例、Zod Schema 与测试，删除仅旧实现产生的孤立代码。空会话持久化后返回 201，首次提交持久化并由后端接管后返回 202，重试命中原提交或已落盘但交接失败返回 200，编号冲突或会话忙碌返回对应的 409。结果待确认和确认未提交按 §1.1 返回不同的 503 错误码。序号与事件内容按新版协议验收。未知副作用、审批与超时等既有产品规则保留，验证完成前不接入真实副作用系统。
+重构交付时同步 README、HTTP 示例、Zod Schema 与测试，删除仅旧实现产生的孤立代码。空会话持久化后返回 201。首次内存受理及重发命中返回 `202 { accepted: true }`，非空闲 Agent 拒绝新编号并返回 `409 { code: "agent_busy" }`。序号与事件内容按新版协议验收。未知副作用、审批与超时等既有产品规则保留，验证完成前不接入真实副作用系统。
 
 ## Open Questions
 
