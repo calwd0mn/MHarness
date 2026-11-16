@@ -42,4 +42,6 @@ Markdown 固定采用 react-markdown 10.1.0，官方发布页 https://github.com
 - 6.12 `2d2bad7`（父 `5d654e0`）：无正文 failed/cancelled/truncated 与后续 Turn 回归先失败后通过；状态行不暴露 reason、不生成空助手消息。
 - 6.15 `1fbcd0e`（父 `2d2bad7`）：unknown 切回丢重试约束和 pending 切回解锁两项先失败后通过；补事件先到、跨切换迟到 HTTP 与原会话归属。`e5025c5` 精确拆分答复结果类型并补充控制方法契约，`abe30ad` 修正卡片参数说明。
 - 6.16 `e5025c5`（父 `1fbcd0e`）：真实 App 的完整事件窗口、结果/终态关闭和同步失败/恢复三项新增测试首次即通过，是此前验收覆盖缺口，非虚报 red。隔离夹具可用 `fixture.html?scenario=result` 检查工具结果与轮次终态，`fixture.html?scenario=failed` 检查同步失败后点击重新同步恢复；可与 `theme=light` 或 `theme=dark` 组合。
-- 新鲜执行 `pnpm typecheck`、`pnpm --filter @mharness/web test`（Session 40、App 46）、`pnpm --filter @mharness/web build` 和 `git diff --check 4856b44..HEAD` 均通过。构建保留既有 Zod/Rollup 注释警告。以上修复等待独立复核，不替代复核结论；正式 6.3/6.4 联调仍未完成。
+- 新鲜执行 `pnpm typecheck`、`pnpm --filter @mharness/web test`（Session 40、App 46）、`pnpm --filter @mharness/web build` 和 `git diff --check 4856b44..HEAD` 均通过。构建保留既有 Zod/Rollup 注释警告。以上修复已由原独立审查 agent 复核闭环，完整审查记录见 `.scratch/frontend-session-experience/review.md`；正式 6.3/6.4 联调仍未完成。
+
+最终代码 `abe30ad` 的浏览器补充验收：`?scenario=result` 展示成功工具结果与 completed 终态，审批按钮关闭；`?scenario=failed` 保留历史且禁止审批，点击重新同步后恢复快照与审批按钮。截图为 `C:/Users/Risc4/.codex/visualizations/2026/11/16/01a1e461-3f4e-7bf1-9044-a968c96bc170/frontend-session-final-result.jpg`、同目录 `frontend-session-final-sync-failed.jpg`。实际 OS 主题切换、touch/reduced-motion 媒体与浏览器缩放的未验收限制保持不变。
