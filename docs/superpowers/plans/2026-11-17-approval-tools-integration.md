@@ -1,0 +1,39 @@
+# 审批、工具状态与 Turn 闭环实施计划
+
+用户通过 continue-dev 授权本批 6.3、6.4、7.5、7.6 的开发与必要修复，并预先要求开发后直接 continue-review，分别启动独立子 agent 审查各任务 diff。沿用 agent-harness-prototype 已确认设计，不走 OpenSpec apply，不归档，不开展 4.1–4.3，也不合并 main。
+
+基线 main@b7f0709。集成分支 codex/approval-tools-integration，工作树 .worktrees/approval-tools-integration。开发代理均为新建 GPT-6.1 Terra / high；各任务独立工作树、独立提交，统筹串行集成并记录 base/head。主工作区既有未跟踪文件和旧工作树保留。
+
+## 执行顺序与职责
+
+1. 统筹先保存本计划，运行基线检查并准备独立工作树。使用 planning-with-files 的持久记录方式，工作记录存入本批 .scratch，正式任务完成状态只维护 OpenSpec tasks.md。
+2. 新开发代理并行执行 6.3 与 6.4。6.3 拥有审批 HTTP 适配与共享审批契约接线及审批联调测试；6.4 拥有工具/消息/Turn 投影、卡片及工具联调测试。不要同时修改已有 app.test.jsx；各自新增独立测试入口。共用 package.json 或联调辅助设施由统筹协调。
+3. 集成两项后，由新开发代理执行 7.5：丢失中间消息实时 end、审批阶段取消、重连恢复、下一轮模型上下文、工具零执行。完成后再由新开发代理执行 7.6 与联验：成功 concludeTurn A + 明确错误 B、均执行且持久化、completed、无下一模型请求、真实页面结果一致。
+4. 统筹运行最终全仓类型检查、服务端全部测试、Web 全部测试及构建、diff check、OpenSpec strict validate；核对本批中文 JSDoc 与任务验收证据后才勾选四项。
+5. 直接进入已授权 continue-review。针对 6.3、6.4、7.5、7.6 分别新开独立只读审查代理，读取各任务 base/head 和最终集成调用链。证实的问题交开发代理修复并由独立审查者复核；修复后运行相关检查。最后保存审查与验收记录，不归档。
+
+## 验收矩阵
+
+| 任务 | 必须可验证的结果 |
+| --- | --- |
+| 6.3 | 浏览器消费唯一共享审批答复契约；真实审批按 id、operationId 对应确切工具/版本/参数；刷新恢复；200 重发、409 已有决定、409 approval_not_active、404 收敛；结果或终态关闭；重复答复无重复执行。 |
+| 6.4 | 真实 tool/call 准备卡片及原始参数、operation 已校验参数、可展开详情；增量、刷新快照、flush 后 HTTP 历史投影一致；参数错误配对；等待审批；截断/取消标签；无正文声明无空泡；reasoning 折叠；恢复 TOOL_NOT_STARTED；错误与 meta 重放。 |
+| 7.5 | 带文字调用提交后丢失 end，审批期间取消，通过真实链路重连；文字仅一次，工具正文计数 0；下一轮模型输入包含此前完整文字、工具调用及取消结果。 |
+| 7.6 | A 成功且 concludeTurn=true，B 明确失败；调用顺序与效果计数正确，两个结果均保存，Turn completed；Provider 请求总数 1；页面、重连、日志一致。 |
+
+## 实现与测试约束
+
+开发采用测试先行，记录真实 red/green；既有行为首次通过属于新增验收覆盖，不能虚报 red。使用生产 HTTP/SSE/Agent 路径、临时数据库、模拟 Provider 和无外部副作用的注册工具。不得用手写完整事件窗口替代正式联调；DOM 断言可检验真实 App 内容，但不能宣称本批验证了浏览器布局。
+
+TypeScript 禁止 any。应用 jsdoc-contracts、karpathy-guidelines 及代码注释规范；公共契约中文 JSDoc 记录行为、失败与资源所有权，内部注释仅说明必要原因。不增加 MCP 接入、自动重试、持久幂等台账、迟到核实或范围外重构。当前无专用 JSDoc 静态检查器，人工核对并如实报告。
+
+## 初始核对
+
+- 6.15 / 6.14 及后端 3.3 / 3.5 / 5.2 已实现；6.3、6.4、7.5、7.6 尚未勾选。
+- 审批请求/决定 Schema 现位于 apps/server/src/approval/contracts.ts，浏览器尚未统一消费；6.3 在现有 @mharness/session/contracts 浏览器边界提供同一 Schema，保持服务端兼容导出，避免双份定义。
+- 仓库无 GLOSSARY.md、docs/adr 或 .superpowers-memory，按规则继续，不创建空文档。
+- 上一批曾出现系统动态端口触发 fetch bad port；新增真实网络测试应避开禁用端口，保留实际失败证据，不用反复重试掩盖问题。
+
+## 执行与审查记录
+
+待随各阶段追加实际命令、任务 diff、结果与限制。
