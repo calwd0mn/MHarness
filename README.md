@@ -81,3 +81,9 @@ Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/approva
 - 对已有请求、无持久决定、但因工具结果或 Turn 终态关闭的审批返回 `409 { code: "approval_not_active" }`；审批不存在返回 `404`。
 - 同意只允许进入执行前检查点；用户明确拒绝和取消会停止本批后续派发并保存配对结果。重启修复保留原审批请求且不重新执行工具。
 - 审批检查点失败不会放行工具，并关闭对应 Agent 的存储准入；渠道失败单独处理，不冒充存储故障。接口兑现不表示浏览器已经收到后续事件。
+
+## 模拟 MCP 工具
+
+单独启动模拟服务：`pnpm --filter @mharness/mock-mcp dev`，默认仅监听 `127.0.0.1:3101`。可通过 `MHARNESS_MOCK_MCP_PORT` 修改端口。启动后端前显式设置 `MHARNESS_MCP_ENDPOINT=http://127.0.0.1:3101/mcp` 才会连接；未设置时保持默认行为。可信配置将 `mock_read` 设为只读免审批，`mock_write` 设为副作用且需审批。模拟模型默认只回答文本，可在测试驱动中发出工具调用。
+
+服务使用 MCP Streamable HTTP，输入保留顶层 `operationId`，只由 Harness 在操作记录建立后注入。模型输入和包含标识的完整输入分别按远端 JSON Schema 校验，服务入口也独立校验。仅支持可安全移除保留字段的顶层对象规则；复杂的跨字段约束会在连接时拒绝。MCP 默认采用远程取消策略，即使地址是 localhost 也不保证服务端停止。当前模拟写入尚无持久台账或去重能力；不要将其作为真实副作用服务。

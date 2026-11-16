@@ -32,7 +32,7 @@ export function defineLocalToolOutput<Args, Value>(definition: {
   presentationMeta?: (args: Args, value: Value) => unknown;
 }): LocalToolOutput<Args, Value> {
   // Zod 附加不可枚举的运行时元数据，JSON Schema 快照只保留可传输部分。
-  const schema = snapshot(JSON.parse(JSON.stringify(toToolJsonSchema(definition.schema)))) as Record<string, unknown>;
+  const schema = snapshotToolJson(JSON.parse(JSON.stringify(toToolJsonSchema(definition.schema)))) as Record<string, unknown>;
   return Object.freeze({ schema, [outputValidator]: definition.schema, render: definition.render,
     ...(definition.presentationMeta ? { presentationMeta: definition.presentationMeta } : {}) });
 }
@@ -52,7 +52,14 @@ export class HarnessError extends Error {
   }
 }
 
-function snapshot(value: unknown, ancestors = new Set<object>()): ToolJson {
+/**
+ * 创建不可变、无损的 JSON 快照。
+ * @param value - 待复制的数据。
+ * @param ancestors - 内部递归使用的祖先集合；调用方应省略。
+ * @returns 不与原数据共享可变对象的快照。
+ * @throws 数据无法无损表示为 JSON 或存在循环引用时抛出。
+ */
+export function snapshotToolJson(value: unknown, ancestors = new Set<object>()): ToolJson {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0)) return value;
   if (typeof value !== "object" || ancestors.has(value)) throw new TypeError("无效 JSON");
@@ -65,13 +72,13 @@ function snapshot(value: unknown, ancestors = new Set<object>()): ToolJson {
     };
     if (Array.isArray(value)) {
       if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length + 1) throw new TypeError("无效 JSON");
-      return Object.freeze(Array.from({ length: value.length }, (_, i) => snapshot(read(String(i)), ancestors))) as ToolJson[];
+      return Object.freeze(Array.from({ length: value.length }, (_, i) => snapshotToolJson(read(String(i)), ancestors))) as ToolJson[];
     }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError("无效 JSON");
     const entries = Reflect.ownKeys(value).map((key) => {
       if (typeof key !== "string") throw new TypeError("无效 JSON");
-      return [key, snapshot(read(key), ancestors)] as const;
+      return [key, snapshotToolJson(read(key), ancestors)] as const;
     });
     return Object.freeze(Object.fromEntries(entries));
   } finally {
@@ -107,12 +114,12 @@ export function normalizeLocalToolResult<Args, Value>(
   output: LocalToolOutput<Args, Value>, args: Args, candidate: unknown, concludeTurn?: boolean,
 ): ToolResult<Value> {
   try {
-    const argsSnapshot = snapshot(args) as Args;
-    const parsed = output[outputValidator].parse(snapshot(candidate));
-    const value = snapshot(parsed) as Value;
-    const content = snapshot(output.render(argsSnapshot, value));
+    const argsSnapshot = snapshotToolJson(args) as Args;
+    const parsed = output[outputValidator].parse(snapshotToolJson(candidate));
+    const value = snapshotToolJson(parsed) as Value;
+    const content = snapshotToolJson(output.render(argsSnapshot, value));
     if (!Array.isArray(content)) throw new TypeError("无效内容");
-    const meta = output.presentationMeta ? snapshot(output.presentationMeta(argsSnapshot, value)) : undefined;
+    const meta = output.presentationMeta ? snapshotToolJson(output.presentationMeta(argsSnapshot, value)) : undefined;
     return { isError: false, value, content, ...(meta !== undefined ? { meta } : {}), ...(concludeTurn !== undefined ? { concludeTurn } : {}) };
   } catch {
     return failure("工具输出不符合结果契约。", { name: "InvalidToolOutputError", code: "INVALID_TOOL_OUTPUT" });

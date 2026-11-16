@@ -3,6 +3,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { localConfig } from "../../../config/local.ts";
 import { createEventSessionApp } from "./app.ts";
+import { ToolRegistry } from "./tools/registry.ts";
+import { connectMcpTools } from "./tools/mcp.ts";
 
 const repository = fileURLToPath(new URL("../../../", import.meta.url));
 const configuredPath = process.env[localConfig.sessionDatabasePathVariable];
@@ -11,7 +13,17 @@ if (configuredPath !== undefined && !configuredPath.trim()) {
 }
 const databasePath = resolve(repository, configuredPath ?? "data/mharness-events.sqlite");
 await mkdir(dirname(databasePath), { recursive: true });
-const app = await createEventSessionApp(databasePath, true);
+const endpoint = process.env.MHARNESS_MCP_ENDPOINT;
+const registry = endpoint ? new ToolRegistry() : undefined;
+const mcp = endpoint && registry ? await connectMcpTools(registry, endpoint) : undefined;
+let app: Awaited<ReturnType<typeof createEventSessionApp>>;
+try {
+  app = await createEventSessionApp(databasePath, true, undefined, { toolRegistry: registry });
+} catch (error) {
+  await mcp?.close();
+  throw error;
+}
+if (mcp) app.addHook("onClose", async () => { await mcp.close(); });
 
 function shutdown() {
   void app.close().catch((error: unknown) => {

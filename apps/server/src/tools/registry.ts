@@ -20,7 +20,7 @@ type LocalOptions<S extends z.ZodType, V> = GovernanceOptions & {
   name: string; version: string; description: string; input: S; handler: (args: z.output<S>, signal: AbortSignal) => V;
   output?: LocalToolOutput<z.output<S>, Awaited<V>>; concludeTurn?: boolean;
 };
-/** 模型可见的本地工具定义，不包含治理策略或正文。 */
+/** 模型可见的工具定义，不包含治理策略或正文。 */
 export interface ToolDefinition { readonly name: string; readonly description: string; readonly inputSchema: Record<string, unknown> }
 /** 绑定的已验证调用；调用方须在执行前完成审批、持久化检查点和取消检查。 */
 export interface PreparedToolCall {
@@ -28,24 +28,34 @@ export interface PreparedToolCall {
   /**
    * 执行已绑定正文；兑现或拒绝表示正文返回或抛错。
    * @param signal - 传给正文的取消请求；省略时使用未取消的信号，不保证正文停止。
+   * @param operationId - 已持久化的操作标识；需要注入标识的远程工具必须提供。
    * @returns 正文的原始返回值。
    */
-  execute(signal?: AbortSignal): Promise<unknown>;
+  execute(signal?: AbortSignal, operationId?: string): Promise<unknown>;
   /**
    * 执行正文并校验输出；未配置输出契约时返回契约失败，正文抛错时 Promise 拒绝。
    * 派发器停止观察后，迟到值不会进入校验或内容派生，Promise 拒绝；这不证明执行端没有副作用。
    * @param signal - 传给正文的取消请求，不保证正文已经停止。
+   * @param operationId - 已持久化的操作标识；需要注入标识的远程工具必须提供。
    * @returns 已校验的成功结果或输出契约失败。
    */
-  executeNormalized(signal: AbortSignal): Promise<ToolResult<unknown>>;
+  executeNormalized(signal: AbortSignal, operationId?: string): Promise<ToolResult<unknown>>;
 }
 /** 准备失败不发起审批或执行。 */
 export type PrepareResult = { readonly ok: true; readonly call: PreparedToolCall } | { readonly ok: false; readonly code: "UNKNOWN_TOOL" | "INVALID_JSON" | "INVALID_INPUT" };
-interface LocalTool {
+/** 可注册工具负责校验输入并绑定不可变参数。 */
+export interface RegisteredTool {
   readonly name: string; readonly definition: ToolDefinition; readonly governance: ToolGovernance;
   prepare(input: unknown): PrepareResult;
 }
-function governance(options: GovernanceOptions, executionBoundary: "local" | "remote"): ToolGovernance {
+/**
+ * 根据可信配置生成不可变治理策略，未指定超时时采用集中默认值。
+ * @param options - 治理配置；超时以毫秒计且必须在计时器支持的范围内。
+ * @param executionBoundary - 可信执行边界，不由模型指定。
+ * @returns 已补全默认值的治理策略。
+ * @throws 超时无效时抛错。
+ */
+export function toolGovernance(options: GovernanceOptions, executionBoundary: "local" | "remote"): ToolGovernance {
   const timeoutMs = options.timeoutMs ?? localConfig.tools.timeoutMs;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) throw new Error("timeoutMs 必须大于 0 且不超过 2_147_483_647 毫秒");
   const sideEffect = options.sideEffect ?? "unknown";
@@ -69,9 +79,9 @@ function freezeJson(value: unknown): void {
  * @returns 可注册的本地工具。
  * @throws 输入定义不受支持或超时无效时抛出错误。
  */
-export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S, V>): LocalTool {
+export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S, V>): RegisteredTool {
   const inputSchema = toToolJsonSchema(options.input);
-  const policy = governance(options, "local");
+  const policy = toolGovernance(options, "local");
   const { name, version, handler, input, output, concludeTurn } = options;
   const definition = { name, description: options.description, inputSchema };
   freezeJson(definition);
@@ -92,10 +102,10 @@ export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S,
 }
 /** 保存可信工具注册信息并准备完整模型参数。 */
 export class ToolRegistry {
-  private readonly local = new Map<string, LocalTool>();
+  private readonly local = new Map<string, RegisteredTool>();
   private readonly policies = new Map<string, ToolGovernance>();
-  /** 注册本地工具；名称重复时抛错。 */
-  register(tool: LocalTool): void {
+  /** 注册已绑定治理的工具；名称重复时抛错。 */
+  register(tool: RegisteredTool): void {
     if (this.policies.has(tool.name)) throw new Error("工具名称已注册");
     this.local.set(tool.name, tool); this.policies.set(tool.name, tool.governance);
   }
@@ -106,11 +116,11 @@ export class ToolRegistry {
    */
   registerRemote(options: GovernanceOptions & { name: string; version: string; executionBoundary: "remote"; endpoint: string }): void {
     if (this.policies.has(options.name)) throw new Error("工具名称已注册");
-    this.policies.set(options.name, governance(options, "remote"));
+    this.policies.set(options.name, toolGovernance(options, "remote"));
   }
   /** 返回指定工具的可信治理信息；未注册时返回 undefined。 */
   governance(name: string): ToolGovernance | undefined { return this.policies.get(name); }
-  /** 返回本地工具的模型可见定义副本。 */
+  /** 返回已注册工具的模型可见定义副本。 */
   definitions(): ToolDefinition[] { return [...this.local.values()].map((tool) => structuredClone(tool.definition)); }
   /**
    * 解析完整 arguments 并校验，不请求审批或执行正文。

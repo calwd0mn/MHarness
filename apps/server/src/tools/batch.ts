@@ -81,7 +81,7 @@ export async function runToolBatch(session: Session, registry: ToolRegistry, app
     if (signal.aborted) cancel();
     let outcome: DispatchOutcome<ToolResult<unknown>>;
     try {
-      outcome = await gate.dispatch((toolSignal) => prepared.call.executeNormalized(toolSignal), prepared.call.governance);
+      outcome = await gate.dispatch((toolSignal) => prepared.call.executeNormalized(toolSignal, prepared.operation.data.operationId), prepared.call.governance);
     } finally {
       signal.removeEventListener("abort", cancel);
     }
