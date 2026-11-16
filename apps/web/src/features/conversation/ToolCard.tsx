@@ -4,7 +4,7 @@ import type { ToolView } from "../../session/tools.ts";
 import styles from "./ToolCard.module.css";
 
 /** 展示工具调用的已记录参数、结果和可检查元数据。
- * @param props - tool 是同一会话的投影事实，enabled 表示审批可交互，onDecide 负责提交决定。
+ * @param props - tool 是同一会话的投影事实，enabled 表示审批可交互，approvals 持有跨切换请求状态及提交动作。
  * @returns 可展开的工具详情；允许后仅显示等待结果。
  */
 export function ToolCard({ tool, sessionId, enabled, approvals }: { tool: ToolView; sessionId: string; enabled: boolean; approvals: ReturnType<typeof useApprovals> }) {

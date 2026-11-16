@@ -214,5 +214,3 @@ export function useConversation() {
   const visibleMessages = state.sessionId === selected ? messages(state) : [];
   return { approvals, sessions, selected, setSelected, state, submissions, text, setText, notice, creating, controller, createSession, send, cancel, submission, confirmedRecord, visibleMessages };
 }
-
-

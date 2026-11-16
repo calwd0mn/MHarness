@@ -29,4 +29,3 @@ export function Approval({ approval, enabled, decision, closed = false, request,
       <Button disabled={!enabled || pending || uncertain === "allowed-once"} onClick={() => submit("rejected")}>拒绝</Button></>}
   </div>;
 }
-

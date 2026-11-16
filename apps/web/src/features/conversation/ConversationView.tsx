@@ -220,7 +220,3 @@ export function Composer({ text, setText, selected, submission, send }: Pick<Ret
         </form>
   );
 }
-
-
-
-
