@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState } from "react";
 import { AssistantMarkdown } from "./AssistantMarkdown.tsx";
 import { Button } from "../../components/ui/Button.tsx";
 import { lastTurn } from "../../session/view.ts";
@@ -77,8 +78,41 @@ export function ConversationHeader({ selected, sessions, state, cancel }: Pick<R
 
 /** 显示当前会话消息与同步反馈。 */
 export function MessageStream({ visibleMessages, submission, state, selected, confirmedRecord, notice, controller, setText }: Pick<ReturnType<typeof useConversation>, "visibleMessages" | "submission" | "state" | "selected" | "confirmedRecord" | "notice" | "controller" | "setText">) {
+  const area = useRef<HTMLDivElement>(null);
+  const positions = useRef<Record<string, { top: number; following: boolean }>>({});
+  const [following, setFollowing] = useState(true);
+  useLayoutEffect(() => {
+    const node = area.current;
+    if (!node || !selected) return;
+    const saved = positions.current[selected] ?? { top: 0, following: true };
+    setFollowing(saved.following);
+    node.scrollTop = saved.following ? node.scrollHeight : saved.top;
+  }, [selected]);
+  useLayoutEffect(() => {
+    const node = area.current;
+    if (!node || !selected) return;
+    const follow = () => { if (positions.current[selected]?.following !== false) node.scrollTop = node.scrollHeight; };
+    follow();
+    const observer = new MutationObserver(follow);
+    observer.observe(node, { childList: true, subtree: true, characterData: true, attributes: true });
+    return () => observer.disconnect();
+  }, [selected, state, visibleMessages]);
+  function onScroll() {
+    const node = area.current;
+    if (!node || !selected) return;
+    const next = node.scrollHeight - node.clientHeight - node.scrollTop <= 24;
+    positions.current[selected] = { top: node.scrollTop, following: next };
+    setFollowing(next);
+  }
+  function latest() {
+    const node = area.current;
+    if (!node || !selected) return;
+    node.scrollTop = node.scrollHeight;
+    positions.current[selected] = { top: node.scrollTop, following: true };
+    setFollowing(true);
+  }
   return (
-    <div className="messages" aria-live="polite">
+    <div className="messages" aria-live="polite" ref={area} onScroll={onScroll}>
           {visibleMessages.length === 0 &&
             !submission &&
             !state.agentError &&
@@ -137,6 +171,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
             </article>
           )}
           {notice && <p role="status">{notice}</p>}
+          {!following && <Button className="return-latest" onClick={latest}>返回最新</Button>}
         </div>
   );
 }
@@ -164,5 +199,6 @@ export function Composer({ text, setText, selected, submission, send }: Pick<Ret
         </form>
   );
 }
+
 
 

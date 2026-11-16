@@ -244,3 +244,17 @@ test("流式推理独立折叠，未闭合代码块可读且复制失败可见",
   await click(button("复制"));
   expect(container.textContent).toContain("复制失败");
 });
+
+test("阅读位置按会话保存，主动上滚后可返回最新", async () => {
+  await sendFrame(connections[0], snapshot("a", [userRecord("a")]));
+  const area = container.querySelector(".messages");
+  Object.defineProperties(area, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 200 } });
+  await act(async () => { area.scrollTop = 100; area.dispatchEvent(new Event("scroll")); });
+  expect(button("返回最新")).toBeTruthy();
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", [userRecord("a")]));
+  expect(area.scrollTop).toBe(100);
+  await click(button("返回最新"));
+  expect(area.scrollTop).toBe(1000);
+  expect(button("返回最新")).toBeFalsy();
+});
