@@ -1,58 +1,87 @@
-/** Session follow 流的业务帧契约。 */
+/** Session follow 流的业务帧契约；跨帧顺序由消费者校验。 */
 import { z } from "zod";
-import { attemptIdentitySchema, attemptOutcomeSchema, sessionRecordSchema } from "./history.ts";
+import { rawSessionEventFrameSchema } from "./raw-history.ts";
+import { sessionParamsSchema } from "./submission.ts";
 
-const toolCallChunkData = {
-  callId: z.string().min(1),
-  name: z.string().min(1),
-  arguments: z.string(),
-};
-
-/** 模型尝试的流式片段。工具参数可先分段到达，完整调用用 tool/call 表达。 */
+const position = z.int().nonnegative();
+const scope = { turn: z.int().positive(), step: z.int().positive() };
+/** 实时分片；工具调用首片包含标识和名称，后续重带时须保持一致。 */
 export const assistantChunkSchema = z.discriminatedUnion("type", [
-  z.strictObject({ type: z.literal("text/delta"), text: z.string() }),
-  z.strictObject({ type: z.literal("tool/arguments-delta"), ...toolCallChunkData }),
-  z.strictObject({ type: z.literal("tool/call"), ...toolCallChunkData }),
+  z.strictObject({ type: z.literal("text"), delta: z.string() }),
+  z.strictObject({ type: z.literal("reasoning"), delta: z.string() }),
+  z.strictObject({
+    type: z.literal("tool-call-delta"),
+    toolIndex: position,
+    argumentsDelta: z.string(),
+    callId: z.string().min(1).optional(),
+    name: z.string().min(1).optional(),
+  }),
 ]);
-
-const activeAttemptSchema = attemptIdentitySchema.extend({
+const activeAttemptSchema = z.strictObject({
+  attemptId: z.string().min(1),
+  ...scope,
   chunks: z.array(assistantChunkSchema),
-  nextIndex: z.int().nonnegative(),
+  nextIndex: position,
 });
-
-/** 按 type 校验单个业务帧。快照包含公开历史，可携带当前草稿。跨帧顺序由消费者处理。 */
-export const followFrameSchema = z.discriminatedUnion("type", [
+const identity = { attemptId: z.string().min(1), revision: z.int().positive() };
+const streamFrameSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("start"), ...identity, ...scope }),
   z.strictObject({
-    type: z.literal("snapshot"),
-    sessionId: z.string().min(1),
-    records: z.array(sessionRecordSchema),
-    cursor: z.int().nonnegative(),
-    assistantStream: z.strictObject({
-      revision: z.int().nonnegative(),
-      activeAttempt: activeAttemptSchema.optional(),
-    }),
-  }),
-  z.strictObject({ type: z.literal("record"), record: sessionRecordSchema }),
-  attemptIdentitySchema.extend({
-    type: z.literal("assistant/start"),
-    revision: z.int().positive(),
-  }),
-  z.strictObject({
-    type: z.literal("assistant/chunk"),
-    revision: z.int().positive(),
-    attemptId: z.string().min(1),
-    index: z.int().nonnegative(),
+    type: z.literal("chunk"),
+    ...identity,
+    index: position,
     chunk: assistantChunkSchema,
   }),
   z.strictObject({
-    type: z.literal("assistant/end"),
-    revision: z.int().positive(),
-    attemptId: z.string().min(1),
-    nextIndex: z.int().nonnegative(),
-    outcome: attemptOutcomeSchema,
-    recordSeq: z.int().positive(),
+    type: z.literal("end"),
+    ...identity,
+    ...scope,
+    index: position,
+    outcome: z.discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.literal("committed"),
+        eventType: z.enum(["assistant/message", "assistant/attempt"]),
+        seq: position,
+      }),
+      z.strictObject({ kind: z.literal("abandoned") }),
+    ]),
   }),
 ]);
-
+/** 单帧结构校验；快照前缀和实时帧的连续性须由消费者另行校验。 */
+export const followFrameSchema = z.discriminatedUnion("type", [
+  sessionParamsSchema.extend({
+    type: z.literal("snapshot"),
+    inheritedEventCount: position,
+    cursor: z.int().min(-1),
+    records: z.array(rawSessionEventFrameSchema),
+    assistantStream: z.strictObject({
+      revision: position,
+      activeAttempt: activeAttemptSchema.optional(),
+    }),
+  }),
+  rawSessionEventFrameSchema,
+  z.strictObject({
+    type: z.literal("assistant-stream"),
+    frame: streamFrameSchema,
+  }),
+  z.strictObject({
+    type: z.literal("agent/error"),
+    turn: z.int().positive(),
+    message: z.string(),
+  }),
+  z.strictObject({
+    type: z.literal("error"),
+    error: z.strictObject({
+      code: z.literal("follow_sync_failed"),
+      message: z.string(),
+      details: z.union([
+        z.strictObject({}),
+        z.strictObject({ expectedSeq: position, actualSeq: position }),
+      ]),
+    }),
+  }),
+]);
+/** 实时 Assistant 片段。 */
 export type AssistantChunk = z.infer<typeof assistantChunkSchema>;
+/** follow 业务帧，不含 SSE 心跳注释。 */
 export type FollowFrame = z.infer<typeof followFrameSchema>;
