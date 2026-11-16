@@ -82,7 +82,7 @@ export function ConversationHeader({ selected, sessions, state, cancel }: Pick<R
 }
 
 /** 显示当前会话消息与同步反馈。 */
-export function MessageStream({ visibleMessages, submission, state, selected, confirmedRecord, notice, controller, setText, decideApproval }: Pick<ReturnType<typeof useConversation>, "visibleMessages" | "submission" | "state" | "selected" | "confirmedRecord" | "notice" | "controller" | "setText" | "decideApproval">) {
+export function MessageStream({ visibleMessages, submission, state, selected, confirmedRecord, notice, controller, setText, approvals }: Pick<ReturnType<typeof useConversation>, "visibleMessages" | "submission" | "state" | "selected" | "confirmedRecord" | "notice" | "controller" | "setText" | "approvals">) {
   const area = useRef<HTMLDivElement>(null);
   const positions = useRef<Record<string, { top: number; following: boolean }>>({});
   const [following, setFollowing] = useState(true);
@@ -155,7 +155,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
           )}
           {[...visibleMessages.map((message) => ({ kind: "message" as const, order: message.order, message })),
             ...(state.sessionId === selected ? projectTools(state.records) : []).map((tool) => ({ kind: "tool" as const, order: tool.order, tool }))]
-            .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} onDecide={decideApproval} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
+            .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} approvals={approvals} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
               const message = entry.message;
               if (message.role === "系统") return <p key={message.key} role="status">{message.text}</p>;
               return (

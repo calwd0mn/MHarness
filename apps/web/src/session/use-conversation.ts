@@ -1,4 +1,4 @@
-import { decideApproval } from "./approval.ts";
+import { useApprovals } from "./use-approvals.ts";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   createSessionResponseSchema,
@@ -38,6 +38,7 @@ const initialState: FollowState = {
  * @returns 当前页面状态和动作；草稿只在页面存活期间按会话保存，切换只释放订阅。
  */
 export function useConversation() {
+  const approvals = useApprovals();
   const [initialDirectory] = useState(() => loadDirectory(browserStorage()));
   const [sessions, setSessions] = useState<string[]>(initialDirectory.sessions);
   const [selected, setSelectedState] = useState<string | null>(
@@ -84,6 +85,7 @@ export function useConversation() {
         return { close: () => source.close() };
       },
       onState(next) {
+        if (next.sessionId) approvals.observe(next.sessionId, next.records);
         setState(next);
         if (next.sessionId)
           setSubmissions((previous) => {
@@ -210,7 +212,7 @@ export function useConversation() {
       state.inheritedEventCount,
     ).status === "accepted";
   const visibleMessages = state.sessionId === selected ? messages(state) : [];
-  return { decideApproval, sessions, selected, setSelected, state, submissions, text, setText, notice, creating, controller, createSession, send, cancel, submission, confirmedRecord, visibleMessages };
+  return { approvals, sessions, selected, setSelected, state, submissions, text, setText, notice, creating, controller, createSession, send, cancel, submission, confirmedRecord, visibleMessages };
 }
 
 

@@ -1,9 +1,15 @@
-import { decideApproval } from "./session/approval.ts";
+import { useApprovals } from "./session/use-approvals.ts";
+import { Approval as ApprovalView } from "./features/conversation/Approval.tsx";
 // @vitest-environment jsdom
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./App.tsx";
+
+function Approval({ approval, enabled, decision, closed }) {
+  const approvals = useApprovals();
+  return <ApprovalView approval={approval} enabled={enabled} decision={decision} closed={closed} request={approvals.get("a", approval.id, approval.operationId)} onSubmit={(outcome) => void approvals.submit("a", approval.id, approval.operationId, outcome)} />;
+}
 
 const connections = [];
 class Source {
@@ -309,11 +315,10 @@ test("工具卡片在消息之间按原始事件顺序展示", async () => {
 });
 
 test("审批点击与键盘共用请求锁，冲突按服务端决定收敛", async () => {
-  const { Approval } = await import("./features/conversation/Approval.tsx");
   let resolve;
   fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
   const approval = { id: "p", operationId: "op", toolName: "工具", reason: "需要许可" };
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={approval} enabled />));
+  await act(async () => root.render(<Approval approval={approval} enabled />));
   const detail = container.querySelector('[tabindex="0"]');
   await act(async () => { button("单次允许").click(); detail.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
   expect(fetch).toHaveBeenCalledTimes(1);
@@ -337,34 +342,31 @@ test("视口尺寸变化时仅跟随模式滚到底部", async () => {
 });
 
 for (const [status, body, expected] of [[200, { id: "p", outcome: "allowed-once" }, "已允许"], [409, { code: "approval_not_active" }, "审批已失效"], [404, {}, "审批不存在"]]) test(`审批 HTTP ${status} 按权威响应结束交互`, async () => {
-  const { Approval } = await import("./features/conversation/Approval.tsx");
   fetch.mockResolvedValue({ status, ok: status === 200, json: async () => body });
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
+  await act(async () => root.render(<Approval approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
   await click(button("单次允许"));
   expect(container.textContent).toContain(expected);
   expect(button("单次允许")).toBeFalsy();
 });
 
 test("审批网络未知仅允许重试原决定，事件确认不会被迟到响应覆盖", async () => {
-  const { Approval } = await import("./features/conversation/Approval.tsx");
   const approval = { id: "p", operationId: "op", toolName: "工具", reason: "原因" };
   fetch.mockRejectedValueOnce(new Error("lost"));
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={approval} enabled />));
+  await act(async () => root.render(<Approval approval={approval} enabled />));
   await click(button("单次允许"));
   expect(container.textContent).toContain("结果未知");
   expect(button("拒绝").disabled).toBe(true);
   let resolve;
   fetch.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
   await click(button("单次允许"));
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={approval} enabled decision="rejected" />));
+  await act(async () => root.render(<Approval approval={approval} enabled decision="rejected" />));
   await act(async () => resolve({ status: 200, ok: true, json: async () => ({ id: "p", outcome: "allowed-once" }) })); await flush();
   expect(container.textContent).toContain("已拒绝");
   expect(container.textContent).not.toContain("已允许");
 });
 
 test("审批快捷键不抢原生按钮、输入与输入法", async () => {
-  const { Approval } = await import("./features/conversation/Approval.tsx");
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
+  await act(async () => root.render(<Approval approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
   const detail = container.querySelector('[tabindex="0"]');
   await act(async () => { button("拒绝").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); detail.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: true })); });
   expect(fetch).not.toHaveBeenCalled();
@@ -392,9 +394,8 @@ test("会话导航可折叠并用可访问状态说明当前展开情况", async
 });
 
 for (const outcome of ["cancelled", "unavailable"]) test(`审批冲突已有 ${outcome} 时结束交互`, async () => {
-  const { Approval } = await import("./features/conversation/Approval.tsx");
   fetch.mockResolvedValue({ status: 409, ok: false, json: async () => ({ id: "p", outcome }) });
-  await act(async () => root.render(<Approval onDecide={(outcome) => decideApproval("a", "p", outcome)} approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
+  await act(async () => root.render(<Approval approval={{ id: "p", operationId: "op", toolName: "工具", reason: "原因" }} enabled />));
   await click(button("单次允许"));
   expect(container.textContent).toContain("审批已结束");
   expect(button("单次允许")).toBeFalsy();
@@ -483,4 +484,44 @@ test("无正文失败、取消和截断尝试保留状态且后续轮次可读",
   expect(container.textContent).not.toContain("不展示诊断");
   expect(container.textContent).toContain("正在处理");
   expect(container.querySelectorAll("article.assistant")).toHaveLength(0);
+});
+
+const approvalWindow = () => [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 }), record(2, "tool/call", { turn: 1, step: 1, callId: "x", name: "工具", arguments: "{}" }), record(3, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op", toolName: "工具", toolVersion: "1", validatedArgs: {} }), record(4, "approval/asked", { id: "p", operationId: "op", toolName: "工具", reason: "原因" })];
+
+test("审批网络未知切回后仅可重试原决定", async () => {
+  const events = approvalWindow(); await sendFrame(connections[0], snapshot("a", events));
+  fetch.mockRejectedValueOnce(new Error("lost")); await click(button("单次允许"));
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", events));
+  expect(container.textContent).toContain("结果未知");
+  expect(button("拒绝").disabled).toBe(true);
+  fetch.mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({ id: "p", outcome: "allowed-once" }) });
+  await click(button("单次允许"));
+  expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({ outcome: "allowed-once" });
+});
+
+test("审批请求跨切换保持锁，事件先到时迟到回调不可覆盖", async () => {
+  const events = approvalWindow(); await sendFrame(connections[0], snapshot("a", events));
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await click(button("单次允许"));
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", events));
+  expect(button("单次允许").disabled).toBe(true);
+  expect(button("拒绝").disabled).toBe(true);
+  await sendFrame(connections[2], record(5, "approval/decided", { id: "p", outcome: "rejected" }));
+  await act(async () => resolve({ status: 200, ok: true, json: async () => ({ id: "p", outcome: "allowed-once" }) })); await flush();
+  expect(container.textContent).toContain("已拒绝");
+  expect(container.textContent).not.toContain("已允许");
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+test("审批请求切走后 HTTP 确认仍归原会话，切回可见", async () => {
+  const events = approvalWindow(); await sendFrame(connections[0], snapshot("a", events));
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await click(button("单次允许")); await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await act(async () => resolve({ status: 200, ok: true, json: async () => ({ id: "p", outcome: "allowed-once" }) })); await flush();
+  expect(container.textContent).not.toContain("已允许");
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", events));
+  expect(container.textContent).toContain("已允许");
+  expect(container.textContent).toContain("等待结果");
 });
