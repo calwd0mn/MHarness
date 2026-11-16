@@ -106,3 +106,11 @@ pnpm dev
 ```powershell
 pnpm --filter @mharness/mock-mcp test
 ```
+
+响应丢失可通过测试或自定义模拟服务启动代码显式注入：
+
+```ts
+const server = await startMockMcp(0, databasePath, { dropResponseOnceForOperationId: "op-1" });
+```
+
+该选项只影响指定 `operationId` 的一次成功 `mock_write`（包括重用已保存的结果）：SQLite 事务提交后断开该请求的 HTTP 响应。读取、其他操作、参数无效和冲突不会消耗故障。默认关闭；状态仅存在于服务实例中，每次启动时再次传入选项都会重新启用，不传则关闭。上述测试使用临时数据库和真实 MCP SDK 验证响应丢失、提交后的结果及手动重发，不会触及默认数据库，也不会触发 Harness 自动重试。

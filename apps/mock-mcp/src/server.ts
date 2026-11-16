@@ -13,11 +13,13 @@ const validate = new Ajv2020().compile(inputSchema);
  * 在本机启动模拟 MCP 服务，并持有独立的效果与操作台账数据库。
  * @param port - 监听端口，0 由系统分配。
  * @param databasePath - SQLite 文件路径，默认使用临时内存数据库。
+ * @param options - 可选故障注入；指定操作的首次成功写入响应（含已有结果）会在事务提交后丢失；每次传入配置启动都会重新生效。
  * @returns 服务地址、已提交效果快照和关闭接口；调用方负责关闭服务，关闭会等待已接收的请求处理结束。
  * @throws 数据库打开或监听失败时 Promise 拒绝。
  */
-export async function startMockMcp(port = 0, databasePath = ":memory:"): Promise<{ url: string; effects(): readonly string[]; close(): Promise<void> }> {
+export async function startMockMcp(port = 0, databasePath = ":memory:", options: { dropResponseOnceForOperationId?: string } = {}): Promise<{ url: string; effects(): readonly string[]; close(): Promise<void> }> {
   const ledger = new MockLedger(databasePath);
+  let dropResponseFor = options.dropResponseOnceForOperationId;
   const active = new Set<Promise<void>>();
   const http = createServer((req, res) => {
     const handling = (async () => {
@@ -31,7 +33,15 @@ export async function startMockMcp(port = 0, databasePath = ":memory:"): Promise
       const args = request.params.arguments;
       if (!validate(args) || !args || typeof args.text !== "string" || typeof args.operationId !== "string") return { isError: true, content: [{ type: "text", text: "参数校验失败。" }] };
       if (request.params.name === "mock_read") return { content: [{ type: "text", text: args.text }] };
-      if (request.params.name === "mock_write") return ledger.write(args.operationId, request.params.name, { text: args.text }) ?? { isError: true, content: [{ type: "text", text: "操作标识与已有工具或参数冲突。" }] };
+      if (request.params.name === "mock_write") {
+        const result = ledger.write(args.operationId, request.params.name, { text: args.text });
+        if (!result) return { isError: true, content: [{ type: "text", text: "操作标识与已有工具或参数冲突。" }] };
+        if (dropResponseFor === args.operationId) {
+          dropResponseFor = undefined;
+          res.destroy();
+        }
+        return result;
+      }
       return { isError: true, content: [{ type: "text", text: "工具不存在。" }] };
     });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

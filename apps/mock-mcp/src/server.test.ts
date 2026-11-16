@@ -163,3 +163,61 @@ test("操作标识和效果中的 NUL 与未配对代理项在重启后无损区
     assert.deepEqual(server.effects(), inputs.map(([, text]) => text));
   } finally { await server.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test("成功提交后丢失响应，显式重发返回保存结果且不重复产生效果", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-response-loss-"));
+  const path = join(dir, "mock.sqlite");
+  const server = await startMockMcp(0, path, { dropResponseOnceForOperationId: "target" });
+  let calls = 0;
+  const client = new Client({ name: "test", version: "1" });
+  const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+    fetch: async (input, init) => {
+      if (typeof init?.body === "string" && JSON.parse(init.body).method === "tools/call") calls++;
+      return fetch(input, init);
+    },
+  });
+  try {
+    await client.connect(transport);
+    assert.equal((await client.callTool({ name: "mock_read", arguments: { operationId: "target", text: "read" } })).isError, undefined);
+    assert.equal((await client.callTool({ name: "mock_write", arguments: { operationId: "target", text: "" } })).isError, true);
+    assert.equal((await client.callTool({ name: "mock_write", arguments: { operationId: "other", text: "other" } })).isError, undefined);
+    assert.equal((await client.callTool({ name: "mock_write", arguments: { operationId: "other", text: "conflict" } })).isError, true);
+    const args = { operationId: "target", text: "once" };
+    await assert.rejects(client.callTool({ name: "mock_write", arguments: args }, undefined, { signal: AbortSignal.timeout(5000) }));
+    assert.equal(calls, 5);
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS n FROM mock_effects WHERE operation_id = ?").get(JSON.stringify("target"))?.n, 1);
+      const row = db.prepare("SELECT result FROM mock_operations WHERE operation_id = ?").get(JSON.stringify("target"));
+      const saved: unknown = JSON.parse(String(row?.result));
+      assert.deepEqual(saved, { content: [{ type: "text", text: "once" }], structuredContent: { text: "once", operationId: "target" } });
+      assert.deepEqual(await client.callTool({ name: "mock_write", arguments: args }), saved);
+      assert.equal(calls, 6);
+      assert.equal(db.prepare("SELECT count(*) AS n FROM mock_effects WHERE operation_id = ?").get(JSON.stringify("target"))?.n, 1);
+    } finally { db.close(); }
+  } finally { await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("目标操作冲突不消耗故障，未重新配置的服务重启后不再注入", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-fault-scope-"));
+  const path = join(dir, "mock.sqlite");
+  const ledger = new MockLedger(path);
+  const saved = ledger.write("target", "mock_write", { text: "original" });
+  ledger.close();
+  let server = await startMockMcp(0, path, { dropResponseOnceForOperationId: "target" });
+  const call = async (text: string) => {
+    const client = new Client({ name: "test", version: "1" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+    try { return await client.callTool({ name: "mock_write", arguments: { operationId: "target", text } }, undefined, { signal: AbortSignal.timeout(5000) }); }
+    finally { await client.close(); }
+  };
+  try {
+    assert.equal((await call("conflict")).isError, true);
+    await assert.rejects(call("original"));
+    assert.deepEqual(await call("original"), saved);
+    await server.close();
+    server = await startMockMcp(0, path);
+    assert.deepEqual(await call("original"), saved);
+    assert.deepEqual(server.effects(), ["original"]);
+  } finally { await server.close(); await rm(dir, { recursive: true, force: true }); }
+});
