@@ -32,7 +32,10 @@ const initialState: FollowState = {
   settledNodeIds: {},
 };
 
-/** 渲染会话目录、实时视图和消息操作。 */
+/**
+ * 渲染会话目录、实时视图和消息操作，卸载时释放会话订阅。
+ * @returns 包含会话导航、消息与输入区的页面。
+ */
 export function App() {
   const [initialDirectory] = useState(() => loadDirectory(browserStorage()));
   const [sessions, setSessions] = useState<string[]>(initialDirectory.sessions);
@@ -190,26 +193,48 @@ export function App() {
   const visibleMessages = state.sessionId === selected ? messages(state) : [];
   return (
     <main className="shell">
-      <aside>
-        <h1>MHarness</h1>
-        <button onClick={() => void createSession()} disabled={creating}>
-          ＋ 新建会话
+      <aside className="sidebar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">
+            M
+          </span>
+          <h1>MHarness</h1>
+        </div>
+        <button
+          className="new-session"
+          onClick={() => void createSession()}
+          disabled={creating}
+        >
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path
+              d="M8 3v10M3 8h10"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            />
+          </svg>
+          新建会话
         </button>
-        <nav aria-label="会话">
-          {sessions.map((id, index) => (
-            <button
-              key={id}
-              className={selected === id ? "selected" : ""}
-              onClick={() => setSelected(id)}
-            >
-              会话 {index + 1}
-              <small>{id}</small>
-            </button>
-          ))}
-        </nav>
+        <div className="session-directory">
+          <h2 className="section-label">会话</h2>
+          <nav className="session-list" aria-label="会话">
+            {sessions.map((id, index) => (
+              <button
+                key={id}
+                className={selected === id ? "selected" : ""}
+                aria-current={selected === id ? "page" : undefined}
+                onClick={() => setSelected(id)}
+              >
+                会话 {index + 1}
+                <small>{id}</small>
+              </button>
+            ))}
+          </nav>
+          {sessions.length === 0 && <p className="directory-empty">还没有会话</p>}
+        </div>
       </aside>
       <section className="conversation">
-        <header>
+        <header className="conversation-header">
           <div>
             <h2>
               {selected
@@ -229,6 +254,20 @@ export function App() {
           {selected && <button onClick={() => void cancel()}>取消任务</button>}
         </header>
         <div className="messages" aria-live="polite">
+          {visibleMessages.length === 0 &&
+            !submission &&
+            !state.agentError &&
+            (!selected ||
+              (state.sessionId === selected && state.status === "ready")) && (
+              <div className="empty-state">
+                <h3>{selected ? "发送第一条消息" : "开始一个会话"}</h3>
+                <p>
+                  {selected
+                    ? "在下方输入内容，开始本次对话。"
+                    : "点击「新建会话」，开始与助手对话。"}
+                </p>
+              </div>
+            )}
           {state.status === "failed" && (
             <p className="error">
               {state.error}{" "}
@@ -273,7 +312,7 @@ export function App() {
           )}
           {notice && <p role="status">{notice}</p>}
         </div>
-        <form onSubmit={(event) => void send(event)}>
+        <form className="composer" onSubmit={(event) => void send(event)}>
           <label htmlFor="prompt">消息</label>
           <textarea
             id="prompt"
