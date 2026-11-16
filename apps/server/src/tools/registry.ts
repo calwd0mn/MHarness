@@ -1,3 +1,5 @@
+import { localConfig } from "../../../../config/local.ts";
+import { STOP_OBSERVING_TOOL_RESULT } from "./dispatch.ts";
 import { z } from "zod";
 import { toToolJsonSchema } from "./schema.ts";
 import { normalizeLocalToolResult, type LocalToolOutput, type ToolResult } from "./result.ts";
@@ -10,9 +12,10 @@ export interface ToolGovernance {
   readonly supportsIdempotency: boolean;
   readonly supportsResultQuery: boolean;
   readonly approvalPolicy: "allow" | "deny" | "ask";
+  /** 等待时间以毫秒计，必须大于 0 且不超过 2_147_483_647。 */
   readonly timeoutMs: number;
 }
-type GovernanceOptions = Partial<Omit<ToolGovernance, "executionBoundary" | "timeoutMs">> & { timeoutMs: number };
+type GovernanceOptions = Partial<Omit<ToolGovernance, "executionBoundary">>;
 type LocalOptions<S extends z.ZodType, V> = GovernanceOptions & {
   name: string; version: string; description: string; input: S; handler: (args: z.output<S>, signal: AbortSignal) => V;
   output?: LocalToolOutput<z.output<S>, Awaited<V>>; concludeTurn?: boolean;
@@ -30,6 +33,7 @@ export interface PreparedToolCall {
   execute(signal?: AbortSignal): Promise<unknown>;
   /**
    * 执行正文并校验输出；未配置输出契约时返回契约失败，正文抛错时 Promise 拒绝。
+   * 派发器停止观察后，迟到值不会进入校验或内容派生，Promise 拒绝；这不证明执行端没有副作用。
    * @param signal - 传给正文的取消请求，不保证正文已经停止。
    * @returns 已校验的成功结果或输出契约失败。
    */
@@ -42,11 +46,12 @@ interface LocalTool {
   prepare(input: unknown): PrepareResult;
 }
 function governance(options: GovernanceOptions, executionBoundary: "local" | "remote"): ToolGovernance {
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) throw new Error("timeoutMs 必须为正有限数");
+  const timeoutMs = options.timeoutMs ?? localConfig.tools.timeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) throw new Error("timeoutMs 必须大于 0 且不超过 2_147_483_647 毫秒");
   const sideEffect = options.sideEffect ?? "unknown";
   return Object.freeze({ executionBoundary, cancellationGuarantee: options.cancellationGuarantee ?? "none", sideEffect,
     supportsIdempotency: options.supportsIdempotency ?? false, supportsResultQuery: options.supportsResultQuery ?? false,
-    approvalPolicy: options.approvalPolicy ?? (sideEffect === "read-only" ? "allow" : "ask"), timeoutMs: options.timeoutMs });
+    approvalPolicy: options.approvalPolicy ?? (sideEffect === "read-only" ? "allow" : "ask"), timeoutMs });
 }
 function isLosslessJson(value: unknown): boolean {
   if (typeof value === "number") return Number.isFinite(value) && !Object.is(value, -0);
@@ -60,7 +65,7 @@ function freezeJson(value: unknown): void {
 /**
  * 以同一 Zod 定义创建本地工具并推导正文参数类型，不调用正文。
  * 仅支持严格对象与可等价导出的 JSON 子集；转换、自定义校验和默认值会被拒绝。
- * @param options - 可信身份、输入与输出定义、治理配置、结束意向和正文；未提供输出定义时不能产生规范化成功结果。
+ * @param options - 可信身份、输入与输出定义、治理配置、结束意向和正文；超时须大于 0 且不超过 2_147_483_647 毫秒，未提供时采用集中默认值；未提供输出定义时不能产生规范化成功结果。
  * @returns 可注册的本地工具。
  * @throws 输入定义不受支持或超时无效时抛出错误。
  */
@@ -78,6 +83,7 @@ export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S,
       return { ok: true, call: Object.freeze({ name, version, governance: policy, args: parsed.data, execute: async (signal = new AbortController().signal) => handler(parsed.data, signal),
         executeNormalized: async (signal: AbortSignal) => {
           const value = await handler(parsed.data, signal);
+          if (signal.aborted && signal.reason === STOP_OBSERVING_TOOL_RESULT) throw new Error("工具结果已停止观察");
           if (!output) return { isError: true as const, error: { message: "工具未配置输出契约。", info: { name: "InvalidToolOutputError", code: "INVALID_TOOL_OUTPUT" } }, content: [{ type: "text", text: "工具未配置输出契约。" }] };
           return normalizeLocalToolResult(output, parsed.data, value, concludeTurn);
         } }) };
@@ -95,7 +101,7 @@ export class ToolRegistry {
   }
   /**
    * 保存远程治理信息，不提供远程输入校验或派发；地址不改变取消退出保证。
-   * @param options - 可信远程工具注册信息。
+   * @param options - 可信远程工具注册信息；超时须大于 0 且不超过 2_147_483_647 毫秒，未提供时采用集中默认值。
    * @throws 名称重复或超时无效时抛出错误。
    */
   registerRemote(options: GovernanceOptions & { name: string; version: string; executionBoundary: "remote"; endpoint: string }): void {

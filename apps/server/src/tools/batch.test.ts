@@ -301,7 +301,7 @@ test("审批等待的真实持久前缀在重启恢复时按结果未知结算",
 
 
 
-test("模型可在下一 Step 修正参数，成功结束意向不提前结束本轮", async () => {
+test("模型可在下一 Step 修正参数，成功结束意向在批次结算后结束本轮", async () => {
   const session = new Session({ sessionId: "repair-arguments", createdAt: 0 }); session.bindCheckpoint(async () => {});
   let requests = 0; const ran: number[] = [];
   const drive = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => {
@@ -312,7 +312,7 @@ test("模型可在下一 Step 修正参数，成功结束意向不提前结束�
     ] : [{ chunk: { type: "finish", reason: { kind: "stop" } } }];
   }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: makeRegistry((n) => { ran.push(n); return n; }, "allow", true) });
   await drive({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
-  assert.equal(requests, 3); assert.deepEqual(ran, [7]);
+  assert.equal(requests, 2); assert.deepEqual(ran, [7]);
   const results = session.snapshot().events.filter((e) => e.type === "tool/result");
   assert.deepEqual(results.map((e) => e.data.error?.code), ["INVALID_JSON", undefined]);
 });

@@ -81,3 +81,26 @@ test("拒绝不能无损持久化的数字并冻结参数", async () => {
     assert.equal(await result.call.execute(), 1);
   }
 });
+
+test("工具超时默认值集中配置且允许可信覆盖", () => {
+  const registry = new ToolRegistry();
+  registry.register(defineLocalTool({ name: "default", version: "1", description: "default", input: z.strictObject({}), handler: () => 1 }));
+  registry.registerRemote({ name: "remote-default", version: "1", executionBoundary: "remote", endpoint: "http://localhost" });
+  registry.registerRemote({ name: "override", version: "1", executionBoundary: "remote", endpoint: "http://localhost", timeoutMs: 123 });
+  assert.equal(registry.governance("default")?.timeoutMs, 30_000);
+  assert.equal(registry.governance("remote-default")?.timeoutMs, 30_000);
+  assert.equal(registry.governance("override")?.timeoutMs, 123);
+  assert.throws(() => registry.registerRemote({ name: "invalid", version: "1", executionBoundary: "remote", endpoint: "http://localhost", timeoutMs: 0 }));
+});
+
+test("本地和远程注册拒绝超出计时器上界的超时并接受上界", () => {
+  const registry = new ToolRegistry();
+  const local = { name: "local", version: "1", description: "local", input: z.strictObject({}), handler: () => 1 };
+  const remote = { name: "remote", version: "1", executionBoundary: "remote", endpoint: "http://localhost" } as const;
+  assert.throws(() => defineLocalTool({ ...local, timeoutMs: 2_147_483_648 }));
+  assert.throws(() => registry.registerRemote({ ...remote, timeoutMs: 2_147_483_648 }));
+  registry.register(defineLocalTool({ ...local, timeoutMs: 2_147_483_647 }));
+  registry.registerRemote({ ...remote, timeoutMs: 2_147_483_647 });
+  assert.equal(registry.governance("local")?.timeoutMs, 2_147_483_647);
+  assert.equal(registry.governance("remote")?.timeoutMs, 2_147_483_647);
+});

@@ -4,6 +4,9 @@ import { Session } from "@mharness/session/server";
 import { rebuildRequestContext } from "../agent/request-context.ts";
 import { appendToolResult } from "./result-event.ts";
 import { ToolDispatch } from "./dispatch.ts";
+import { z } from "zod";
+import { defineLocalTool, ToolRegistry } from "./registry.ts";
+import { defineLocalToolOutput } from "./result.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -112,4 +115,120 @@ test("已确认结果不受后续取消影响，协作退出拒绝也等待清�
   const failure = new Error("清理完成后的明确失败");
   work.reject(failure);
   assert.deepEqual(await result, { kind: "failed", error: failure });
+});
+
+test("超时后仅本地协作退出等待清理，迟到结果不能覆盖超时", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const [executionBoundary, cancellationGuarantee] of [["local", "cooperative-exit"], ["local", "none"], ["remote", "cooperative-exit"], ["remote", "none"]] as const) {
+    const gate = new ToolDispatch<string>();
+    const work = deferred<string>();
+    let signal: AbortSignal | undefined;
+    let settled = false;
+    const result = gate.dispatch((received) => { signal = received; return work.promise; }, { executionBoundary, cancellationGuarantee, timeoutMs: 20 });
+    void result.then(() => { settled = true; });
+    t.mock.timers.tick(20);
+    await Promise.resolve();
+    assert.equal(signal?.aborted, true);
+    const waitsForCleanup = executionBoundary === "local" && cancellationGuarantee === "cooperative-exit";
+    assert.equal(settled, !waitsForCleanup);
+    work.resolve("late");
+    assert.deepEqual(await result, { kind: "timeout", code: "TOOL_TIMEOUT" });
+  }
+});
+
+test("远程取消立即停止等待并处理迟到拒绝", async () => {
+  const gate = new ToolDispatch<string>();
+  const work = deferred<string>();
+  let signal: AbortSignal | undefined;
+  const result = gate.dispatch((received) => { signal = received; return work.promise; }, { executionBoundary: "remote", cancellationGuarantee: "cooperative-exit", timeoutMs: 20 });
+  gate.cancel();
+  assert.equal(signal?.aborted, true);
+  assert.deepEqual(await result, { kind: "aborted", code: "ABORTED" });
+  work.reject(new Error("late"));
+  await Promise.resolve();
+});
+
+test("截止前结果优先且取消或完成后不再触发计时", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const gate = new ToolDispatch<string>();
+  let signal: AbortSignal | undefined;
+  const result = gate.dispatch(async (received) => { signal = received; return "confirmed"; }, { executionBoundary: "local", cancellationGuarantee: "cooperative-exit", timeoutMs: 20 });
+  assert.deepEqual(await result, { kind: "completed", value: "confirmed" });
+  t.mock.timers.tick(20);
+  assert.equal(signal?.aborted, false);
+  const cancelled = new ToolDispatch<string>();
+  const work = deferred<string>();
+  const pending = cancelled.dispatch(() => work.promise, { executionBoundary: "local", cancellationGuarantee: "cooperative-exit", timeoutMs: 20 });
+  cancelled.cancel();
+  t.mock.timers.tick(20);
+  work.resolve("confirmed");
+  assert.deepEqual(await pending, { kind: "completed", value: "confirmed" });
+});
+
+test("本地超时后的清理拒绝仍结算为超时", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const gate = new ToolDispatch<string>();
+  const work = deferred<string>();
+  const result = gate.dispatch(() => work.promise, { executionBoundary: "local", cancellationGuarantee: "cooperative-exit", timeoutMs: 1 });
+  t.mock.timers.tick(1);
+  work.reject(new Error("cleanup"));
+  assert.deepEqual(await result, { kind: "timeout", code: "TOOL_TIMEOUT" });
+});
+
+test("超时后的迟到值不触发结果渲染", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let renders = 0;
+  const work = deferred<number>();
+  const registry = new ToolRegistry();
+  registry.register(defineLocalTool({ name: "late", version: "1", description: "late", input: z.strictObject({}), timeoutMs: 1,
+    handler: () => work.promise, output: defineLocalToolOutput({ schema: z.number(), render: () => { renders++; return [{ type: "text", text: "late" }]; } }) }));
+  const prepared = registry.prepare("late", "{}");
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) throw new Error("准备失败");
+  const gate = new ToolDispatch<unknown>();
+  const result = gate.dispatch((signal) => prepared.call.executeNormalized(signal), prepared.call.governance);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await result, { kind: "timeout", code: "TOOL_TIMEOUT" });
+  work.resolve(1);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(renders, 0);
+});
+
+test("停止等待的取消不会渲染迟到值，本地协作取消仍可确认结果", async () => {
+  for (const executionBoundary of ["local", "remote"] as const) {
+    let renders = 0;
+    const work = deferred<number>();
+    const registry = new ToolRegistry();
+    registry.register(defineLocalTool({ name: "read", version: "1", description: "read", input: z.strictObject({}), cancellationGuarantee: "cooperative-exit",
+      handler: () => work.promise, output: defineLocalToolOutput({ schema: z.number(), render: () => { renders++; return [{ type: "text", text: "ok" }]; } }) }));
+    const prepared = registry.prepare("read", "{}");
+    if (!prepared.ok) throw new Error("准备失败");
+    const gate = new ToolDispatch<unknown>();
+    const result = gate.dispatch((signal) => prepared.call.executeNormalized(signal), { ...prepared.call.governance, executionBoundary });
+    gate.cancel();
+    work.resolve(1);
+    const outcome = await result;
+    await Promise.resolve();
+    assert.equal(renders, executionBoundary === "local" ? 1 : 0);
+    assert.equal(outcome.kind, executionBoundary === "local" ? "completed" : "aborted");
+  }
+});
+
+test("派发拒绝超出计时器上界的超时并接受上界", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let called = false;
+  const policy = { executionBoundary: "remote", cancellationGuarantee: "none" } as const;
+  assert.throws(() => new ToolDispatch<string>().dispatch(async () => { called = true; return "unexpected"; }, { ...policy, timeoutMs: 2_147_483_648 }));
+  assert.equal(called, false);
+  const gate = new ToolDispatch<string>();
+  const work = deferred<string>();
+  let settled = false;
+  const result = gate.dispatch(() => work.promise, { ...policy, timeoutMs: 2_147_483_647 });
+  void result.then(() => { settled = true; });
+  t.mock.timers.tick(1);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  work.resolve("完成");
+  assert.deepEqual(await result, { kind: "completed", value: "完成" });
 });

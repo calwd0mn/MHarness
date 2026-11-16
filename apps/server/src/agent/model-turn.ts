@@ -75,6 +75,8 @@ export type ModelTurnOptions = {
   tools?: () => readonly ModelTool[];
   /** 每轮最多发起的模型步数，须为正安全整数；默认使用集中配置。 */
   maxSteps?: number;
+  /** 每轮只读工具超时次数上限，须为正安全整数；达到上限时停止本轮，默认使用集中配置。 */
+  maxReadOnlyTimeouts?: number;
   /** 提供可信工具定义和正文；未配置时工具调用不派发。 */
   toolRegistry?: ToolRegistry;
   /** 审批服务；未提供时审批渠道不可用。 */
@@ -120,8 +122,11 @@ function compact(entries: { time: number; chunk: LlmChunk }[]) {
 /**
  * 创建有限步数的 Turn 驱动，检查点成功后启动模型并结算每个 Step。
  * 未配置工具注册表时工具调用追加 TOOL_NOT_STARTED 并以 blocked 结束；耗尽步数时不再派发。
+ * 已完成批次中的成功结束意向使 Turn 以 completed 结束，不再请求模型续答。
+ * 副作用或未知工具超时以及只读超时预算耗尽时以对应错误码结束；只读预算跨 Step 累计，每轮重置。
  * @param options - Runtime 及每次请求读取的配置和系统提示词。
  * @returns 可注入 Agent 的异步驱动；取消信号传给当前模型请求和工具批次。
+ * @throws 步数或只读超时上限不是正安全整数时抛出 RangeError。
  */
 export function createModelTurnDriver(
   options: ModelTurnOptions,
@@ -129,6 +134,9 @@ export function createModelTurnDriver(
   const maxSteps = options.maxSteps ?? localConfig.model.maxSteps;
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1)
     throw new RangeError("maxSteps must be a positive safe integer");
+  const maxReadOnlyTimeouts = options.maxReadOnlyTimeouts ?? localConfig.tools.maxReadOnlyTimeouts;
+  if (!Number.isSafeInteger(maxReadOnlyTimeouts) || maxReadOnlyTimeouts < 1)
+    throw new RangeError("maxReadOnlyTimeouts must be a positive safe integer");
   const prepareRequest = createRequestPreparer({ ...options, tools: options.tools ?? (options.toolRegistry ? () => options.toolRegistry!.definitions() : undefined) });
   const approvals = options.approvalService ?? new ApprovalService(null);
   return async ({
@@ -140,6 +148,7 @@ export function createModelTurnDriver(
     blockStorage,
   }) => {
     let step = initialStep;
+    const timeoutBudget = { count: 0, max: maxReadOnlyTimeouts };
     let turnReason:
       | { kind: "completed" | "max-tokens" | "blocked" }
       | { kind: "aborted"; reason: string }
@@ -381,10 +390,15 @@ export function createModelTurnDriver(
                 for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message: "工具尚未派发", info: { name: "ToolError", code: "TOOL_NOT_STARTED" } }, content: [{ type: "text", text: "工具尚未派发" }] });
                 throw error;
               }
-              const batch = await runToolBatch(session, options.toolRegistry!, approvals, { turn, step }, toolCalls, signal, checkpoint, storageFailure);
-              if (batch.kind === "completed") continued = true;
+              const batch = await runToolBatch(session, options.toolRegistry!, approvals, { turn, step }, toolCalls, signal, checkpoint, storageFailure, timeoutBudget);
+              if (batch.kind === "completed") {
+                if (batch.concludeTurn) turnReason = { kind: "completed" };
+                else continued = true;
+              }
               else if (batch.kind === "aborted") turnReason = { kind: "aborted", reason: "user" };
               else if (batch.kind === "rejected") turnReason = { kind: "blocked" };
+              else if (batch.kind === "timeout") turnReason = { kind: "error", error: { code: "TOOL_TIMEOUT", message: "工具超时，最终结果未确认" } };
+              else if (batch.kind === "read-only-timeout-budget") turnReason = { kind: "error", error: { code: "READ_ONLY_TIMEOUT_BUDGET_EXHAUSTED", message: "只读工具超时预算已耗尽" } };
               else turnReason = { kind: "error", error: { code: "UNKNOWN", message: "本轮执行失败" } };
             } else {
               const message = signal.aborted ? "用户取消，工具未执行。" : "工具尚未派发";
