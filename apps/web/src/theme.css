@@ -6,7 +6,11 @@
   --mh-font-mono: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
   --mh-text-size: 14px;
   --mh-text-leading: 22px;
+  --mh-radius-detail: 4px;
+  --mh-radius-compact: 8px;
   --mh-radius-control: 12px;
+  --mh-radius-group: 16px;
+  --mh-radius-message: 20px;
   --mh-radius-panel: 28px;
   --mh-ease: cubic-bezier(0.4, 0, 0.2, 1);
   --mh-duration: 200ms;

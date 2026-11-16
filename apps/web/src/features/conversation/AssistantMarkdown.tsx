@@ -1,5 +1,6 @@
+import { Button } from "../../components/ui/Button.tsx";
 import { isValidElement, useState, type ReactNode } from "react";
-import Markdown from "react-markdown";
+import Markdown, { type Components } from "react-markdown";
 import styles from "./AssistantMarkdown.module.css";
 
 function safeLink(url: string): boolean {
@@ -13,14 +14,19 @@ function CodeBlock({ children }: { children?: ReactNode }) {
     try { await navigator.clipboard.writeText(code); setFeedback("已复制"); }
     catch { setFeedback("复制失败"); }
   }
-  return <div className={styles.code}><button type="button" onClick={() => void copy()}>复制</button><span role="status">{feedback}</span><pre>{children}</pre></div>;
+  return <div className={styles.code}><Button type="button" onClick={() => void copy()}>复制</Button><span role="status">{feedback}</span><pre>{children}</pre></div>;
 }
 
-/** 将助手正文解析为安全 Markdown，并为代码块提供复制反馈。 */
+const components: Components = {
+  a: ({ href, children }) => href ? <a href={href}>{children}</a> : <>{children}</>,
+  pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+  img: ({ alt }) => <>{alt}</>,
+};
+
+/** 将助手正文解析为安全 Markdown，并为代码块提供复制反馈。
+ * @param props - text 为助手正文；原始 HTML 不执行，仅允许 HTTP(S)、mailto 和页内链接。
+ * @returns 可阅读的 Markdown 内容及代码复制操作。
+ */
 export function AssistantMarkdown({ text }: { text: string }) {
-  return <div className={styles.markdown}><Markdown skipHtml urlTransform={(url) => safeLink(url) ? url : ""} components={{
-    a: ({ href, children }) => href ? <a href={href}>{children}</a> : <>{children}</>,
-    pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-    img: ({ alt }) => <>{alt}</>,
-  }}>{text}</Markdown></div>;
+  return <div className={styles.markdown}><Markdown skipHtml urlTransform={(url) => safeLink(url) ? url : ""} components={components}>{text}</Markdown></div>;
 }

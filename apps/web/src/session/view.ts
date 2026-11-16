@@ -1,14 +1,18 @@
 import type { RawSessionEventFrame } from "@mharness/session/contracts";
 import type { FollowState } from "./follow-controller.ts";
 
-type Message = { key: string; role: string; text: string; note?: string; reasoning?: string };
-/** 根据原始事件和实时草稿构造消息；结算等待期间仅显示草稿。 */
+type Message = { key: string; order: number; role: string; text: string; note?: string; reasoning?: string };
+/** 根据原始事件和实时草稿构造消息；结算等待期间仅显示草稿。
+ * @param state - 当前订阅已安装的事件窗口与活动草稿。
+ * @returns 按事件顺序排列的消息；key 用于草稿和正式消息的节点交接，order 用于与工具卡片合并。
+ */
 export function messages(state: FollowState): Message[] {
   const result: Message[] = [];
   for (const { event } of state.records) {
     if (event.type === "turn/end" && event.data.reason.kind === "error")
       result.push({
         key: `event-${event.seq}`,
+        order: event.seq,
         role: "系统",
         text: `本轮失败：${event.data.reason.error.message}`,
       });
@@ -19,6 +23,7 @@ export function messages(state: FollowState): Message[] {
     )
       result.push({
         key: `event-${event.seq}`,
+        order: event.seq,
         role: "你",
         text: event.data.content.map((block) => block.text).join(""),
       });
@@ -39,6 +44,7 @@ export function messages(state: FollowState): Message[] {
       if (text || reasoning)
         result.push({
           key: state.settledNodeIds[event.seq] ?? `event-${event.seq}`,
+          order: event.seq,
           role: "助手",
           text,
           reasoning,
@@ -47,9 +53,10 @@ export function messages(state: FollowState): Message[] {
     if (event.type === "assistant/attempt" && event.data.text)
       result.push({
         key: state.settledNodeIds[event.seq] ?? `event-${event.seq}`,
+        order: event.seq,
         role: "助手",
         text: event.data.text,
-        note: "未完成",
+        note: event.data.outcome === "cancelled" ? "已取消" : event.data.outcome === "truncated" ? "已截断" : "失败",
       });
   }
   if (state.draft) {
@@ -61,6 +68,7 @@ export function messages(state: FollowState): Message[] {
     if (text || reasoning)
       result.push({
         key: state.draft.nodeId,
+        order: state.records.length,
         role: "助手",
         text,
         note: "正在生成",

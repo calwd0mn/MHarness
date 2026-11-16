@@ -1,3 +1,4 @@
+import styles from "./ConversationView.module.css";
 import { projectTools } from "../../session/tools.ts";
 import { ToolCard } from "./ToolCard.tsx";
 import { useLayoutEffect, useRef, useState } from "react";
@@ -9,16 +10,17 @@ import type { useConversation } from "../../session/use-conversation.ts";
 
 /** 显示会话目录和创建入口。 */
 export function SessionNavigation({ sessions, selected, setSelected, creating, createSession }: Pick<ReturnType<typeof useConversation>, "sessions" | "selected" | "setSelected" | "creating" | "createSession">) {
+  const [expanded, setExpanded] = useState(true);
   return (
-    <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
+    <aside className={"sidebar " + styles["sidebar"]}>
+        <div className={"brand " + styles["brand"]}>
+          <span className={"brand-mark " + styles["brand-mark"]} aria-hidden="true">
             M
           </span>
           <h1>MHarness</h1>
         </div>
-        <button
-          className="new-session"
+        <Button
+          className={"new-session " + styles["new-session"]}
           onClick={() => void createSession()}
           disabled={creating}
         >
@@ -31,24 +33,25 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
             />
           </svg>
           新建会话
-        </button>
-        <div className="session-directory">
-          <h2 className="section-label">会话</h2>
-          <nav className="session-list" aria-label="会话">
+        </Button>
+        <Button aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? "收起会话导航" : "展开会话导航"}</Button>
+        {expanded && <div className={"session-directory " + styles["session-directory"]}>
+          <h2 className={"section-label " + styles["section-label"]}>会话</h2>
+          <nav className={"session-list " + styles["session-list"]} aria-label="会话">
             {sessions.map((id, index) => (
-              <button
+              <Button
                 key={id}
-                className={selected === id ? "selected" : ""}
+                className={selected === id ? "selected " + styles.selected : ""}
                 aria-current={selected === id ? "page" : undefined}
                 onClick={() => setSelected(id)}
               >
                 会话 {index + 1}
                 <small>{id}</small>
-              </button>
+              </Button>
             ))}
           </nav>
-          {sessions.length === 0 && <p className="directory-empty">还没有会话</p>}
-        </div>
+          {sessions.length === 0 && <p className={"directory-empty " + styles["directory-empty"]}>还没有会话</p>}
+        </div>}
       </aside>
   );
 }
@@ -56,7 +59,7 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
 /** 显示所选会话和运行状态。 */
 export function ConversationHeader({ selected, sessions, state, cancel }: Pick<ReturnType<typeof useConversation>, "selected" | "sessions" | "state" | "cancel">) {
   return (
-    <header className="conversation-header">
+    <header className={"conversation-header " + styles["conversation-header"]}>
           <div>
             <h2>
               {selected
@@ -79,7 +82,7 @@ export function ConversationHeader({ selected, sessions, state, cancel }: Pick<R
 }
 
 /** 显示当前会话消息与同步反馈。 */
-export function MessageStream({ visibleMessages, submission, state, selected, confirmedRecord, notice, controller, setText }: Pick<ReturnType<typeof useConversation>, "visibleMessages" | "submission" | "state" | "selected" | "confirmedRecord" | "notice" | "controller" | "setText">) {
+export function MessageStream({ visibleMessages, submission, state, selected, confirmedRecord, notice, controller, setText, decideApproval }: Pick<ReturnType<typeof useConversation>, "visibleMessages" | "submission" | "state" | "selected" | "confirmedRecord" | "notice" | "controller" | "setText" | "decideApproval">) {
   const area = useRef<HTMLDivElement>(null);
   const positions = useRef<Record<string, { top: number; following: boolean }>>({});
   const [following, setFollowing] = useState(true);
@@ -102,9 +105,12 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
     }
     const follow = () => { if (positions.current[selected]?.following !== false) node.scrollTop = node.scrollHeight; };
     follow();
-    const observer = new MutationObserver(follow);
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(follow);
+    const observeSize = () => { resize?.observe(node); for (const child of node.children) resize?.observe(child); };
+    observeSize();
+    const observer = new MutationObserver(() => { observeSize(); follow(); });
     observer.observe(node, { childList: true, subtree: true, characterData: true, attributes: true });
-    return () => observer.disconnect();
+    return () => { observer.disconnect(); resize?.disconnect(); };
   }, [selected, state, visibleMessages]);
   function onScroll() {
     const node = area.current;
@@ -121,13 +127,13 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
     setFollowing(true);
   }
   return (
-    <div className="messages" aria-live="polite" ref={area} onScroll={onScroll}>
+    <div className={"messages " + styles["messages"]} aria-live="polite" ref={area} onScroll={onScroll}>
           {visibleMessages.length === 0 &&
             !submission &&
             !state.agentError &&
             (!selected ||
               (state.sessionId === selected && state.status === "ready")) && (
-              <div className="empty-state">
+              <div className={"empty-state " + styles["empty-state"]}>
                 <h3>{selected ? "发送第一条消息" : "开始一个会话"}</h3>
                 <p>
                   {selected
@@ -137,30 +143,34 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
               </div>
             )}
           {state.status === "failed" && (
-            <p className="error">
+            <p className={"error " + styles["error"]}>
               {state.error}{" "}
-              <button onClick={() => controller.current?.retry()}>
+              <Button onClick={() => controller.current?.retry()}>
                 重新同步
-              </button>
+              </Button>
             </p>
           )}
           {state.agentError && (
-            <p className="error">执行错误：{state.agentError}</p>
+            <p className={"error " + styles["error"]}>执行错误：{state.agentError}</p>
           )}
-          {visibleMessages.map((message) => (
+          {[...visibleMessages.map((message) => ({ kind: "message" as const, order: message.order, message })),
+            ...(state.sessionId === selected ? projectTools(state.records) : []).map((tool) => ({ kind: "tool" as const, order: tool.order, tool }))]
+            .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} onDecide={decideApproval} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
+              const message = entry.message;
+              return (
             <article
               key={message.key}
-              className={message.role === "你" ? "user" : "assistant"}
+              className={message.role === "你" ? "user " + styles.user : "assistant " + styles.assistant}
             >
               <strong>{message.role}</strong>
               {message.reasoning && <details><summary>推理</summary><p>{message.reasoning}</p></details>}
               {message.role === "助手" ? <AssistantMarkdown text={message.text} /> : <p>{message.text}</p>}
               {message.note && <small>{message.note}</small>}
             </article>
-          ))}
-          {state.sessionId === selected && projectTools(state.records).map((tool) => <ToolCard key={tool.key} tool={tool} />)}
+              );
+            })())}
           {submission && !confirmedRecord && (
-            <article className="user">
+            <article className={"user " + styles["user"]}>
               <strong>你</strong>
               <p>{submission.text}</p>
               <small>
@@ -181,7 +191,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
             </article>
           )}
           {notice && <p role="status">{notice}</p>}
-          {!following && <Button className="return-latest" onClick={latest}>返回最新</Button>}
+          {!following && <Button className={"return-latest " + styles["return-latest"]} onClick={latest}>返回最新</Button>}
         </div>
   );
 }
@@ -189,7 +199,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
 /** 显示当前会话的受控输入区。 */
 export function Composer({ text, setText, selected, submission, send }: Pick<ReturnType<typeof useConversation>, "text" | "setText" | "selected" | "submission" | "send">) {
   return (
-    <form className="composer" onSubmit={(event) => void send(event)}>
+    <form className={"composer " + styles["composer"]} onSubmit={(event) => void send(event)}>
           <label htmlFor="prompt">消息</label>
           <textarea
             id="prompt"
@@ -198,14 +208,14 @@ export function Composer({ text, setText, selected, submission, send }: Pick<Ret
             placeholder="输入消息…"
             disabled={!selected}
           />
-          <button
+          <Button
             type="submit"
             disabled={
               !selected || !text.trim() || submission?.status === "sending"
             }
           >
             发送
-          </button>
+          </Button>
         </form>
   );
 }

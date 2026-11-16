@@ -1,4 +1,4 @@
-.card { border: 1px solid var(--mh-line); border-radius: 12px; padding: 12px; overflow-wrap: anywhere; }
+.card { border: 1px solid var(--mh-line); border-radius: var(--mh-radius-control); padding: 12px; overflow-wrap: anywhere; }
 .card summary { cursor: pointer; }
 .card pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mh-font-mono); }
 .card dd { margin: 0 0 12px; }

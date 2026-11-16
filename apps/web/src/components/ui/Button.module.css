@@ -1,2 +1,8 @@
-.button { min-height: 36px; border-radius: var(--mh-radius-control); }
+.button { display: inline-flex; position: relative; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 7px 14px; border: 0; border-radius: var(--mh-radius-control); background: transparent; color: var(--mh-text); cursor: pointer; transition: background-color var(--mh-duration) var(--mh-ease), box-shadow var(--mh-duration) var(--mh-ease); }
+@media (hover: hover) { .button:hover:not(:disabled) { background: var(--mh-hover); } }
+.button:active:not(:disabled) { background: var(--mh-active); }
 .button:focus-visible { outline: 2px solid var(--mh-focus); outline-offset: 3px; }
+.button:disabled { opacity: 0.4; cursor: not-allowed; }
+.labelBusy { visibility: hidden; }
+.busy { position: absolute; inset: 0; display: grid; place-items: center; }
+@media (prefers-reduced-motion: reduce) { .button { transition: none; } }
