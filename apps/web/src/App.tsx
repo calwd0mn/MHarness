@@ -1,3 +1,4 @@
+import { Button } from "./components/ui/Button.tsx";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   createSessionResponseSchema,
@@ -251,7 +252,7 @@ export function App() {
                 : "创建会话后即可发送消息"}
             </p>
           </div>
-          {selected && <button onClick={() => void cancel()}>取消任务</button>}
+          {selected && <Button onClick={() => void cancel()}>取消任务</Button>}
         </header>
         <div className="messages" aria-live="polite">
           {visibleMessages.length === 0 &&
@@ -304,9 +305,9 @@ export function App() {
               </small>
               {(submission.status === "uncertain" ||
                 submission.status === "busy") && (
-                <button onClick={() => setText(submission.text)}>
+                <Button onClick={() => setText(submission.text)}>
                   重试此消息
-                </button>
+                </Button>
               )}
             </article>
           )}
@@ -334,3 +335,5 @@ export function App() {
     </main>
   );
 }
+
+

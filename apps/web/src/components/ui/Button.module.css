@@ -1,0 +1,2 @@
+.button { min-height: 36px; border-radius: var(--mh-radius-control); }
+.button:focus-visible { outline: 2px solid var(--mh-focus); outline-offset: 3px; }

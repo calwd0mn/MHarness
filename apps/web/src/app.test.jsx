@@ -178,3 +178,12 @@ test("继承的同编号消息不能确认子会话的新提交", async () => {
   expect(container.querySelectorAll("article.user")).toHaveLength(2);
   vi.restoreAllMocks();
 });
+
+test("通用按钮在忙碌时禁用并提供文字反馈", async () => {
+  const { Button } = await import("./components/ui/Button.tsx");
+  await act(async () => root.render(<Button busy>保存</Button>));
+  const control = container.querySelector("button");
+  expect(control.disabled).toBe(true);
+  expect(control.getAttribute("aria-busy")).toBe("true");
+  expect(control.textContent).toContain("处理中");
+});

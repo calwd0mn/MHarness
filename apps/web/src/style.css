@@ -20,14 +20,14 @@ button {
   min-height: 36px;
   padding: 7px 14px;
   border: 0;
-  border-radius: 18px;
+  border-radius: var(--mh-radius-control);
   background: transparent;
   color: var(--mh-text);
   cursor: pointer;
   transition: background-color var(--mh-duration) var(--mh-ease),
     box-shadow var(--mh-duration) var(--mh-ease);
 }
-button:hover:not(:disabled) { background: var(--mh-hover); }
+@media (hover: hover) { button:hover:not(:disabled) { background: var(--mh-hover); } }
 button:active:not(:disabled) { background: var(--mh-active); }
 button:focus-visible { outline: 2px solid var(--mh-focus); outline-offset: 3px; }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -168,7 +168,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .composer textarea::placeholder { color: var(--mh-text-muted); opacity: 1; }
 .composer textarea:disabled { cursor: not-allowed; }
 .composer button { flex: none; min-width: 64px; background: var(--mh-primary); color: var(--mh-on-primary); }
-.composer button:hover:not(:disabled), .composer button:active:not(:disabled) { background: var(--mh-primary-hover); }
+@media (hover: hover) { .composer button:hover:not(:disabled) { background: var(--mh-primary-hover); } }
+.composer button:active:not(:disabled) { background: var(--mh-primary-hover); }
 
 @keyframes enter {
   from { opacity: 0; transform: translateY(6px); }
@@ -202,3 +203,4 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+

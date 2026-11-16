@@ -6,8 +6,8 @@
   --mh-font-mono: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
   --mh-text-size: 14px;
   --mh-text-leading: 22px;
-  --mh-radius-control: 8px;
-  --mh-radius-panel: 24px;
+  --mh-radius-control: 12px;
+  --mh-radius-panel: 28px;
   --mh-ease: cubic-bezier(0.4, 0, 0.2, 1);
   --mh-duration: 200ms;
   --mh-workspace: #ffffff;
@@ -56,3 +56,4 @@
     --mh-scrollbar: rgb(207 211 214 / 24%);
   }
 }
+
