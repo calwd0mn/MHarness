@@ -81,3 +81,14 @@ test("拒绝不能无损持久化的数字并冻结参数", async () => {
     assert.equal(await result.call.execute(), 1);
   }
 });
+
+test("工具超时默认值集中配置且允许可信覆盖", () => {
+  const registry = new ToolRegistry();
+  registry.register(defineLocalTool({ name: "default", version: "1", description: "default", input: z.strictObject({}), handler: () => 1 }));
+  registry.registerRemote({ name: "remote-default", version: "1", executionBoundary: "remote", endpoint: "http://localhost" });
+  registry.registerRemote({ name: "override", version: "1", executionBoundary: "remote", endpoint: "http://localhost", timeoutMs: 123 });
+  assert.equal(registry.governance("default")?.timeoutMs, 30_000);
+  assert.equal(registry.governance("remote-default")?.timeoutMs, 30_000);
+  assert.equal(registry.governance("override")?.timeoutMs, 123);
+  assert.throws(() => registry.registerRemote({ name: "invalid", version: "1", executionBoundary: "remote", endpoint: "http://localhost", timeoutMs: 0 }));
+});
