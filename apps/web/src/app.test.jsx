@@ -468,3 +468,19 @@ test("创建请求卸载后完成不订阅新会话", async () => {
   expect(connections[0].closed).toBe(true);
   root = createRoot(container);
 });
+
+test("无正文失败、取消和截断尝试保留状态且后续轮次可读", async () => {
+  const records = [
+    record(0, "assistant/attempt", { turn: 1, step: 1, outcome: "failed", reason: { diagnostic: "不展示诊断" }, stream: [], includeInModelContext: false }),
+    record(1, "assistant/attempt", { turn: 2, step: 1, outcome: "cancelled", reason: "cancel", stream: [], includeInModelContext: false }),
+    record(2, "assistant/attempt", { turn: 3, step: 1, outcome: "truncated", reason: "output_limit", stream: [], includeInModelContext: false }),
+    record(3, "turn/start", { turn: 4 }),
+  ];
+  await sendFrame(connections[0], snapshot("a", records));
+  expect(container.textContent).toContain("失败");
+  expect(container.textContent).toContain("已取消");
+  expect(container.textContent).toContain("已截断");
+  expect(container.textContent).not.toContain("不展示诊断");
+  expect(container.textContent).toContain("正在处理");
+  expect(container.querySelectorAll("article.assistant")).toHaveLength(0);
+});

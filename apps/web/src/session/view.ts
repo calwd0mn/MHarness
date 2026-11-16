@@ -50,6 +50,13 @@ export function messages(state: FollowState): Message[] {
           reasoning,
         });
     }
+    if (event.type === "assistant/attempt" && !event.data.text)
+      result.push({
+        key: state.settledNodeIds[event.seq] ?? `event-${event.seq}`,
+        order: event.seq,
+        role: "系统",
+        text: event.data.outcome === "cancelled" ? "助手尝试已取消" : event.data.outcome === "truncated" ? "助手尝试已截断" : "助手尝试失败",
+      });
     if (event.type === "assistant/attempt" && event.data.text)
       result.push({
         key: state.settledNodeIds[event.seq] ?? `event-${event.seq}`,

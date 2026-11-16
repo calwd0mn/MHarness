@@ -157,6 +157,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
             ...(state.sessionId === selected ? projectTools(state.records) : []).map((tool) => ({ kind: "tool" as const, order: tool.order, tool }))]
             .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} onDecide={decideApproval} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
               const message = entry.message;
+              if (message.role === "系统") return <p key={message.key} role="status">{message.text}</p>;
               return (
             <article
               key={message.key}
@@ -219,6 +220,7 @@ export function Composer({ text, setText, selected, submission, send }: Pick<Ret
         </form>
   );
 }
+
 
 
 
