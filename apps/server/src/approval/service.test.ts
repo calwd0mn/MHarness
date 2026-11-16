@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Session } from "@mharness/session/server";
-import { ApprovalService } from "./service.ts";
+import { ApprovalCheckpointError, ApprovalService } from "./service.ts";
 
 function fixture(flush: () => Promise<void> = async () => {}) {
   const session = new Session({ sessionId: "s", createdAt: 0 });
@@ -16,10 +16,12 @@ test("审批先持久化请求，重复操作共用交互和持久决定", async
   const { session, operation } = fixture();
   let calls = 0;
   let resolve!: (outcome: "allowed-once") => void;
-  const service = new ApprovalService(() => { calls++; return new Promise((r) => { resolve = r; }); });
+  let notify!: () => void;
+  const requested = new Promise<void>((r) => { notify = r; });
+  const service = new ApprovalService(() => { calls++; notify(); return new Promise((r) => { resolve = r; }); });
   const one = service.request(session, operation, "reason", new AbortController().signal);
   const two = service.request(session, operation, "reason", new AbortController().signal);
-  await Promise.resolve(); await Promise.resolve();
+  await requested;
   assert.equal(calls, 1);
   resolve("allowed-once");
   assert.deepEqual(await Promise.all([one, two]), ["allowed-once", "allowed-once"]);
@@ -30,16 +32,18 @@ test("审批先持久化请求，重复操作共用交互和持久决定", async
 test("请求和决定检查点失败不交付决定", async () => {
   let calls = 0;
   let bodies = 0;
-  const failed = fixture(async () => { throw new Error("disk"); });
+  const disk = new Error("disk");
+  const isCheckpointError = (error: unknown) => error instanceof ApprovalCheckpointError && error.cause === disk;
+  const failed = fixture(async () => { throw disk; });
   const service = new ApprovalService(() => { calls++; return Promise.resolve("allowed-once"); });
   const run = async (value: ReturnType<typeof fixture>) => {
     if (await service.request(value.session, value.operation, "r", new AbortController().signal) === "allowed-once") bodies++;
   };
-  await assert.rejects(run(failed), /disk/);
+  await assert.rejects(run(failed), isCheckpointError);
   assert.equal(calls, 0);
   let count = 0;
-  const later = fixture(async () => { if (++count === 2) throw new Error("disk"); });
-  await assert.rejects(run(later), /disk/);
+  const later = fixture(async () => { if (++count === 2) throw disk; });
+  await assert.rejects(run(later), isCheckpointError);
   assert.equal(bodies, 0);
 });
 
@@ -84,17 +88,42 @@ test("取消使用首次信号，无渠道提交 unavailable，已关闭操作�
 
 test("决定检查点失败后相同决定重新确认才能返回成功", async () => {
   let flushes = 0;
-  const { session, operation } = fixture(async () => { if (++flushes === 2) throw new Error("disk"); });
+  const disk = new Error("disk");
+  const { session, operation } = fixture(async () => { if (++flushes === 2) throw disk; });
   const service = new ApprovalService();
   const waiting = service.request(session, operation, "r", new AbortController().signal);
   const asked = session.snapshot().events.find((e) => e.type === "approval/asked");
   assert.ok(asked && asked.type === "approval/asked");
   const response = service.respond("s", asked.data.id, "allowed-once", session.snapshot().events, session);
-  await assert.rejects(response, /disk/);
-  await assert.rejects(waiting, /disk/);
+  const check = (error: unknown) => error instanceof ApprovalCheckpointError && error.cause === disk;
+  await assert.rejects(response, check);
+  await assert.rejects(waiting, check);
   const retry = await service.respond("s", asked.data.id, "allowed-once", session.snapshot().events, session);
   assert.equal(retry.status, 200);
   assert.equal(flushes, 3);
+});
+
+test("渠道失败保留原错误，不作为检查点失败", async () => {
+  const { session, operation } = fixture();
+  const failure = new Error("channel");
+  const service = new ApprovalService(() => Promise.reject(failure));
+  await assert.rejects(service.request(session, operation, "r", new AbortController().signal), (error: unknown) => error === failure && !(error instanceof ApprovalCheckpointError));
+});
+
+test("已有决定的请求及答复均区分检查点失败", async () => {
+  let fail = false;
+  const disk = new Error("disk");
+  const { session, operation } = fixture(async () => { if (fail) throw disk; });
+  const service = new ApprovalService(null);
+  assert.equal(await service.request(session, operation, "r", new AbortController().signal), "unavailable");
+  const asked = session.snapshot().events.find((event) => event.type === "approval/asked");
+  assert.ok(asked && asked.type === "approval/asked");
+  const check = (error: unknown) => error instanceof ApprovalCheckpointError && error.cause === disk;
+  fail = true;
+  await assert.rejects(service.request(session, operation, "r", new AbortController().signal), check);
+  await assert.rejects(service.respond("s", asked.data.id, "rejected", session.snapshot().events, session), check);
+  fail = false;
+  assert.equal(await service.request(session, operation, "r", new AbortController().signal), "unavailable");
 });
 
 test("没有 asked 的已结束操作不会创建审批", async () => {

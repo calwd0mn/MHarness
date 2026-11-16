@@ -10,6 +10,14 @@ export type ApprovalChannel = (asked: Asked, operation: Operation, signal: Abort
 /** HTTP 答复状态与已确认决定。 */
 export type ApprovalResponse = { status: 200 | 409; body: { id: string; outcome: ApprovalOutcome } } | { status: 409; body: { code: "approval_not_active" } } | { status: 404; body: { code: "approval_not_found" } };
 type Pending = { session: Session; asked: Asked; ready: Promise<void>; done: Promise<ApprovalOutcome>; resolve: (outcome: ApprovalOutcome) => void; reject: (error: unknown) => void; queue: Promise<void> };
+/** 审批持久化检查点失败；cause 保留存储层原错误，渠道失败不会包装为此类型。 */
+export class ApprovalCheckpointError extends Error {
+  /** @param cause - 检查点拒绝的原始原因。 */
+  constructor(cause: unknown) { super("审批持久化检查点失败", { cause }); this.name = "ApprovalCheckpointError"; }
+}
+async function flush(session: Session): Promise<void> {
+  try { await session.flush(); } catch (error) { throw new ApprovalCheckpointError(error); }
+}
 class ApprovalNotActive extends Error {}
 function operationClosed(events: readonly SessionEvent[], operation: Operation): boolean {
   return events.some((e) => (e.type === "turn/end" && e.data.turn === operation.data.turn) ||
@@ -32,7 +40,7 @@ export class ApprovalService {
    * @param reason - 展示给审批方的原因。
    * @param signal - 首次请求持有的 Turn 信号，取消时尝试保存 cancelled；重传沿用首次信号。
    * @returns 已持久化的决定；只有 allowed-once 可进入执行前检查点。
-   * @throws 检查点或渠道失败时拒绝。
+   * @throws 检查点失败以 ApprovalCheckpointError 拒绝；渠道失败保留原错误。
    */
   request(session: Session, operation: Operation, reason: string, signal: AbortSignal): Promise<ApprovalOutcome> {
     const events = session.snapshot().events;
@@ -44,11 +52,11 @@ export class ApprovalService {
     const previous = this.#pending.get(key);
     if (previous) return previous.done;
     const decision = events.find((e): e is Decided => e.type === "approval/decided" && e.data.id === asked.data.id);
-    if (decision) return session.flush().then(() => decision.data.outcome);
+    if (decision) return flush(session).then(() => decision.data.outcome);
     let resolve!: (outcome: ApprovalOutcome) => void;
     let reject!: (error: unknown) => void;
     const done = new Promise<ApprovalOutcome>((yes, no) => { resolve = yes; reject = no; });
-    const pending: Pending = { session, asked, ready: session.flush(), done, resolve, reject, queue: Promise.resolve() };
+    const pending: Pending = { session, asked, ready: flush(session), done, resolve, reject, queue: Promise.resolve() };
     this.#pending.set(key, pending);
     const channelController = new AbortController();
     const abort = () => { void this.#settle(pending, "cancelled").catch(() => {}); };
@@ -73,7 +81,7 @@ export class ApprovalService {
       let decided = events.find((e): e is Decided => e.type === "approval/decided" && e.data.id === pending.asked.data.id);
       if (!decided && closed(events, pending.asked)) throw new ApprovalNotActive();
       if (!decided) decided = pending.session.append({ type: "approval/decided", data: { id: pending.asked.data.id, outcome } });
-      await pending.session.flush();
+      await flush(pending.session);
       pending.resolve(decided.data.outcome);
       return decided.data.outcome;
     });
@@ -89,7 +97,7 @@ export class ApprovalService {
    * @param events - 在线快照或已提交历史。
    * @param session - 已加载会话；未加载时省略。
    * @returns 持久决定、冲突、已关闭或不存在的响应。
-   * @throws 决定检查点失败时拒绝。
+   * @throws 决定检查点失败时以 ApprovalCheckpointError 拒绝。
    */
   async respond(sessionId: string, id: string, outcome: ApprovalReply, events: readonly SessionEvent[], session?: Session): Promise<ApprovalResponse> {
     const asked = events.find((e): e is Asked => e.type === "approval/asked" && e.data.id === id);
@@ -102,7 +110,7 @@ export class ApprovalService {
       try { result = await this.#settle(pending, outcome); }
       catch (error) { if (error instanceof ApprovalNotActive) return { status: 409, body: { code: "approval_not_active" } }; throw error; }
     }
-    else if (decided) { if (session) await session.flush(); result = decided.data.outcome; }
+    else if (decided) { if (session) await flush(session); result = decided.data.outcome; }
     else return { status: 409, body: { code: "approval_not_active" } };
     return { status: result === outcome ? 200 : 409, body: { id, outcome: result } };
   }
