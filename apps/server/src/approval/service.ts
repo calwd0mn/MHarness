@@ -94,8 +94,8 @@ export class ApprovalService {
    * @param sessionId - 会话标识。
    * @param id - 审批标识。
    * @param outcome - 客户端决定。
-   * @param events - 在线快照或已提交历史。
-   * @param session - 已加载会话；未加载时省略。
+   * @param events - 传入 session 时为在线快照；省略 session 时必须为已提交历史。
+   * @param session - 用于确认尚未提交决定的在线会话；以已提交历史答复时省略，即使会话已加载。
    * @returns 持久决定、冲突、已关闭或不存在的响应。
    * @throws 决定检查点失败时以 ApprovalCheckpointError 拒绝。
    */
@@ -106,7 +106,8 @@ export class ApprovalService {
     const decided = events.find((e): e is Decided => e.type === "approval/decided" && e.data.id === id);
     if (!decided && closed(events, asked)) return { status: 409, body: { code: "approval_not_active" } };
     let result: ApprovalOutcome;
-    if (pending) {
+    if (!session && decided) result = decided.data.outcome;
+    else if (pending) {
       try { result = await this.#settle(pending, outcome); }
       catch (error) { if (error instanceof ApprovalNotActive) return { status: 409, body: { code: "approval_not_active" } }; throw error; }
     }

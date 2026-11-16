@@ -148,3 +148,97 @@ test("follow 与持久历史交付相同的原始操作和审批事件", async (
     await persistence.close();
   }
 });
+
+test("已提交决定的 HTTP 重发不排空失败的在线尾部", async (t) => {
+  const { Session, SqliteSessionPersistence } = await import("@mharness/session/server");
+  const { ReActAgent } = await import("../agent/react-agent.ts");
+  const { registerApprovalRoutes } = await import("./routes.ts");
+  const { default: Fastify } = await import("fastify");
+  const dir = await mkdtemp(join(tmpdir(), "approval-prefix-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const session = new Session({ sessionId: "s", createdAt: 0 });
+  const handle = await persistence.create(session.header);
+  await handle.flush();
+  let committed = 0;
+  let fail = false;
+  let failedFlushes = 0;
+  session.bindCheckpoint(async () => {
+    if (fail) { failedFlushes++; throw new Error("tail"); }
+    const events = session.snapshot().events;
+    await handle.append(events.slice(committed));
+    committed = events.length;
+  });
+  session.append({ type: "assistant/message", surfaceOp: "append", data: { turn: 1, step: 1, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true, message: { id: "a", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "tool-call", id: "c", name: "t", arguments: "{}" }] } } });
+  session.append({ type: "tool/call", data: { turn: 1, step: 1, callId: "c", name: "t", arguments: "{}" } });
+  const operation = session.append({ type: "tool/operation", data: { turn: 1, step: 1, callId: "c", operationId: "o", toolName: "t", toolVersion: "1", validatedArgs: {} } });
+  const service = new ApprovalService(() => Promise.resolve("allowed-once"));
+  await service.request(session, operation, "r", new AbortController().signal);
+  const asked = session.snapshot().events.find((e) => e.type === "approval/asked");
+  assert.ok(asked && asked.type === "approval/asked");
+  session.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  fail = true;
+  const app = Fastify();
+  const agent = new ReActAgent(session, async () => {}, handle);
+  let current = agent;
+  registerApprovalRoutes(app, "/api/sessions", persistence, { get: () => current }, service);
+  try {
+    const url = `/api/sessions/s/approvals/${asked.data.id}/decision`;
+    for (const [outcome, status] of [["allowed-once", 200], ["rejected", 409]] as const) {
+      const response = await app.inject({ method: "POST", url, payload: { outcome } });
+      assert.equal(response.statusCode, status);
+      assert.deepEqual(response.json(), { id: asked.data.id, outcome: "allowed-once" });
+    }
+    assert.equal(failedFlushes, 0);
+    const restored = new Session(session.header, { seed: { kind: "restore", events: await handle.read(), inheritedEventCount: 0 } });
+    restored.bindCheckpoint(async () => { throw new Error("tail"); });
+    current = new ReActAgent(restored, async () => {}, handle);
+    const reopened = await app.inject({ method: "POST", url, payload: { outcome: "allowed-once" } });
+    assert.equal(reopened.statusCode, 200);
+    assert.deepEqual(reopened.json(), { id: asked.data.id, outcome: "allowed-once" });
+    await current.stop();
+  } finally { await app.close(); await agent.stop(); await handle.close(); await persistence.close(); }
+});
+
+test("HTTP 不能把仅内存接受的决定当成已提交", async (t) => {
+  const { Session, SqliteSessionPersistence } = await import("@mharness/session/server");
+  const { ReActAgent } = await import("../agent/react-agent.ts");
+  const { registerApprovalRoutes } = await import("./routes.ts");
+  const { default: Fastify } = await import("fastify");
+  const dir = await mkdtemp(join(tmpdir(), "approval-uncommitted-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const session = new Session({ sessionId: "s", createdAt: 0 });
+  const handle = await persistence.create(session.header);
+  await handle.flush();
+  let committed = 0;
+  let fail = false;
+  session.bindCheckpoint(async () => {
+    if (fail) throw new Error("disk");
+    const events = session.snapshot().events;
+    await handle.append(events.slice(committed));
+    committed = events.length;
+  });
+  session.append({ type: "assistant/message", surfaceOp: "append", data: { turn: 1, step: 1, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true, message: { id: "a", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "tool-call", id: "c", name: "t", arguments: "{}" }] } } });
+  session.append({ type: "tool/call", data: { turn: 1, step: 1, callId: "c", name: "t", arguments: "{}" } });
+  const operation = session.append({ type: "tool/operation", data: { turn: 1, step: 1, callId: "c", operationId: "o", toolName: "t", toolVersion: "1", validatedArgs: {} } });
+  let ready!: () => void;
+  const requested = new Promise<void>((resolve) => { ready = resolve; });
+  const service = new ApprovalService(() => { ready(); return new Promise(() => {}); });
+  const waiting = service.request(session, operation, "r", new AbortController().signal);
+  await requested;
+  const asked = session.snapshot().events.find((e) => e.type === "approval/asked");
+  assert.ok(asked && asked.type === "approval/asked");
+  fail = true;
+  const app = Fastify();
+  const agent = new ReActAgent(session, async () => {}, handle);
+  registerApprovalRoutes(app, "/api/sessions", persistence, { get: () => agent }, service);
+  try {
+    const url = `/api/sessions/s/approvals/${asked.data.id}/decision`;
+    const first = await app.inject({ method: "POST", url, payload: { outcome: "allowed-once" } });
+    assert.equal(first.statusCode, 500);
+    await assert.rejects(waiting);
+    assert.equal((await app.inject({ method: "POST", url, payload: { outcome: "allowed-once" } })).statusCode, 500);
+    assert.equal((await handle.read()).some((e) => e.type === "approval/decided"), false);
+  } finally { await app.close(); await agent.stop(); await handle.close(); await persistence.close(); }
+});
