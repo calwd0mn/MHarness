@@ -16,6 +16,7 @@ import { test } from "node:test";
 import { startMockMcp } from "../../../mock-mcp/src/server.ts";
 import { connectMcpTools } from "./mcp.ts";
 import { ToolRegistry } from "./registry.ts";
+import { STOP_OBSERVING_TOOL_RESULT } from "./dispatch.ts";
 
 test("真实 MCP 工具隐藏 operationId 并接受绑定标识", async () => {
   const server = await startMockMcp(0);
@@ -194,4 +195,53 @@ test("真实 Agent 与 SQLite 持久化 MCP 操作和结果", async () => {
     assert.equal(JSON.stringify(result).includes('"value"'), false);
     assert.deepEqual(server.effects(), ["stored"]);
   } finally { await manager.close(); await store.close(); await connection.close(); await server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("工具目录分页及注册失败不留下部分工具", async () => {
+  const upstream = await startMockMcp(0);
+  const proxy = createServer(async (req, res) => {
+    const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = Buffer.concat(chunks).toString();
+    const request = body ? JSON.parse(body) as { id?: number; method?: string; params?: { cursor?: string } } : {};
+    if (request.method === "tools/list") {
+      const cursor = request.params?.cursor;
+      const tool = cursor ? "mock_write" : "mock_read";
+      const schema = { type: "object", properties: { operationId: { type: "string" } }, required: ["operationId"], additionalProperties: false };
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { tools: [{ name: tool, inputSchema: schema }], ...(!cursor ? { nextCursor: "page-2" } : {}) } }));
+      return;
+    }
+    try {
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) if (value && key !== "host" && key !== "content-length") headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+      const forwarded = await fetch(upstream.url, { method: req.method, headers, ...(body ? { body } : {}) });
+      res.writeHead(forwarded.status, Object.fromEntries(forwarded.headers)); res.end(Buffer.from(await forwarded.arrayBuffer()));
+    } catch { res.destroy(); }
+  });
+  await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const address = proxy.address(); assert.ok(address && typeof address !== "string");
+  const endpoint = `http://127.0.0.1:${address.port}/mcp`;
+  try {
+    const registry = new ToolRegistry();
+    const connection = await connectMcpTools(registry, endpoint);
+    assert.deepEqual(registry.definitions().map((item) => item.name), ["mock_read", "mock_write"]);
+    await connection.close();
+    const failed = new ToolRegistry();
+    await assert.rejects(connectMcpTools(failed, endpoint, [{ name: "mock_read", version: "1" }, { name: "missing", version: "1" }]));
+    assert.deepEqual(failed.definitions(), []);
+    await assert.rejects(connectMcpTools(failed, endpoint, [{ name: "mock_read", version: "1" }, { name: "mock_read", version: "1" }]));
+    assert.deepEqual(failed.definitions(), []);
+  } finally { proxy.closeAllConnections(); await new Promise<void>((resolve) => proxy.close(() => resolve())); await upstream.close(); }
+});
+
+test("停止观察后远程调用拒绝迟到结局", async () => {
+  const server = await startMockMcp(0);
+  const registry = new ToolRegistry();
+  const connection = await connectMcpTools(registry, server.url);
+  try {
+    const prepared = registry.prepare("mock_write", '{"text":"x"}'); assert.ok(prepared.ok);
+    const controller = new AbortController();
+    const pending = prepared.call.executeNormalized(controller.signal, "op");
+    controller.abort(STOP_OBSERVING_TOOL_RESULT);
+    await assert.rejects(pending, /停止观察/);
+  } finally { await connection.close(); await server.close(); }
 });

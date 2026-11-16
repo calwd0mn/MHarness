@@ -5,6 +5,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import Ajv2019 from "ajv/dist/2019.js";
 import Ajv from "ajv";
 import { z } from "zod";
+import { STOP_OBSERVING_TOOL_RESULT } from "./dispatch.ts";
 import { toolGovernance, type RegisteredTool, type ToolGovernance, type ToolRegistry } from "./registry.ts";
 import { snapshotToolJson, type ToolResult } from "./result.ts";
 
@@ -42,7 +43,17 @@ export async function connectMcpTools(registry: ToolRegistry, endpoint: string, 
   const client = new Client({ name: "mharness", version: "1.0.0" });
   try {
     await client.connect(new StreamableHTTPClientTransport(new URL(endpoint)));
-    const listed = await client.request({ method: "tools/list" }, ListToolsResultSchema);
+    const tools: z.infer<typeof ListToolsResultSchema>["tools"] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await client.request({ method: "tools/list", ...(cursor !== undefined ? { params: { cursor } } : {}) }, ListToolsResultSchema);
+      tools.push(...page.tools);
+      cursor = page.nextCursor;
+      if (cursor !== undefined && cursors.has(cursor)) throw new Error("MCP 工具目录游标重复");
+      if (cursor !== undefined) cursors.add(cursor);
+    } while (cursor !== undefined);
+    const pending: RegisteredTool[] = [];
     const validator = (schema: Record<string, unknown>) => {
       const dialect = schema.$schema;
       const ajv = dialect === "http://json-schema.org/draft-07/schema#" ? new Ajv({ strict: false })
@@ -51,7 +62,7 @@ export async function connectMcpTools(registry: ToolRegistry, endpoint: string, 
       return ajv.compile(schema);
     };
     for (const config of selected) {
-      const remote = listed.tools.find((tool) => tool.name === config.name);
+      const remote = tools.find((tool) => tool.name === config.name);
       if (!remote) throw new Error(`MCP 工具不存在: ${config.name}`);
       const projection = modelSchema(remote.inputSchema);
       const projected = projection.schema;
@@ -63,9 +74,8 @@ export async function connectMcpTools(registry: ToolRegistry, endpoint: string, 
       const tool: RegisteredTool = { name: remote.name, definition, governance: policy,
         prepare(value) {
           if (!value || typeof value !== "object" || Array.isArray(value) || (projection.inject && Object.hasOwn(value, "operationId")) || !validateModel(value)) return { ok: false, code: "INVALID_INPUT" };
-          const args = structuredClone(value);
-          const freeze = (item: object): void => { for (const child of Object.values(item)) if (child && typeof child === "object") freeze(child); Object.freeze(item); };
-          freeze(args);
+          const args = snapshotToolJson(value);
+          if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, code: "INVALID_INPUT" };
           const execute = async (signal = new AbortController().signal, operationId?: string): Promise<unknown> => {
             const full = projection.inject ? { ...args, operationId } : args;
             if (!validateFull(full)) throw new Error("完整工具参数校验失败。");
@@ -77,10 +87,12 @@ export async function connectMcpTools(registry: ToolRegistry, endpoint: string, 
             let result: unknown;
             try { result = await execute(signal, operationId); }
             catch (error) {
+              if (signal.aborted && signal.reason === STOP_OBSERVING_TOOL_RESULT) throw new Error("工具结果已停止观察");
               if (error instanceof z.ZodError) return failure("INVALID_TOOL_OUTPUT", "工具输出不符合结果契约。");
               const protocol = error instanceof SyntaxError || (error instanceof McpError && error.code !== ErrorCode.ConnectionClosed && error.code !== ErrorCode.RequestTimeout);
               return failure(protocol ? "MCP_PROTOCOL_ERROR" : "MCP_TRANSPORT_ERROR", "MCP 调用失败。");
             }
+            if (signal.aborted && signal.reason === STOP_OBSERVING_TOOL_RESULT) throw new Error("工具结果已停止观察");
             if (!remote.outputSchema && (typeof result !== "object" || result === null || !Object.hasOwn(result, "content"))) return failure("INVALID_TOOL_OUTPUT", "工具输出不符合结果契约。");
             const parsed = CallToolResultSchema.safeParse(result);
             if (!parsed.success) return failure("INVALID_TOOL_OUTPUT", "工具输出不符合结果契约。");
@@ -96,8 +108,9 @@ export async function connectMcpTools(registry: ToolRegistry, endpoint: string, 
           return { ok: true, call: { name: remote.name, version: config.version, governance: policy, args, execute, executeNormalized } };
         },
       };
-      registry.register(tool);
+      pending.push(tool);
     }
+    registry.registerMany(pending);
     return { close: () => client.close() };
   } catch (error) { await client.close(); throw error; }
 }

@@ -33,11 +33,11 @@ export interface PreparedToolCall {
    */
   execute(signal?: AbortSignal, operationId?: string): Promise<unknown>;
   /**
-   * 执行正文并校验输出；未配置输出契约时返回契约失败，正文抛错时 Promise 拒绝。
-   * 派发器停止观察后，迟到值不会进入校验或内容派生，Promise 拒绝；这不证明执行端没有副作用。
+   * 执行正文并规范化结局；本地工具未配置输出契约时返回契约失败，远端工具可返回 content-only 成功。
+   * 本地正文抛错时拒绝，远端协议与传输故障会归一为失败结果。停止观察后不校验迟到值并拒绝，不代表副作用已撤销。
    * @param signal - 传给正文的取消请求，不保证正文已经停止。
    * @param operationId - 已持久化的操作标识；需要注入标识的远程工具必须提供。
-   * @returns 已校验的成功结果或输出契约失败。
+   * @returns 已校验的成功结果或规范化失败结果。
    */
   executeNormalized(signal: AbortSignal, operationId?: string): Promise<ToolResult<unknown>>;
 }
@@ -106,8 +106,20 @@ export class ToolRegistry {
   private readonly policies = new Map<string, ToolGovernance>();
   /** 注册已绑定治理的工具；名称重复时抛错。 */
   register(tool: RegisteredTool): void {
-    if (this.policies.has(tool.name)) throw new Error("工具名称已注册");
-    this.local.set(tool.name, tool); this.policies.set(tool.name, tool.governance);
+    this.registerMany([tool]);
+  }
+  /**
+   * 一次注册所有工具；存在名称冲突时不修改注册表。
+   * @param tools - 可信工具集合。
+   * @throws 与已有名称或集合内部名称重复时抛错。
+   */
+  registerMany(tools: readonly RegisteredTool[]): void {
+    const names = new Set<string>();
+    for (const tool of tools) {
+      if (this.policies.has(tool.name) || names.has(tool.name)) throw new Error("工具名称已注册");
+      names.add(tool.name);
+    }
+    for (const tool of tools) { this.local.set(tool.name, tool); this.policies.set(tool.name, tool.governance); }
   }
   /**
    * 保存远程治理信息，不提供远程输入校验或派发；地址不改变取消退出保证。

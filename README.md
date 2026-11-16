@@ -27,7 +27,7 @@ pnpm dev
 
 工具超时保存配对的 `TOOL_TIMEOUT`。只读超时按 Turn 跨 Step 累计，默认前两次可继续，第三次以 `READ_ONLY_TIMEOUT_BUDGET_EXHAUSTED` 结束。副作用或未知能力工具超时且结果未确认时，以 `TOOL_TIMEOUT` 结束本轮，剩余调用保存未执行结局，不请求模型续答。已派发取消但结果未确认保存 `ABORTED`。幂等与查询能力不会触发重试或核实；迟到响应或拒绝不改写已结算结果、不恢复本轮。默认值集中于 `config/local.ts`，模型最大步数仍为 8。
 
-MCP、迟到结果入账与核实、恢复执行和前端审批交互仍按后续任务推进。
+模拟 MCP 已可按下方说明显式启用；工具端持久幂等、迟到结果入账与核实、恢复执行和前端审批联调仍按后续任务推进。
 
 ## Session 模块
 
@@ -65,7 +65,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。当前模型为模拟 Adapter，真实 Provider、MCP 接入和压缩按 OpenSpec 的后续任务交付。
+- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。当前模型为模拟 Adapter；真实 Provider 和压缩按 OpenSpec 的后续任务交付。
 
 ## 审批答复接口
 
@@ -84,6 +84,19 @@ Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/approva
 
 ## 模拟 MCP 工具
 
-单独启动模拟服务：`pnpm --filter @mharness/mock-mcp dev`，默认仅监听 `127.0.0.1:3101`。可通过 `MHARNESS_MOCK_MCP_PORT` 修改端口。启动后端前显式设置 `MHARNESS_MCP_ENDPOINT=http://127.0.0.1:3101/mcp` 才会连接；未设置时保持默认行为。可信配置将 `mock_read` 设为只读免审批，`mock_write` 设为副作用且需审批。模拟模型默认只回答文本，可在测试驱动中发出工具调用。
+在一个 PowerShell 7 窗口启动模拟服务，默认仅监听 `127.0.0.1:3101`：
+
+```powershell
+pnpm --filter @mharness/mock-mcp dev
+```
+
+在另一个 PowerShell 7 窗口显式启用 MCP 后启动应用：
+
+```powershell
+$env:MHARNESS_MCP_ENDPOINT = 'http://127.0.0.1:3101/mcp'
+pnpm dev
+```
+
+可在服务窗口通过 `$env:MHARNESS_MOCK_MCP_PORT` 修改端口，并相应调整后端地址；未设置 `MHARNESS_MCP_ENDPOINT` 时保持默认行为。可信配置将 `mock_read` 设为只读免审批，`mock_write` 设为副作用且需审批。模拟模型默认只回答文本，可在测试驱动中发出工具调用。
 
 服务使用 MCP Streamable HTTP，输入保留顶层 `operationId`，只由 Harness 在操作记录建立后注入。模型输入和包含标识的完整输入分别按远端 JSON Schema 校验，服务入口也独立校验。仅支持可安全移除保留字段的顶层对象规则；复杂的跨字段约束会在连接时拒绝。MCP 默认采用远程取消策略，即使地址是 localhost 也不保证服务端停止。当前模拟写入尚无持久台账或去重能力；不要将其作为真实副作用服务。

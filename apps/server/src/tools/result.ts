@@ -55,11 +55,12 @@ export class HarnessError extends Error {
 /**
  * 创建不可变、无损的 JSON 快照。
  * @param value - 待复制的数据。
- * @param ancestors - 内部递归使用的祖先集合；调用方应省略。
  * @returns 不与原数据共享可变对象的快照。
  * @throws 数据无法无损表示为 JSON 或存在循环引用时抛出。
  */
-export function snapshotToolJson(value: unknown, ancestors = new Set<object>()): ToolJson {
+export function snapshotToolJson(value: unknown): ToolJson { return snapshotJson(value, new Set<object>()); }
+
+function snapshotJson(value: unknown, ancestors: Set<object>): ToolJson {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0)) return value;
   if (typeof value !== "object" || ancestors.has(value)) throw new TypeError("无效 JSON");
@@ -72,13 +73,13 @@ export function snapshotToolJson(value: unknown, ancestors = new Set<object>()):
     };
     if (Array.isArray(value)) {
       if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length + 1) throw new TypeError("无效 JSON");
-      return Object.freeze(Array.from({ length: value.length }, (_, i) => snapshotToolJson(read(String(i)), ancestors))) as ToolJson[];
+      return Object.freeze(Array.from({ length: value.length }, (_, i) => snapshotJson(read(String(i)), ancestors))) as ToolJson[];
     }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError("无效 JSON");
     const entries = Reflect.ownKeys(value).map((key) => {
       if (typeof key !== "string") throw new TypeError("无效 JSON");
-      return [key, snapshotToolJson(read(key), ancestors)] as const;
+      return [key, snapshotJson(read(key), ancestors)] as const;
     });
     return Object.freeze(Object.fromEntries(entries));
   } finally {
