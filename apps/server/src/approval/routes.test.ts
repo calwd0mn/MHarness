@@ -237,8 +237,77 @@ test("HTTP 不能把仅内存接受的决定当成已提交", async (t) => {
     const url = `/api/sessions/s/approvals/${asked.data.id}/decision`;
     const first = await app.inject({ method: "POST", url, payload: { outcome: "allowed-once" } });
     assert.equal(first.statusCode, 500);
+    assert.equal(agent.storageOpen, false);
     await assert.rejects(waiting);
     assert.equal((await app.inject({ method: "POST", url, payload: { outcome: "allowed-once" } })).statusCode, 500);
     assert.equal((await handle.read()).some((e) => e.type === "approval/decided"), false);
   } finally { await app.close(); await agent.stop(); await handle.close(); await persistence.close(); }
+});
+
+test("持久读取截点与在线决定竞争时重新核验已提交决定", async (t) => {
+  const { Session, SqliteSessionPersistence } = await import("@mharness/session/server");
+  const { ReActAgent } = await import("../agent/react-agent.ts");
+  const { registerApprovalRoutes } = await import("./routes.ts");
+  const { default: Fastify } = await import("fastify");
+  for (const [outcome, expected] of [["allowed-once", 200], ["rejected", 409]] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "approval-race-"));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+    const session = new Session({ sessionId: "s", createdAt: 0 });
+    const handle = await persistence.create(session.header);
+    await handle.flush();
+    let committed = 0;
+    let fail = false;
+    session.bindCheckpoint(async () => {
+      if (fail) throw new Error("tail");
+      const events = session.snapshot().events;
+      await handle.append(events.slice(committed));
+      committed = events.length;
+    });
+    session.append({ type: "assistant/message", surfaceOp: "append", data: { turn: 1, step: 1, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true, message: { id: "a", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "tool-call", id: "c", name: "t", arguments: "{}" }] } } });
+    session.append({ type: "tool/call", data: { turn: 1, step: 1, callId: "c", name: "t", arguments: "{}" } });
+    const operation = session.append({ type: "tool/operation", data: { turn: 1, step: 1, callId: "c", operationId: "o", toolName: "t", toolVersion: "1", validatedArgs: {} } });
+    let reply!: (value: "allowed-once") => void;
+    let requested!: () => void;
+    const channelStarted = new Promise<void>((resolve) => { requested = resolve; });
+    const service = new ApprovalService(() => { requested(); return new Promise((resolve) => { reply = resolve; }); });
+    const waiting = service.request(session, operation, "r", new AbortController().signal);
+    await channelStarted;
+    const asked = session.snapshot().events.find((e) => e.type === "approval/asked");
+    assert.ok(asked && asked.type === "approval/asked");
+    let captured!: () => void;
+    let release!: () => void;
+    const readCaptured = new Promise<void>((resolve) => { captured = resolve; });
+    const readReleased = new Promise<void>((resolve) => { release = resolve; });
+    let first = true;
+    const reader: Pick<typeof persistence, "open"> = { open: async (id, access) => {
+      const readHandle = await persistence.open(id, access);
+      if (!readHandle) return undefined;
+      return new Proxy(readHandle, { get(target, property) {
+        if (property === "read") return async () => {
+          const events = await target.read();
+          if (first) { first = false; captured(); await readReleased; }
+          return events;
+        };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    } };
+    const app = Fastify();
+    const agent = new ReActAgent(session, async () => {}, handle);
+    registerApprovalRoutes(app, "/api/sessions", reader, { get: () => agent }, service);
+    try {
+      const pending = app.inject({ method: "POST", url: `/api/sessions/s/approvals/${asked.data.id}/decision`, payload: { outcome } });
+      await readCaptured;
+      reply("allowed-once");
+      assert.equal(await waiting, "allowed-once");
+      session.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+      fail = true;
+      release();
+      const response = await pending;
+      assert.equal(response.statusCode, expected);
+      assert.deepEqual(response.json(), { id: asked.data.id, outcome: "allowed-once" });
+      assert.equal(agent.storageOpen, false);
+    } finally { release(); await app.close(); await agent.stop(); await handle.close(); await persistence.close(); }
+  }
 });

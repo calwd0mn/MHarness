@@ -4,7 +4,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AgentManager } from "../agent/manager.ts";
 import { approvalDecisionRequestSchema } from "./contracts.ts";
-import type { ApprovalService } from "./service.ts";
+import { ApprovalCheckpointError, type ApprovalService } from "./service.ts";
 
 /**
  * 注册审批决定入口；历史查询不加载 Agent，已提交决定直接复用，不排空在线尾部。
@@ -20,15 +20,25 @@ export function registerApprovalRoutes(app: FastifyInstance, path: string, persi
     const body = approvalDecisionRequestSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ code: "invalid_request" });
     const { sessionId, approvalId } = params.data;
-    const session = agents.get(sessionId)?.session;
+    const agent = agents.get(sessionId);
+    const session = agent?.session;
     const handle = await persistence.open(sessionId, "read");
     if (!handle) return reply.code(404).send({ code: "approval_not_found" });
     try {
       const events = await handle.read();
       const committed = events.some((event) => event.type === "approval/decided" && event.data.id === approvalId);
-      const result = session && !committed
-        ? await approvals.respond(sessionId, approvalId, body.data.outcome, session.snapshot().events, session)
-        : await approvals.respond(sessionId, approvalId, body.data.outcome, events);
+      let result;
+      try {
+        result = session && !committed
+          ? await approvals.respond(sessionId, approvalId, body.data.outcome, session.snapshot().events, session)
+          : await approvals.respond(sessionId, approvalId, body.data.outcome, events);
+      } catch (error) {
+        if (!(error instanceof ApprovalCheckpointError)) throw error;
+        agent?.blockStorage(error.cause);
+        const latest = await handle.read();
+        if (!latest.some((event) => event.type === "approval/decided" && event.data.id === approvalId)) throw error;
+        result = await approvals.respond(sessionId, approvalId, body.data.outcome, latest);
+      }
       return reply.code(result.status).send(result.body);
     } finally { await handle.close(); }
   });
