@@ -21,7 +21,13 @@ pnpm dev
 
 `apps/server/src/approval/` 拥有审批服务、答复 Schema 和 HTTP 路由。操作和审批请求提交后才交互，等待期间 Turn 保持活动，历史读取和取消可用，新编号仍返回 `409 agent_busy`。HTTP 和审批渠道共用唯一持久决定；`ApprovalService` 省略渠道表示等待 HTTP，显式传入 `null` 表示不可用。工具正文可接收取消信号；可靠协作退出的工具等待清理，其他工具停止等待后不声称执行端已停止或副作用已撤销。
 
-批次保存成功结果的 `concludeTurn` 供后续 2.8 使用，当前驱动尚未消费结束意向。MCP、完整超时策略和前端审批交互仍按后续任务推进。
+成功结果携带 `concludeTurn` 时，本批剩余调用仍按序结算；明确业务错误不撤销该意向。批次完成后 Turn 以 `completed` 结束，不生成下一 Step 或额外总结。用户拒绝、取消、派发异常及超时中止优先，同一 Agent 可继续处理后续 Turn。
+
+工具默认等待超时为 30 秒，可信注册可覆盖，取值须大于 0 且不超过 2_147_483_647 毫秒。执行计时从实际派发开始，审批及检查点等待不消耗该时间。本地且保证协作退出的工具在超时或取消后等待正文与清理退出，期间 Turn 保持活动；退出保证违约可能导致长期等待。远程或无退出保证的调用传播取消后停止等待，不声称执行端已经停止或副作用已撤销。
+
+工具超时保存配对的 `TOOL_TIMEOUT`。只读超时按 Turn 跨 Step 累计，默认前两次可继续，第三次以 `READ_ONLY_TIMEOUT_BUDGET_EXHAUSTED` 结束。副作用或未知能力工具超时且结果未确认时，以 `TOOL_TIMEOUT` 结束本轮，剩余调用保存未执行结局，不请求模型续答。已派发取消但结果未确认保存 `ABORTED`。幂等与查询能力不会触发重试或核实；迟到响应或拒绝不改写已结算结果、不恢复本轮。默认值集中于 `config/local.ts`，模型最大步数仍为 8。
+
+MCP、迟到结果入账与核实、恢复执行和前端审批交互仍按后续任务推进。
 
 ## Session 模块
 
@@ -59,7 +65,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。当前模型为模拟 Adapter，真实 Provider、MCP 接入、完整超时策略和压缩按 OpenSpec 的后续任务交付。
+- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。当前模型为模拟 Adapter，真实 Provider、MCP 接入和压缩按 OpenSpec 的后续任务交付。
 
 ## 审批答复接口
 

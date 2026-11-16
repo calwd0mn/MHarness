@@ -6,7 +6,7 @@
 
 ## 建议值与边界
 
-- 工具默认等待超时 30_000 ms，由 config/local.ts 集中提供，可信注册可以覆盖；不与模型 requestTimeoutMs 混用。只从实际派发开始计时，审批和持久化检查点不消耗该工具等待时间。
+- 工具默认等待超时 30_000 ms，由 config/local.ts 集中提供，可信注册可以覆盖；不与模型 requestTimeoutMs 混用。只从实际派发开始计时，审批和持久化检查点不消耗该工具等待时间。注册及派发均限制值大于 0 且不超过 Node 定时器上限 2_147_483_647 ms。
 - 每 Turn 的只读超时次数上限建议为 3：第 1、2 次允许继续，第 3 次停止本批剩余派发及模型续答，以明确预算耗尽原因结算。次数跨 Step 累计，新 Turn 重置。
 - 最大模型步数保持现有 8；不新增自动重试、查询、Turn 总墙钟期限或审批超时。
 - 本地且 cooperative-exit：截止/取消传播信号后，等待正文及清理结束。清理没有额外强制截断期限；违约工具可能长期占用 Turn，这是退出保证的明确代价，不能提前宣称已停止。
@@ -37,4 +37,36 @@
 
 ## 执行记录
 
-待开发及独立审查完成后追加各任务 diff、red/green 与最终验证证据。
+统筹在集成工作树确认基线：`pnpm typecheck`、服务端 185/185、Web 40 项 Node 与 11 项 React 测试、Web build、OpenSpec strict validate 全部通过。构建保留两条已有 Zod 上游 Rollup 注释警告。
+
+5.1 与 2.8 以 d3e1fbf 为共同开发基线并行。5.1 的执行接口约定为 `gate.dispatch(body, prepared.call.governance)`；新增 `timeout / TOOL_TIMEOUT` 结果，旧字符串参数保持兼容。集中配置字段为 `localConfig.tools.timeoutMs` 与 `localConfig.tools.maxReadOnlyTimeouts`，5.2 消费并接入 Turn 策略。
+
+| 任务 | 开发 diff / 集成提交 | 已有验证证据 |
+| --- | --- | --- |
+| 2.8 | d3e1fbf..388e0c1 / 3155f41 | 新增 Agent/SQLite 测试先因模型请求 2 次而期望 1 次失败；实现后 model-turn-conclude、model-turn、batch 共 44 项通过，server typecheck 通过。 |
+| 5.1 | d3e1fbf..c480d38 / 07e8315 | `node --import tsx --test src/tools/dispatch.test.ts src/tools/registry.test.ts` 定向 18/18；server typecheck 与服务端 192/192 通过。迟到值不触发 render 的单例先以 1 !== 0 失败，再通过。完整 Turn 接线留给 5.2/5.3。 |
+| 5.2 | 07e8315..03091dd / 3ef67b0 | `node --import tsx --test src/agent/model-turn-timeout.test.ts` 先 3/3 失败：副作用尾项仍派发、只读预算仍请求第 4 步。修复后加 batch、model-turn-conclude 共 23/23 通过，server typecheck 通过。 |
+| 5.3 | 3ef67b0..d436904 / 0ebf595 | 新增 5 个真实 HTTP/临时 SQLite 场景，合并 timeout、batch、dispatch 共 37/37 通过，server typecheck 通过。临时移除超时优先结算后，timeout-cleanup 用例因 TOOL_TIMEOUT 变为成功而失败；还原后通过，最终 diff 仅新增测试。 |
+
+上述定向 Node 命令在 apps/server 执行。5.1 新增 timeout 分支、旧签名兼容、集中默认值以及停止观察后不派生迟到值的约定；2.8 覆盖成功意向、明确错误、拒绝/取消/异常优先及同一 Agent 复用。开发代理已人工核对中文 JSDoc，项目没有专用 JSDoc 静态检查脚本。
+
+5.3 覆盖本地清理期间无 turn/end、新编号 HTTP 409、截止前结果、迟到 resolve/reject 后事件不变、模型不续跑、同一在线会话后续 Turn、flush 后 HTTP 历史及关闭重开一致。已派发结果引用 tool/call，未派发尾项引用 Assistant 声明。停止等待使用无退出保证的本地替身，不声称已验收真实 MCP；live 观察使用 Session 事件，未新增真实 SSE 路由场景，既有 follow 测试继续回归。
+
+## 集成验证与 continue-review
+
+统筹在最终集成代码 0ebf595 亲自执行：`pnpm typecheck`、`pnpm --filter @mharness/server test`（204/204）、`pnpm --filter @mharness/web test`（40 项 Node + 11 项 React）、`pnpm --filter @mharness/web build`、`git diff 4856b44 HEAD --check`、工作区 diff 检查、`openspec validate agent-harness-prototype --strict` 全通过。构建仍有两条已有 Zod 上游 Rollup 注释警告。
+
+按用户预授权直接进入 continue-review，5.1、2.8、5.2、5.3 分别新建了独立只读代理。审查按上述任务 diff 及最终集成调用链核对，不把 4.x MCP 或全局 7.x 待办当成本轮已交付。
+
+- 2.8：未发现可证实的本批缺陷；独立运行 model-turn-conclude、model-turn、batch 共 44/44 通过。
+- 5.1：确认 P2，正有限的超时值 2_147_483_648 超过 Node 定时器上限，实际被缩为 1ms。统筹真实 dispatch 复现约 2ms 得到 TOOL_TIMEOUT，独立审查者确认。原开发代理修复 a8d8b23，集成 094d9c7：本地/远程注册与派发均拒绝超过 2_147_483_647 ms，接受合法上界，补回归并更新 JSDoc。两个新用例先因未抛错而失败，修复后定向 20/20、server typecheck、diff check 通过。原独立审查者运行定向 20/20、重做边界复现并确认 P2 关闭，无其他发现。
+- 5.2：未发现可证实的本批缺陷；独立运行服务端 204/204 与任务 diff check 通过，确认跨 Step 预算、每轮重置、配对及取消监听器收束。
+- 5.3：未发现可证实的本批缺陷；独立运行竞态与相关测试 37/37 通过，确认 HTTP/SQLite 历史及首版替身限制。
+
+## 最终交付
+
+统筹在审查修复后的 094d9c7 再次运行 `pnpm typecheck` 全部通过，服务端最终 **206/206** 通过。首次重跑为 205/206，既有 `routes-acceptance.test.ts` 的 SSE 测试在 `fetch` 连接动态端口时出现 `bad port`；没有进入快照断言。随后原测试单独复跑 1/1 及全量复跑 206/206 均通过，未修改范围外测试，原始失败已记录到本地 issue。Web 40+11、build 在此前最终功能集成代码上通过，此后修改只涉及服务端超时上界；不重复无关 Web 检查。
+
+仅勾选本轮 2.8、5.1、5.2、5.3，未勾选全局 7.x。README 已同步超时、预算、成功结束及首版未知结果限制；本次 API 中文 JSDoc 已由开发者、统筹和独立审查者对照行为核对，没有专用 JSDoc 静态检查器，不声称自动覆盖检查。
+
+成果保留于 codex/tool-timeout-conclude 的独立工作树；未合并 main、未归档 OpenSpec change。主工作区既有前端探索及其他工作树内容未纳入本批。开发和 continue-review 已完成，工作流在此暂停，后续任务等待用户指示。
