@@ -1,7 +1,6 @@
 import {
   createSessionRequestSchema,
   createSessionResponseSchema,
-  rawSessionHistorySchema,
   sessionHistoryResponseSchema,
   sessionParamsSchema,
   submitMessageRequestSchema,
@@ -9,8 +8,6 @@ import {
 } from "@mharness/session/contracts";
 import {
   acquireInstanceOwnership,
-  createPersistedSession,
-  readPersistedSessionHistory,
   recoverInterruptedSession,
   SqliteSessionPersistence,
   type SessionStore,
@@ -19,6 +16,13 @@ import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
+import { AgentManager } from "./agent/manager.ts";
+import { createModelTurnDriver } from "./agent/model-turn.ts";
+import type { RunTurn } from "./agent/react-agent.ts";
+import { SessionCommandController } from "./commands.ts";
+import { createMockAdapter } from "./model/providers/mock.ts";
+import { LlmRuntime } from "./model/runtime.ts";
+import { registerSessionRoutes } from "./session/routes.ts";
 
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
 
@@ -100,10 +104,11 @@ export function createApp(store: SessionStore, logger = false) {
  * 取得新版库的在线实例锁并组装会话创建和持久历史接口。应用开始服务前完成遗留会话修复。
  * @param path - 新版库路径，父目录必须存在。
  * @param logger - 是否启用 HTTP 日志，默认关闭。
+ * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
  * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
  */
-export async function createEventSessionApp(path: string, logger = false) {
+export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn) {
   const ownership = await acquireInstanceOwnership(path);
   let persistence: SqliteSessionPersistence;
   try {
@@ -113,6 +118,20 @@ export async function createEventSessionApp(path: string, logger = false) {
     throw error;
   }
   const app = createHttpApp(logger);
+  const driver = runTurn ?? createModelTurnDriver({
+    runtime: new LlmRuntime({ mock: createMockAdapter((request) => {
+      const text = request.messages.findLast((message) => message.role === "user")?.text ?? "";
+      return [
+        { delayMs: 100, chunk: { type: "text", delta: "模拟回答：" } },
+        { delayMs: 150, chunk: { type: "text", delta: text } },
+        { chunk: { type: "finish", reason: { kind: "stop" } } },
+      ];
+    }) }),
+    config: () => ({ provider: "mock", model: "test-model" }),
+    systemPrompt: () => "你是一个中文助手。",
+  });
+  const agents = new AgentManager(persistence, driver);
+  const commands = new SessionCommandController(agents);
   app.addHook("onReady", async () => {
     for (const { header } of await persistence.list()) {
       const handle = await persistence.open(header.sessionId, "write");
@@ -126,24 +145,15 @@ export async function createEventSessionApp(path: string, logger = false) {
   });
   app.addHook("onClose", async () => {
     try {
-      await persistence.close();
+      try {
+        await agents.close();
+      } finally {
+        await persistence.close();
+      }
     } finally {
       await ownership.release();
     }
   });
-  app.post(sessionsPath, async (request, reply) => {
-    const body = createSessionRequestSchema.safeParse(request.body === undefined ? {} : request.body);
-    if (!body.success) return reply.code(400).send({ code: "invalid_request" });
-    const sessionId = randomUUID();
-    await createPersistedSession(persistence, { sessionId, createdAt: Date.now() });
-    return reply.code(201).send(createSessionResponseSchema.parse({ sessionId }));
-  });
-  app.get(`${sessionsPath}/:sessionId`, async (request, reply) => {
-    const params = sessionParamsSchema.safeParse(request.params);
-    if (!params.success) return reply.code(400).send({ code: "invalid_request" });
-    const history = await readPersistedSessionHistory(persistence, params.data.sessionId);
-    if (!history) return reply.code(404).send({ code: "session_not_found" });
-    return rawSessionHistorySchema.parse(history);
-  });
+  registerSessionRoutes(app, sessionsPath, persistence, commands, agents);
   return app;
 }
