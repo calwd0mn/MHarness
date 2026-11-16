@@ -31,6 +31,10 @@ test("真实 MCP 工具隐藏 operationId 并接受绑定标识", async () => {
     const prepared = registry.prepare("mock_write", '{"text":"hello"}');
     assert.equal(prepared.ok, true);
     if (!prepared.ok) return;
+    assert.equal(prepared.call.governance.supportsIdempotency, true);
+    const read = registry.prepare("mock_read", '{"text":"hello"}');
+    assert.ok(read.ok);
+    assert.equal(read.call.governance.supportsIdempotency, false);
     assert.deepEqual(await prepared.call.executeNormalized(new AbortController().signal, "op-1"), { isError: false, value: { text: "hello", operationId: "op-1" }, content: [{ type: "text", text: "hello" }] });
     await assert.rejects(prepared.call.execute());
     assert.deepEqual(await prepared.call.execute(new AbortController().signal, "op-2"), { content: [{ type: "text", text: "hello" }], structuredContent: { text: "hello", operationId: "op-2" } });

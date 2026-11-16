@@ -1,0 +1,162 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { startMockMcp } from "./server.ts";
+
+test("真实 MCP 重复写入在重启后返回相同结果且只产生一次效果", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-"));
+  const path = join(dir, "mock.sqlite");
+  let server = await startMockMcp(0, path);
+  const call = async (args: Record<string, string>) => {
+    const client = new Client({ name: "test", version: "1" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+    try { return await client.callTool({ name: "mock_write", arguments: args }); }
+    finally { await client.close(); }
+  };
+  try {
+    const first = await call({ text: "hello", operationId: "op" });
+    assert.deepEqual(await call({ operationId: "op", text: "hello" }), first);
+    assert.deepEqual(server.effects(), ["hello"]);
+    await server.close();
+    server = await startMockMcp(0, path);
+    assert.deepEqual(await call({ text: "hello", operationId: "op" }), first);
+    assert.equal((await call({ text: "other", operationId: "op" })).isError, true);
+    assert.deepEqual(server.effects(), ["hello"]);
+  } finally { await server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
+import { DatabaseSync } from "node:sqlite";
+import { MockLedger } from "./ledger.ts";
+
+async function ready(child: ChildProcessWithoutNullStreams): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error("子进程启动超时")), 5000);
+    const finish = (error?: Error, value?: string) => {
+      clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.off("exit", onExit);
+      child.off("error", onError);
+      if (error) reject(error); else resolve(value!);
+    };
+    const onData = (chunk: Buffer) => finish(undefined, chunk.toString().trim());
+    const onExit = () => finish(new Error("子进程启动前退出"));
+    const onError = (error: Error) => finish(error);
+    child.stdout.once("data", onData);
+    child.once("exit", onExit);
+    child.once("error", onError);
+    if (child.exitCode !== null || child.signalCode !== null) onExit();
+  });
+}
+
+async function stop(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.stdin.on("error", () => {});
+  child.stdin.end("stop\n");
+  const timer = setTimeout(() => child.kill(), 2000);
+  try { await exited; } finally { clearTimeout(timer); }
+}
+
+test("独立 MCP 进程在数据库写锁竞争中共同去重", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-concurrent-"));
+  const path = join(dir, "mock.sqlite");
+  const children: ChildProcessWithoutNullStreams[] = [];
+  const serverScript = `import { startMockMcp } from './src/server.ts';
+    const server = await startMockMcp(0, process.argv[1]);
+    console.log(server.url);
+    process.stdin.once('data', async () => { await server.close(); process.exit(0); });`;
+  const lockScript = `import { DatabaseSync } from 'node:sqlite';
+    const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); console.log('locked');
+    process.stdin.once('data', () => { db.exec('COMMIT'); db.close(); process.exit(0); });`;
+  try {
+    const urls: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", serverScript, path]);
+      children.push(child);
+      urls.push(await ready(child));
+    }
+    const lock = spawn(process.execPath, ["--input-type=module", "-e", lockScript, path]);
+    children.push(lock);
+    assert.equal(await ready(lock), "locked");
+    const clients = await Promise.all(urls.map(async (url) => {
+      const client = new Client({ name: "test", version: "1" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      return client;
+    }));
+    try {
+      let finished = 0;
+      const calls = clients.map((client) => client.callTool({ name: "mock_write", arguments: { text: "one", operationId: "shared" } }).then((result) => { finished++; return result; }));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(finished, 0);
+      await stop(lock);
+      const results = await Promise.all(calls);
+      assert.deepEqual(results[0], results[1]);
+      assert.equal(results[0]?.isError, undefined);
+      const db = new DatabaseSync(path);
+      try {
+        assert.equal(db.prepare("SELECT count(*) AS n FROM mock_effects").get()?.n, 1);
+        assert.equal(db.prepare("SELECT count(*) AS n FROM mock_operations").get()?.n, 1);
+        const saved = db.prepare("SELECT result FROM mock_operations").get();
+        assert.deepEqual(JSON.parse(String(saved?.result)), results[0]);
+      } finally { db.close(); }
+    } finally { await Promise.all(clients.map((client) => client.close())); }
+  } finally {
+    await Promise.all(children.map(stop));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("台账规范化对象键并拒绝跨工具和参数冲突", () => {
+  const ledger = new MockLedger(":memory:");
+  try {
+    const first = ledger.write("op", "tool-a", { text: "x", meta: { a: 1, b: 2 } });
+    assert.deepEqual(ledger.write("op", "tool-a", { meta: { b: 2, a: 1 }, text: "x" }), first);
+    assert.equal(ledger.write("op", "tool-b", { text: "x", meta: { a: 1, b: 2 } }), undefined);
+    assert.equal(ledger.write("op", "tool-a", { text: "y", meta: { a: 1, b: 2 } }), undefined);
+    assert.deepEqual(ledger.effects(), ["x"]);
+  } finally { ledger.close(); }
+});
+
+test("结果保存失败时效果和操作记录均回滚", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-rollback-"));
+  const path = join(dir, "mock.sqlite");
+  const ledger = new MockLedger(path);
+  const db = new DatabaseSync(path);
+  try {
+    db.exec("CREATE TRIGGER fail_operation BEFORE INSERT ON mock_operations BEGIN SELECT RAISE(ABORT, 'forced failure'); END");
+    assert.throws(() => ledger.write("op", "tool", { text: "x" }), /forced failure/);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM mock_effects").get()?.n, 0);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM mock_operations").get()?.n, 0);
+    db.exec("DROP TRIGGER fail_operation");
+    assert.ok(ledger.write("op", "tool", { text: "x" }));
+    assert.deepEqual(ledger.effects(), ["x"]);
+  } finally { db.close(); ledger.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("操作标识和效果中的 NUL 与未配对代理项在重启后无损区分", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mock-mcp-unicode-"));
+  const path = join(dir, "mock.sqlite");
+  let server = await startMockMcp(0, path);
+  const call = async (operationId: string, text: string) => {
+    const client = new Client({ name: "test", version: "1" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+    try { return await client.callTool({ name: "mock_write", arguments: { operationId, text } }); }
+    finally { await client.close(); }
+  };
+  try {
+    const inputs = [["id\u0000a", "text\u0000a"], ["id\u0000b", "text\u0000b"], ["\ud800", "\ud800"], ["\ud801", "\ud801"]] as const;
+    const first = [];
+    for (const [id, text] of inputs) first.push(await call(id, text));
+    assert.deepEqual(server.effects(), inputs.map(([, text]) => text));
+    await server.close();
+    server = await startMockMcp(0, path);
+    for (let i = 0; i < inputs.length; i++) assert.deepEqual(await call(inputs[i]![0], inputs[i]![1]), first[i]);
+    assert.deepEqual(server.effects(), inputs.map(([, text]) => text));
+  } finally { await server.close(); await rm(dir, { recursive: true, force: true }); }
+});

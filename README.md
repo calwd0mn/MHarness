@@ -99,4 +99,4 @@ pnpm dev
 
 可在服务窗口通过 `$env:MHARNESS_MOCK_MCP_PORT` 修改端口，并相应调整后端地址；未设置 `MHARNESS_MCP_ENDPOINT` 时保持默认行为。可信配置将 `mock_read` 设为只读免审批，`mock_write` 设为副作用且需审批。模拟模型默认只回答文本，可在测试驱动中发出工具调用。
 
-服务使用 MCP Streamable HTTP，输入保留顶层 `operationId`，只由 Harness 在操作记录建立后注入。模型输入和包含标识的完整输入分别按远端 JSON Schema 校验，服务入口也独立校验。仅支持可安全移除保留字段的顶层对象规则；复杂的跨字段约束会在连接时拒绝。MCP 默认采用远程取消策略，即使地址是 localhost 也不保证服务端停止。当前模拟写入尚无持久台账或去重能力；不要将其作为真实副作用服务。
+服务使用 MCP Streamable HTTP，输入保留顶层 `operationId`，只由 Harness 在操作记录建立后注入。模型输入和包含标识的完整输入分别按远端 JSON Schema 校验，服务入口也独立校验。仅支持可安全移除保留字段的顶层对象规则；复杂的跨字段约束会在连接时拒绝。MCP 默认采用远程取消策略，即使地址是 localhost 也不保证服务端停止。模拟写入将 operationId、工具名、规范化业务参数、效果和成功结果保存在独立 SQLite 台账中，重复请求返回已保存的结果，冲突请求不会产生效果。默认路径为仓库根目录下的 `data/mock-mcp.sqlite`，可使用 `MHARNESS_MOCK_MCP_DB_PATH` 指定其他路径（相对仓库根目录）；该路径应与会话数据库分开。台账不会自动过期，Harness 不会因此自动重试。此保证仅适用于同一数据库内的模拟效果，不适用于真实外部副作用。

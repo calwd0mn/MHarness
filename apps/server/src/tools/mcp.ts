@@ -13,7 +13,7 @@ import { snapshotToolJson, type ToolResult } from "./result.ts";
 export type McpToolConfig = { name: string; version: string } & Partial<Omit<ToolGovernance, "executionBoundary" | "cancellationGuarantee">>;
 const defaults: McpToolConfig[] = [
   { name: "mock_read", version: "1", sideEffect: "read-only", approvalPolicy: "allow" },
-  { name: "mock_write", version: "1", sideEffect: "side-effect", approvalPolicy: "ask" },
+  { name: "mock_write", version: "1", sideEffect: "side-effect", supportsIdempotency: true, approvalPolicy: "ask" },
 ];
 const rawResult = z.unknown();
 function failure(code: string, message: string): ToolResult {
