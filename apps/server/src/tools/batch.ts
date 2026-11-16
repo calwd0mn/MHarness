@@ -3,17 +3,27 @@ import type { Session } from "@mharness/session/server";
 import { ApprovalCheckpointError, ApprovalService } from "../approval/service.ts";
 import type { ApprovalOutcome } from "../approval/contracts.ts";
 import { ToolDispatch } from "./dispatch.ts";
+import type { DispatchOutcome } from "./dispatch.ts";
 import { prepareToolOperation } from "./operation.ts";
 import { ToolRegistry } from "./registry.ts";
 import { HarnessError, normalizeToolError, type ToolResult } from "./result.ts";
 import { appendToolResult } from "./result-event.ts";
+import { localConfig } from "../../../../config/local.ts";
 
 type Call = { readonly id: string; readonly name: string; readonly arguments: string };
 /** 批次结局；结束意向仅供后续 Turn 策略使用。 */
-export type ToolBatchOutcome = { kind: "completed"; concludeTurn: boolean } | { kind: "aborted" | "rejected" | "failed" };
+export type ToolBatchOutcome = { kind: "completed"; concludeTurn: boolean } | { kind: "aborted" | "rejected" | "failed" | "timeout" | "read-only-timeout-budget" };
+
+/** 由同一 Turn 的多个批次共享；新 Turn 应创建新的计数器。 */
+export type ReadOnlyTimeoutBudget = {
+  /** 本轮已发生的只读超时次数，批次执行期间递增。 */
+  count: number;
+  /** 正安全整数；只读超时次数达到此上限时立即停止本轮。 */
+  max: number;
+};
 
 function failure(code: string, message: string): ToolResult {
-  return { isError: true, error: { message, info: { name: "ToolError", code } }, content: [{ type: "text", text: message }] };
+  return { isError: true, error: { message, info: { name: code === "TOOL_TIMEOUT" ? "ToolTimeoutError" : "ToolError", code } }, content: [{ type: "text", text: message }] };
 }
 
 /**
@@ -26,10 +36,11 @@ function failure(code: string, message: string): ToolResult {
  * @param signal - 当前 Turn 的取消信号，向审批和工具传播。
  * @param checkpoint - 工具正文前的持久化检查点；失败时拒绝并停止派发。
  * @param onStorageFailure - 审批检查点失败时接收存储原始错误；渠道失败不会调用。
+ * @param timeoutBudget - 跨批次累计的只读超时预算；省略时仅在本批累计并使用集中默认上限。
  * @returns 批次终态及成功调用提出的结束意向；不自行推进模型。
  */
-export async function runToolBatch(session: Session, registry: ToolRegistry, approvals: ApprovalService, identity: { turn: number; step: number }, calls: readonly Call[], signal: AbortSignal, checkpoint: () => Promise<void>, onStorageFailure?: (error: unknown) => void): Promise<ToolBatchOutcome> {
-  let stop: "aborted" | "rejected" | "failed" | undefined;
+export async function runToolBatch(session: Session, registry: ToolRegistry, approvals: ApprovalService, identity: { turn: number; step: number }, calls: readonly Call[], signal: AbortSignal, checkpoint: () => Promise<void>, onStorageFailure?: (error: unknown) => void, timeoutBudget: ReadOnlyTimeoutBudget = { count: 0, max: localConfig.tools.maxReadOnlyTimeouts }): Promise<ToolBatchOutcome> {
+  let stop: "aborted" | "rejected" | "failed" | "timeout" | "read-only-timeout-budget" | undefined;
   let concludeTurn = false;
   for (const call of calls) {
     const id = { ...identity, callId: call.id, messageId: randomUUID() };
@@ -68,14 +79,22 @@ export async function runToolBatch(session: Session, registry: ToolRegistry, app
     const cancel = () => gate.cancel();
     signal.addEventListener("abort", cancel, { once: true });
     if (signal.aborted) cancel();
-    const outcome = await gate.dispatch((toolSignal) => prepared.call.executeNormalized(toolSignal), prepared.call.governance.cancellationGuarantee);
-    signal.removeEventListener("abort", cancel);
+    let outcome: DispatchOutcome<ToolResult<unknown>>;
+    try {
+      outcome = await gate.dispatch((toolSignal) => prepared.call.executeNormalized(toolSignal), prepared.call.governance);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
     if (outcome.kind === "completed") {
       appendToolResult(session, id, outcome.value);
       if (!outcome.value.isError && outcome.value.concludeTurn) concludeTurn = true;
     } else if (outcome.kind === "aborted") {
       appendToolResult(session, id, failure(outcome.code, outcome.code === "ABORTED" ? "用户取消，工具结果未确认。" : "用户取消，工具尚未派发。"));
       stop = "aborted";
+    } else if (outcome.kind === "timeout") {
+      appendToolResult(session, id, failure(outcome.code, "等待工具响应超时，最终结果未确认。"));
+      if (prepared.call.governance.sideEffect !== "read-only") stop = "timeout";
+      else if (++timeoutBudget.count >= timeoutBudget.max) stop = "read-only-timeout-budget";
     } else {
       appendToolResult(session, id, normalizeToolError(outcome.error));
       if (outcome.kind === "dispatch-error" || !(outcome.error instanceof HarnessError)) stop = "failed";
