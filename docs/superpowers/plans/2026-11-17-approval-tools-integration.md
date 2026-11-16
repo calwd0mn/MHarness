@@ -43,3 +43,16 @@ TypeScript 禁止 any。应用 jsdoc-contracts、karpathy-guidelines 及代码�
 集成 6.3（49f521e → 08fc576）及 6.4（f9e5863 → 6e0b501）后，统筹复跑6.3新增测试2/2通过。首次常规Web测试的Node40/40通过，但Windows未展开`src/*.test.jsx`且Vitest将其当普通筛选文本，报告没有测试。入口改用Vitest文件名筛选`.test.jsx`后重新验证，不能以单独测试通过替代常规入口可执行。
 
 7.5新建Terra/high子agent首次启动遇登录令牌刷新错误（logged out or signed in to another account），尚未开展代码工作；统筹已尝试恢复一次。
+
+| 任务 | 开发 diff / 集成提交 | 已有验证证据 |
+| --- | --- | --- |
+| 6.3 | cc71a69..49f521e / 08fc576 | 共享导出缺失用例先报 undefined safeParse，接线后通过；真实 App/HTTP/SSE/Agent/临时SQLite 验证允许、首次拒绝、刷新、200重发、409决定冲突、404与恢复后inactive；工具执行计数仅1。新增2/2统筹复跑通过。 |
+| 6.4 | cc71a69..f9e5863 / 6e0b501 | 摘要断言真实失败后最小修复；真实链路验证校验失败、审批、元数据/错误、reasoning、取消/截断及TOOL_NOT_STARTED，关闭排空并重开后完整工具投影与HTTP历史、刷新快照一致。 |
+| 7.5 | 待执行 | 已创建 codex/approval-cancel-acceptance 工作树，基线6e0b501；新Terra/high代理及一次恢复均在启动时因令牌刷新失败，未写代码。 |
+| 7.6 | 待执行 | 等待7.5完成后新建Terra/high代理。 |
+
+统筹在6e0b501集成内容及edd7fc5测试入口上亲自完成新鲜检查：全仓`pnpm typecheck`通过；服务端206/206；Web Node40/40 + React49/49；Web build通过（两条已有Zod上游注释提示）；`git diff b7f0709 HEAD --check`与`openspec validate agent-harness-prototype --strict`通过。本批API中文JSDoc经开发者及统筹人工对照，项目无专用JSDoc静态检查器；测试使用jsdom验证真实App内容，不声称已验证浏览器布局或真实MCP。
+
+独立continue-review：为6.3新建了未参与开发的只读审查agent，但同样启动即报登录令牌错误，未实际审查；6.4/7.5/7.6独立审查仍待启动。不得将此次启动失败写成审查完成或无发现。
+
+用户选择“重新登录后继续Terra子agent”，未授权统筹替代剩余开发。当前等待用户重新登录确认，之后恢复7.5，串行完成7.6与联验，再分别新开四项独立review代理。6.3/6.4行为验收已通过并勾选；7.5/7.6保留待办。README同步已交付契约及交互，不归档、不合并main。

@@ -19,7 +19,7 @@ pnpm dev
 
 通过 `createModelTurnDriver` 的 `toolRegistry` 与 `approvalService`，或 `createEventSessionApp` 第四参数中的同名选项接入工具。完整 Assistant 消息通过检查点后，独立批次按模型声明顺序保存调度、校验参数、绑定操作并应用可信策略；允许或已批准的调用仍须通过正文前检查点及取消状态门。调用结果和当前 Step 关闭记录提交后才请求模型续答。默认启动仍使用纯文本模拟模型，不附带业务工具。
 
-`apps/server/src/approval/` 拥有审批服务、答复 Schema 和 HTTP 路由。操作和审批请求提交后才交互，等待期间 Turn 保持活动，历史读取和取消可用，新编号仍返回 `409 agent_busy`。HTTP 和审批渠道共用唯一持久决定；`ApprovalService` 省略渠道表示等待 HTTP，显式传入 `null` 表示不可用。工具正文可接收取消信号；可靠协作退出的工具等待清理，其他工具停止等待后不声称执行端已停止或副作用已撤销。
+`apps/server/src/approval/` 拥有审批服务和 HTTP 路由，答复 Schema 由 `@mharness/session/contracts` 共享给前后端。操作和审批请求提交后才交互，等待期间 Turn 保持活动，历史读取和取消可用，新编号仍返回 `409 agent_busy`。HTTP 和审批渠道共用唯一持久决定；`ApprovalService` 省略渠道表示等待 HTTP，显式传入 `null` 表示不可用。工具正文可接收取消信号；可靠协作退出的工具等待清理，其他工具停止等待后不声称执行端已停止或副作用已撤销。
 
 成功结果携带 `concludeTurn` 时，本批剩余调用仍按序结算；明确业务错误不撤销该意向。批次完成后 Turn 以 `completed` 结束，不生成下一 Step 或额外总结。用户拒绝、取消、派发异常及超时中止优先，同一 Agent 可继续处理后续 Turn。
 
@@ -27,7 +27,9 @@ pnpm dev
 
 工具超时保存配对的 `TOOL_TIMEOUT`。只读超时按 Turn 跨 Step 累计，默认前两次可继续，第三次以 `READ_ONLY_TIMEOUT_BUDGET_EXHAUSTED` 结束。副作用或未知能力工具超时且结果未确认时，以 `TOOL_TIMEOUT` 结束本轮，剩余调用保存未执行结局，不请求模型续答。已派发取消但结果未确认保存 `ABORTED`。幂等与查询能力不会触发重试或核实；迟到响应或拒绝不改写已结算结果、不恢复本轮。默认值集中于 `config/local.ts`，模型最大步数仍为 8。
 
-MCP、迟到结果入账与核实、恢复执行和前端审批交互仍按后续任务推进。
+前端工具卡片在折叠时显示原始参数摘要，展开可核对工具版本、已校验参数、结果和展示元数据。审批支持单次允许与拒绝，刷新可恢复待审批项，已有决定按服务端结果收敛，关联结果或 Turn 终态关闭交互。`pnpm --filter @mharness/web test` 包含真实 HTTP/SSE、Agent 与临时 SQLite 驱动 App 的审批和工具状态联调，使用模拟 Provider 和本地测试工具，不访问用户数据库或外部副作用工具。
+
+MCP、迟到结果入账与核实、恢复执行仍按后续任务推进。
 
 ## Session 模块
 
