@@ -433,3 +433,38 @@ test("审批 HTTP 先确认时工具摘要立即收敛而不声称执行完成",
   expect(container.querySelector("details summary").textContent).toContain("等待结果");
   expect(container.querySelector("details summary").textContent).not.toContain("等待审批");
 });
+
+test("迟到忙碌响应不覆盖切走前主动清空的草稿", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await enter("原文"); await submit(); await enter("编辑"); await enter("");
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await act(async () => resolve({ status: 409, ok: false })); await flush();
+  await click(button("会话 1"));
+  expect(container.querySelector("textarea").value).toBe("");
+});
+
+test("迟到创建成功加入目录但不抢显式选择，即使切回原会话", async () => {
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await click(button("新建会话")); await click(button("会话 2")); await click(button("会话 1"));
+  await act(async () => resolve({ ok: true, json: async () => ({ sessionId: "c" }) })); await flush();
+  expect(button("会话 1").getAttribute("aria-current")).toBe("page");
+  expect(button("会话 3")).toBeTruthy();
+});
+
+test("迟到创建失败不污染新会话通知", async () => {
+  let reject; fetch.mockImplementation(() => new Promise((_, r) => { reject = r; }));
+  await click(button("新建会话")); await click(button("会话 2"));
+  await act(async () => reject(new Error("failed"))); await flush();
+  expect(container.textContent).not.toContain("创建会话失败");
+});
+
+test("创建请求卸载后完成不订阅新会话", async () => {
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await click(button("新建会话"));
+  await act(async () => root.unmount());
+  await act(async () => resolve({ ok: true, json: async () => ({ sessionId: "c" }) })); await flush();
+  expect(connections).toHaveLength(1);
+  expect(connections[0].closed).toBe(true);
+  root = createRoot(container);
+});

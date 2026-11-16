@@ -40,9 +40,16 @@ const initialState: FollowState = {
 export function useConversation() {
   const [initialDirectory] = useState(() => loadDirectory(browserStorage()));
   const [sessions, setSessions] = useState<string[]>(initialDirectory.sessions);
-  const [selected, setSelected] = useState<string | null>(
+  const [selected, setSelectedState] = useState<string | null>(
     initialDirectory.selected,
   );
+  const selectionRevision = useRef(0);
+  const mounted = useRef(false);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  function setSelected(id: string | null) {
+    selectionRevision.current++;
+    setSelectedState(id);
+  }
   const [state, setState] = useState<FollowState>(initialState);
   const [submissions, setSubmissions] = useState<Record<string, Submission>>(
     {},
@@ -50,9 +57,11 @@ export function useConversation() {
   const submissionsRef = useRef(submissions);
   submissionsRef.current = submissions;
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draftRevisions = useRef<Record<string, number>>({});
   const text = selected ? (drafts[selected] ?? "") : "";
   function setText(value: string | ((current: string) => string)) {
     if (!selected) return;
+    draftRevisions.current[selected] = (draftRevisions.current[selected] ?? 0) + 1;
     setDrafts((previous) => ({ ...previous, [selected]: typeof value === "function" ? value(previous[selected] ?? "") : value }));
   }
   const [notice, setNotice] = useState("");
@@ -105,6 +114,7 @@ export function useConversation() {
     saveDirectory(browserStorage(), { sessions, selected });
   }, [sessions, selected]);
   async function createSession() {
+    const revision = selectionRevision.current;
     setCreating(true);
     setNotice("");
     try {
@@ -117,12 +127,13 @@ export function useConversation() {
       const { sessionId } = createSessionResponseSchema.parse(
         await response.json(),
       );
+      if (!mounted.current) return;
       setSessions((items) => [...items, sessionId]);
-      setSelected(sessionId);
+      if (selectionRevision.current === revision) setSelectedState(sessionId);
     } catch {
-      setNotice("创建会话失败，请重试。");
+      if (mounted.current && selectionRevision.current === revision) setNotice("创建会话失败，请重试。");
     } finally {
-      setCreating(false);
+      if (mounted.current) setCreating(false);
     }
   }
   async function send(event: FormEvent) {
@@ -134,7 +145,8 @@ export function useConversation() {
       crypto.randomUUID(),
     );
     setSubmissions((previous) => ({ ...previous, [id]: item }));
-    setText("");
+    const draftRevision = draftRevisions.current[id] ?? 0;
+    setDrafts((previous) => ({ ...previous, [id]: "" }));
     setNotice("");
     try {
       const response = await fetch(`${sessionPath(id)}/messages`, {
@@ -152,7 +164,8 @@ export function useConversation() {
             ? { ...previous, [id]: { ...item, status: "busy" } }
             : previous,
         );
-        setDrafts((previous) => ({ ...previous, [id]: previous[id] || content }));
+        if ((draftRevisions.current[id] ?? 0) === draftRevision && submissionsRef.current[id]?.requestId === item.requestId && submissionsRef.current[id]?.status !== "accepted")
+          setDrafts((previous) => ({ ...previous, [id]: content }));
         if (selectedRef.current === id) {
           setNotice("助手正在处理，请等待或取消当前任务。");
         }
