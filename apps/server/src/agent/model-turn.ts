@@ -6,10 +6,13 @@ import type {
   LlmChunk,
   LlmFinishReason,
   ModelTool,
-  ModelToolCall,
 } from "../model/adapter.ts";
 import type { LlmRuntime, ModelConfig } from "../model/runtime.ts";
 import { createRequestPreparer } from "./request-context.ts";
+import { ApprovalService } from "../approval/service.ts";
+import { ToolRegistry } from "../tools/registry.ts";
+import { runToolBatch } from "../tools/batch.ts";
+import { appendToolResult } from "../tools/result-event.ts";
 
 /** 供会话观察层同步发布的 Attempt 增量；实时版本由观察层分配。 */
 export type ExecutionNotice =
@@ -72,11 +75,10 @@ export type ModelTurnOptions = {
   tools?: () => readonly ModelTool[];
   /** 每轮最多发起的模型步数，须为正安全整数；默认使用集中配置。 */
   maxSteps?: number;
-  /** 测试和后续工具调度的批次边界；逐项返回相同顺序的结果，异常时未确认结果记为结果未知。取消信号仅请求停止批次。 */
-  runToolBatch?: (
-    calls: readonly ModelToolCall[],
-    signal: AbortSignal,
-  ) => Promise<readonly { callId: string; text: string }[]>;
+  /** 提供可信工具定义和正文；未配置时工具调用不派发。 */
+  toolRegistry?: ToolRegistry;
+  /** 审批服务；未提供时审批渠道不可用。 */
+  approvalService?: ApprovalService;
 };
 
 type Content = (
@@ -117,7 +119,7 @@ function compact(entries: { time: number; chunk: LlmChunk }[]) {
 }
 /**
  * 创建有限步数的 Turn 驱动，检查点成功后启动模型并结算每个 Step。
- * 未配置批次时工具调用追加 TOOL_NOT_STARTED 并以 blocked 结束；耗尽步数时不再派发。
+ * 未配置工具注册表时工具调用追加 TOOL_NOT_STARTED 并以 blocked 结束；耗尽步数时不再派发。
  * @param options - Runtime 及每次请求读取的配置和系统提示词。
  * @returns 可注入 Agent 的异步驱动；取消信号传给当前模型请求和工具批次。
  */
@@ -127,7 +129,8 @@ export function createModelTurnDriver(
   const maxSteps = options.maxSteps ?? localConfig.model.maxSteps;
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1)
     throw new RangeError("maxSteps must be a positive safe integer");
-  const prepareRequest = createRequestPreparer(options);
+  const prepareRequest = createRequestPreparer({ ...options, tools: options.tools ?? (options.toolRegistry ? () => options.toolRegistry!.definitions() : undefined) });
+  const approvals = options.approvalService ?? new ApprovalService(null);
   return async ({
     session,
     turn,
@@ -151,21 +154,16 @@ export function createModelTurnDriver(
         let index = 0;
         let storageCode = "UNKNOWN";
         const attemptId = randomUUID();
+        const storageFailure = (error: unknown) => {
+          if (typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" && (error.code === "ERR_SQLITE_ERROR" || /^SQLITE_[A-Z0-9_]{1,40}$/.test(error.code))) storageCode = error.code;
+          blockStorage(error);
+        };
         try {
           const { prepared, input } = prepareRequest(session);
           try {
             await session.flush();
           } catch (error) {
-            if (
-              typeof error === "object" &&
-              error !== null &&
-              "code" in error &&
-              typeof error.code === "string" &&
-              (error.code === "ERR_SQLITE_ERROR" ||
-                /^SQLITE_[A-Z0-9_]{1,40}$/.test(error.code))
-            )
-              storageCode = error.code;
-            blockStorage(error);
+            storageFailure(error);
             throw error;
           }
           if (signal.aborted) {
@@ -368,112 +366,31 @@ export function createModelTurnDriver(
           });
           ended = true;
           if (event.type === "assistant/message" && calls.size) {
-            const toolCalls = [...calls.values()].map((call) => ({
-              callId: call.id,
-              name: call.name,
-              arguments: call.arguments,
-            }));
-            let results:
-              | readonly { callId: string; text: string }[]
-              | undefined;
-            let batchError: unknown;
-            let dispatched = false;
-            const canDispatch =
-              finish.kind === "tool_calls" &&
-              options.runToolBatch &&
-              count + 1 < maxSteps &&
-              !signal.aborted;
+            const toolCalls = content.filter((part): part is Extract<Content[number], { type: "tool-call" }> => part.type === "tool-call");
+            const canDispatch = finish.kind === "tool_calls" && options.toolRegistry && count + 1 < maxSteps && !signal.aborted;
+            const checkpoint = async () => {
+              try { await session.flush(); }
+              catch (error) {
+                storageFailure(error);
+                throw error;
+              }
+            };
             if (canDispatch) {
-              try {
-                await session.flush();
-              } catch (error) {
-                if (
-                  typeof error === "object" &&
-                  error !== null &&
-                  "code" in error &&
-                  typeof error.code === "string" &&
-                  (error.code === "ERR_SQLITE_ERROR" ||
-                    /^SQLITE_[A-Z0-9_]{1,40}$/.test(error.code))
-                )
-                  storageCode = error.code;
-                blockStorage(error);
-                batchError = error;
+              try { await checkpoint(); }
+              catch (error) {
+                for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message: "工具尚未派发", info: { name: "ToolError", code: "TOOL_NOT_STARTED" } }, content: [{ type: "text", text: "工具尚未派发" }] });
+                throw error;
               }
-              if (!batchError && !signal.aborted) {
-                try {
-                  results = await options.runToolBatch!(toolCalls, signal);
-                  dispatched = true;
-                  if (
-                    results.length !== toolCalls.length ||
-                    results.some(
-                      (result, i) => result.callId !== toolCalls[i]?.callId,
-                    )
-                  )
-                    throw new Error("工具批次结果与声明不匹配");
-                } catch (error) {
-                  batchError = error;
-                  dispatched = true;
-                }
-              }
+              const batch = await runToolBatch(session, options.toolRegistry!, approvals, { turn, step }, toolCalls, signal, checkpoint, storageFailure);
+              if (batch.kind === "completed") continued = true;
+              else if (batch.kind === "aborted") turnReason = { kind: "aborted", reason: "user" };
+              else if (batch.kind === "rejected") turnReason = { kind: "blocked" };
+              else turnReason = { kind: "error", error: { code: "UNKNOWN", message: "本轮执行失败" } };
+            } else {
+              for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message: "工具尚未派发", info: { name: "ToolError", code: "TOOL_NOT_STARTED" } }, content: [{ type: "text", text: "工具尚未派发" }] });
+              if (signal.aborted) turnReason = { kind: "aborted", reason: "user" };
+              else if (options.toolRegistry && count + 1 >= maxSteps && finish.kind === "tool_calls") turnReason = { kind: "error", error: { code: "MAX_STEPS", message: "模型步数预算已耗尽" } };
             }
-            for (const [i, call] of toolCalls.entries()) {
-              const candidate = results?.[i];
-              const result = candidate?.callId === call.callId ? candidate : undefined;
-              session.append({
-                type: "tool/result",
-                surfaceOp: "append",
-                sourceEventSeqs: [event.seq],
-                data: {
-                  turn,
-                  step,
-                  message: {
-                    id: randomUUID(),
-                    role: "user",
-                    source: { kind: "tool", callId: call.callId },
-                    content: [
-                      {
-                        type: "tool-result",
-                        toolCallId: call.callId,
-                        isError: !result,
-                        content: [
-                          {
-                            type: "text",
-                            text:
-                              result?.text ??
-                              (dispatched
-                                ? "工具执行结果未知"
-                                : "工具尚未派发"),
-                          },
-                        ],
-                      },
-                    ],
-                  },
-                  ...(!result
-                    ? {
-                        error: {
-                          name: "ToolError",
-                          code: dispatched
-                            ? "TOOL_OUTCOME_UNKNOWN"
-                            : "TOOL_NOT_STARTED",
-                        },
-                      }
-                    : {}),
-                },
-              });
-            }
-            if (batchError) throw batchError;
-            if (signal.aborted)
-              turnReason = { kind: "aborted", reason: "user" };
-            else if (
-              options.runToolBatch &&
-              count + 1 >= maxSteps &&
-              finish.kind === "tool_calls"
-            )
-              turnReason = {
-                kind: "error",
-                error: { code: "MAX_STEPS", message: "模型步数预算已耗尽" },
-              };
-            else if (results) continued = true;
           }
         } catch (error) {
           turnReason = {
@@ -497,16 +414,7 @@ export function createModelTurnDriver(
         try {
           await session.flush();
         } catch (error) {
-          if (
-            typeof error === "object" &&
-            error !== null &&
-            "code" in error &&
-            typeof error.code === "string" &&
-            (error.code === "ERR_SQLITE_ERROR" ||
-              /^SQLITE_[A-Z0-9_]{1,40}$/.test(error.code))
-          )
-            storageCode = error.code;
-          blockStorage(error);
+          storageFailure(error);
           turnReason = {
             kind: "error",
             error: { code: storageCode, message: "本轮执行失败" },

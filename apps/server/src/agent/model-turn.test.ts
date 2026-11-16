@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { z } from "zod";
+import { defineLocalTool, ToolRegistry } from "../tools/registry.ts";
+import { defineLocalToolOutput } from "../tools/result.ts";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { Session } from "@mharness/session/server";
@@ -6,6 +9,12 @@ import { createMockAdapter } from "../model/providers/mock.ts";
 import { LlmError, type ModelRequest } from "../model/adapter.ts";
 import { LlmRuntime } from "../model/runtime.ts";
 import { createModelTurnDriver, type ExecutionNotice } from "./model-turn.ts";
+
+function testRegistry(handler: () => string | Promise<string>): ToolRegistry {
+  const registry = new ToolRegistry();
+  registry.register(defineLocalTool({ name: "lookup", version: "1", description: "lookup", input: z.strictObject({}), timeoutMs: 100, sideEffect: "read-only", output: defineLocalToolOutput({ schema: z.string(), render: (_args, value) => [{ type: "text", text: value }] }), handler }));
+  return registry;
+}
 
 test("检查点成功后流式结算并记录可重放请求", async () => {
   const session = new Session({ sessionId: "s", createdAt: 0 });
@@ -660,10 +669,7 @@ test("模型步数达到上限时保留工具配对并停止调度", async () =>
     config: () => ({ provider: "mock", model: "m" }),
     systemPrompt: () => "",
     maxSteps: 2,
-    runToolBatch: async (toolCalls) => {
-      batches++;
-      return toolCalls.map((call) => ({ callId: call.callId, text: "ok" }));
-    },
+    toolRegistry: testRegistry(() => { batches++; return "ok"; }),
   });
   await drive({
     session,
@@ -768,10 +774,7 @@ test("批次前检查点失败仍配对未派发调用", async () => {
     }),
     config: () => ({ provider: "mock", model: "m" }),
     systemPrompt: () => "",
-    runToolBatch: async () => {
-      batches++;
-      return [];
-    },
+    toolRegistry: testRegistry(() => { batches++; return "ok"; }),
   })({
     session,
     turn: 1,
@@ -788,7 +791,7 @@ test("批次前检查点失败仍配对未派发调用", async () => {
   assert.equal(session.snapshot().events.at(-1)?.type, "turn/end");
 });
 
-test("已派发批次失败时不声称工具尚未开始", async () => {
+test("工具正文异常时不声称工具尚未开始", async () => {
   const session = new Session({ sessionId: "batch-failure", createdAt: 0 });
   session.bindCheckpoint(async () => {});
   await createModelTurnDriver({
@@ -808,9 +811,7 @@ test("已派发批次失败时不声称工具尚未开始", async () => {
     }),
     config: () => ({ provider: "mock", model: "m" }),
     systemPrompt: () => "",
-    runToolBatch: async () => {
-      throw new Error("lost");
-    },
+    toolRegistry: testRegistry(() => { throw new Error("lost"); }),
   })({
     session,
     turn: 1,
@@ -822,13 +823,13 @@ test("已派发批次失败时不声称工具尚未开始", async () => {
   const result = session
     .snapshot()
     .events.find((e) => e.type === "tool/result");
-  assert.equal(result?.data.error?.code, "TOOL_OUTCOME_UNKNOWN");
+  assert.equal(result?.data.error, undefined);
 });
 
 test("工具结果检查点失败后不打开下一步", async () => {
   const session = new Session({ sessionId: "result-checkpoint", createdAt: 0 });
   let checkpoints = 0;
-  session.bindCheckpoint(async () => { if (++checkpoints === 3) throw Object.assign(new Error("secret"), { code: "SQLITE_BUSY" }); });
+  session.bindCheckpoint(async () => { if (++checkpoints === 4) throw Object.assign(new Error("secret"), { code: "SQLITE_BUSY" }); });
   let calls = 0;
   await createModelTurnDriver({
     runtime: new LlmRuntime({ mock: createMockAdapter(() => {
@@ -838,7 +839,7 @@ test("工具结果检查点失败后不打开下一步", async () => {
         { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
       ];
     }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    runToolBatch: async () => [{ callId: "c", text: "完成" }],
+    toolRegistry: testRegistry(() => "完成"),
   })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
   const events = session.snapshot().events;
   assert.equal(calls, 1);
@@ -858,7 +859,7 @@ test("批次前取消不派发并保留工具配对", async () => {
       { chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{}" } },
       { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
     ]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    runToolBatch: async () => { batches++; return []; },
+    toolRegistry: testRegistry(() => { batches++; return "ok"; }),
   })({ session, turn: 1, step: 1, signal: controller.signal, publish: (notice) => { if (notice.type === "assistant/end") controller.abort(); }, blockStorage: () => assert.fail() });
   assert.equal(batches, 0);
   const events = session.snapshot().events;
@@ -877,28 +878,30 @@ test("工具续答成功时 Turn 以 completed 结束", async () => {
       { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
     ] : [{ chunk: { type: "finish", reason: { kind: "stop" } } }]) }),
     config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    runToolBatch: async () => [{ callId: "c", text: "ok" }],
+    toolRegistry: testRegistry(() => "ok"),
   })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
   const end = session.snapshot().events.at(-1);
   assert.equal(end?.type === "turn/end" && end.data.reason.kind, "completed");
 });
 
-test("批次结果不完整时保留已确认结果", async () => {
+test("后续工具异常时保留已确认结果", async () => {
   const session = new Session({ sessionId: "partial-batch", createdAt: 0 });
   session.bindCheckpoint(async () => {});
+  let executions = 0;
   await createModelTurnDriver({
     runtime: new LlmRuntime({ mock: createMockAdapter(() => [
       { chunk: { type: "tool_call", index: 0, callId: "a", name: "lookup", argumentsDelta: "{}" } },
       { chunk: { type: "tool_call", index: 1, callId: "b", name: "lookup", argumentsDelta: "{}" } },
       { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
     ]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    runToolBatch: async () => [{ callId: "a", text: "已确认" }],
+    toolRegistry: testRegistry(() => { if (++executions === 2) throw new Error("lost"); return "已确认"; }),
   })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
   const results = session.snapshot().events.filter((e) => e.type === "tool/result");
   assert.equal(results.length, 2);
   assert.equal(results[0]?.data.error, undefined);
   assert.deepEqual(results[0]?.data.message.content[0].content, [{ type: "text", text: "已确认" }]);
-  assert.equal(results[1]?.data.error?.code, "TOOL_OUTCOME_UNKNOWN");
+  assert.equal(results[1]?.data.error, undefined);
+  assert.equal(results[1]?.data.message.content[0].isError, true);
 });
 
 test("非法工具分片只进入诊断流，所有实时帧和活动快照符合协议", async () => {

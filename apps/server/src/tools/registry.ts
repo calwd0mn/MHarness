@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { toToolJsonSchema } from "./schema.ts";
+import { normalizeLocalToolResult, type LocalToolOutput, type ToolResult } from "./result.ts";
 
 /** 工具的可信治理信息，超时单位为毫秒。 */
 export interface ToolGovernance {
@@ -13,15 +14,26 @@ export interface ToolGovernance {
 }
 type GovernanceOptions = Partial<Omit<ToolGovernance, "executionBoundary" | "timeoutMs">> & { timeoutMs: number };
 type LocalOptions<S extends z.ZodType, V> = GovernanceOptions & {
-  name: string; version: string; description: string; input: S; handler: (args: z.output<S>) => V;
+  name: string; version: string; description: string; input: S; handler: (args: z.output<S>, signal: AbortSignal) => V;
+  output?: LocalToolOutput<z.output<S>, Awaited<V>>; concludeTurn?: boolean;
 };
 /** 模型可见的本地工具定义，不包含治理策略或正文。 */
 export interface ToolDefinition { readonly name: string; readonly description: string; readonly inputSchema: Record<string, unknown> }
 /** 绑定的已验证调用；调用方须在执行前完成审批、持久化检查点和取消检查。 */
 export interface PreparedToolCall {
   readonly name: string; readonly version: string; readonly governance: ToolGovernance; readonly args: unknown;
-  /** 执行已绑定正文；兑现或拒绝表示正文返回或抛错。 */
-  execute(): Promise<unknown>;
+  /**
+   * 执行已绑定正文；兑现或拒绝表示正文返回或抛错。
+   * @param signal - 传给正文的取消请求；省略时使用未取消的信号，不保证正文停止。
+   * @returns 正文的原始返回值。
+   */
+  execute(signal?: AbortSignal): Promise<unknown>;
+  /**
+   * 执行正文并校验输出；未配置输出契约时返回契约失败，正文抛错时 Promise 拒绝。
+   * @param signal - 传给正文的取消请求，不保证正文已经停止。
+   * @returns 已校验的成功结果或输出契约失败。
+   */
+  executeNormalized(signal: AbortSignal): Promise<ToolResult<unknown>>;
 }
 /** 准备失败不发起审批或执行。 */
 export type PrepareResult = { readonly ok: true; readonly call: PreparedToolCall } | { readonly ok: false; readonly code: "UNKNOWN_TOOL" | "INVALID_JSON" | "INVALID_INPUT" };
@@ -48,14 +60,14 @@ function freezeJson(value: unknown): void {
 /**
  * 以同一 Zod 定义创建本地工具并推导正文参数类型，不调用正文。
  * 仅支持严格对象与可等价导出的 JSON 子集；转换、自定义校验和默认值会被拒绝。
- * @param options - 可信身份、输入定义、治理配置和正文。
+ * @param options - 可信身份、输入与输出定义、治理配置、结束意向和正文；未提供输出定义时不能产生规范化成功结果。
  * @returns 可注册的本地工具。
  * @throws 输入定义不受支持或超时无效时抛出错误。
  */
 export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S, V>): LocalTool {
   const inputSchema = toToolJsonSchema(options.input);
   const policy = governance(options, "local");
-  const { name, version, handler, input } = options;
+  const { name, version, handler, input, output, concludeTurn } = options;
   const definition = { name, description: options.description, inputSchema };
   freezeJson(definition);
   return Object.freeze({ name, definition, governance: policy,
@@ -63,7 +75,12 @@ export function defineLocalTool<S extends z.ZodType, V>(options: LocalOptions<S,
       const parsed = input.safeParse(value);
       if (!parsed.success) return { ok: false, code: "INVALID_INPUT" };
       freezeJson(parsed.data);
-      return { ok: true, call: Object.freeze({ name, version, governance: policy, args: parsed.data, execute: async () => handler(parsed.data) }) };
+      return { ok: true, call: Object.freeze({ name, version, governance: policy, args: parsed.data, execute: async (signal = new AbortController().signal) => handler(parsed.data, signal),
+        executeNormalized: async (signal: AbortSignal) => {
+          const value = await handler(parsed.data, signal);
+          if (!output) return { isError: true as const, error: { message: "工具未配置输出契约。", info: { name: "InvalidToolOutputError", code: "INVALID_TOOL_OUTPUT" } }, content: [{ type: "text", text: "工具未配置输出契约。" }] };
+          return normalizeLocalToolResult(output, parsed.data, value, concludeTurn);
+        } }) };
     },
   });
 }

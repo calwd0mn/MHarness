@@ -18,6 +18,7 @@ import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
 import { AgentManager } from "./agent/manager.ts";
 import { createModelTurnDriver } from "./agent/model-turn.ts";
+import { ToolRegistry } from "./tools/registry.ts";
 import type { RunTurn } from "./agent/react-agent.ts";
 import { SessionCommandController } from "./commands.ts";
 import { createMockAdapter } from "./model/providers/mock.ts";
@@ -107,11 +108,11 @@ export function createApp(store: SessionStore, logger = false) {
  * @param path - 新版库路径，父目录必须存在。
  * @param logger - 是否启用 HTTP 日志，默认关闭。
  * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
- * @param options - 可注入驱动共享的审批服务；默认提供 HTTP 审批渠道。
+ * @param options - 可注入默认驱动的工具注册表与共享审批服务；默认提供 HTTP 审批渠道。
  * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
  */
-export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService } = {}) {
+export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService; toolRegistry?: ToolRegistry } = {}) {
   const ownership = await acquireInstanceOwnership(path);
   let persistence: SqliteSessionPersistence;
   try {
@@ -121,7 +122,9 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     throw error;
   }
   const app = createHttpApp(logger);
+  const approvalService = options.approvalService ?? new ApprovalService();
   const driver = runTurn ?? createModelTurnDriver({
+    toolRegistry: options.toolRegistry, approvalService,
     runtime: new LlmRuntime({ mock: createMockAdapter((request) => {
       const text = request.messages.findLast((message) => message.role === "user")?.text ?? "";
       return [
@@ -158,6 +161,6 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     }
   });
   registerSessionRoutes(app, sessionsPath, persistence, commands, agents);
-  registerApprovalRoutes(app, sessionsPath, persistence, agents, options.approvalService ?? new ApprovalService());
+  registerApprovalRoutes(app, sessionsPath, persistence, agents, approvalService);
   return app;
 }
