@@ -4,10 +4,10 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AgentManager } from "../agent/manager.ts";
 import { approvalDecisionRequestSchema } from "./contracts.ts";
-import { ApprovalCheckpointError, type ApprovalService } from "./service.ts";
+import { ApprovalCheckpointError, type ApprovalResponse, type ApprovalService } from "./service.ts";
 
 /**
- * 注册审批决定入口；历史查询不加载 Agent，已提交决定直接复用，不排空在线尾部。
+ * 注册审批决定入口；历史查询不加载 Agent，在已提交前缀中确认的决定直接复用，不排空在线尾部。
  * @param app - HTTP 应用。
  * @param path - 会话集合路径。
  * @param persistence - 提供未加载会话的已提交历史。
@@ -27,7 +27,7 @@ export function registerApprovalRoutes(app: FastifyInstance, path: string, persi
     try {
       const events = await handle.read();
       const committed = events.some((event) => event.type === "approval/decided" && event.data.id === approvalId);
-      let result;
+      let result: ApprovalResponse;
       try {
         result = session && !committed
           ? await approvals.respond(sessionId, approvalId, body.data.outcome, session.snapshot().events, session)
