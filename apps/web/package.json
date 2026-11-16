@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test src/session/*.test.js && vitest run src/app.test.jsx"
+    "test": "node --test src/session/*.test.js && vitest run src/*.test.jsx"
   },
   "dependencies": {
     "@mharness/session": "workspace:*",

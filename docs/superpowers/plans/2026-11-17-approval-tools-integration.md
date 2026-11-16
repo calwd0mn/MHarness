@@ -36,4 +36,6 @@ TypeScript 禁止 any。应用 jsdoc-contracts、karpathy-guidelines 及代码�
 
 ## 执行与审查记录
 
-待随各阶段追加实际命令、任务 diff、结果与限制。
+基线已亲自执行：`pnpm typecheck` 通过；服务端 `pnpm --filter @mharness/server test` 206/206 通过；Web `pnpm --filter @mharness/web test` 40 项 Node + 46 项 React 通过；Web build 通过，仅保留两条既有 Zod 上游注释警告。基线 Web 实际用例数是 46，与上一批记录的 11 不同，以本次运行输出为准。
+
+6.3、6.4 以 cc71a69 为共同基线启动独立 Terra/high 开发。统筹将 Web 常规入口扩展为 `src/*.test.jsx`，确保本批新增独立联调测试参与常规检查。
