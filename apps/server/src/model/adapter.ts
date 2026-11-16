@@ -7,8 +7,12 @@ export type GenerationParams = Readonly<{
   temperature?: number;
   /** 核采样概率，取值 0 至 1。 */
   topP?: number;
-  /** 允许生成的最大 token 数，须为正整数。 */
+  /** 允许生成的最大 token 数，须为正整数；会话请求头将其记录为 maxTokens。 */
   maxOutputTokens?: number;
+  /** 模型推理强度；支持值由模型信息约束。 */
+  reasoningEffort?: string;
+  /** 生成遇到任一停止序列时结束。 */
+  stop?: readonly string[];
 }>;
 
 /** 独立于 Turn 总预算的请求级等待上限，单位为毫秒。 */
@@ -127,7 +131,7 @@ export type LlmFinishReason =
  * 首个分片提供 callId 和 name，后续分片可以省略它们。usage 表示截至该事件的累计 token 数。
  */
 export type AdapterChunk =
-  | Readonly<{ type: "text"; delta: string }>
+  | Readonly<{ type: "text" | "reasoning"; delta: string }>
   | Readonly<{ type: "tool_call"; index: number; callId?: string; name?: string; argumentsDelta: string }>
   | Readonly<{ type: "usage"; inputTokens: number; outputTokens: number }>
   | Readonly<{ type: "finish"; reason: Extract<LlmFinishReason, { kind: "stop" | "tool_calls" | "output_limit" }> }>;
@@ -138,10 +142,19 @@ export type LlmChunk = Exclude<AdapterChunk, { type: "finish" }> | Readonly<{
   reason: LlmFinishReason;
 }>;
 
+/** Adapter 提供的模型默认值和推理能力。 */
+export type ModelInfo = Readonly<{
+  defaultMaxTokens?: number;
+  supportedReasoningEfforts?: readonly string[];
+  defaultReasoningEffort?: string;
+}>;
+
 /** 模型接入边界。Adapter 持有厂商连接、鉴权和取消所需资源。 */
 export interface ModelAdapter {
   /** 请求省略字段时使用的 Adapter 生成参数默认值。 */
   readonly defaultParams?: GenerationParams;
+  /** 当前 Adapter 模型的能力和可记录默认值。 */
+  readonly modelInfo?: ModelInfo;
 
   /**
    * 发起一次模型请求并交付统一流。正常结束时交付 finish，失败或取消时抛出 LlmError。

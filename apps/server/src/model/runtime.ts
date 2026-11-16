@@ -23,6 +23,8 @@ export interface PreparedModel {
   readonly route: ModelRoute;
   /** 合并 Adapter 默认值后的可记录参数。 */
   readonly effectiveParams: GenerationParams;
+  /** 模型信息或旧 Adapter 默认值补入的可记录参数。 */
+  readonly adapterDefaults?: Readonly<{ maxTokens?: number; reasoningEffort?: string }>;
 
   /**
    * 消费时启动一次生成，交付按序增量和一个终止事件，随后结束。
@@ -41,7 +43,7 @@ function requiredId(value: string, field: string): string {
   return value.trim();
 }
 
-function validateParams({ temperature, topP, maxOutputTokens }: GenerationParams): GenerationParams {
+function validateParams({ temperature, topP, maxOutputTokens, reasoningEffort, stop }: GenerationParams): GenerationParams {
   if (temperature !== undefined && (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)) {
     throw new RangeError("temperature must be between 0 and 2");
   }
@@ -52,7 +54,15 @@ function validateParams({ temperature, topP, maxOutputTokens }: GenerationParams
     throw new RangeError("maxOutputTokens must be a positive integer");
   }
 
+  if (reasoningEffort !== undefined && (typeof reasoningEffort !== "string" || reasoningEffort.length === 0)) {
+    throw new TypeError("reasoningEffort must be a non-empty string");
+  }
+  if (stop !== undefined && (!Array.isArray(stop) || stop.some((value) => typeof value !== "string"))) {
+    throw new TypeError("stop must be an array of strings");
+  }
   return Object.freeze({
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...(stop === undefined ? {} : { stop: Object.freeze([...stop]) }),
     ...(temperature === undefined ? {} : { temperature }),
     ...(topP === undefined ? {} : { topP }),
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
@@ -81,10 +91,11 @@ export class LlmRuntime {
   /**
    * 校验配置并选择 Adapter，可在发起模型请求前读取可记录的路由和有效参数。
    * @param config - 请求的路由、生成参数和可选的请求级超时覆盖值。
+   * @param options - recordable 为 true 时，未显式覆盖旧 temperature 或 stop 默认值会被拒绝。
    * @returns 冻结的配置快照和绑定该快照的生成入口。
-   * @throws Provider 未注册、路由标识为空或参数超出允许范围时抛出错误。
+   * @throws Provider 未注册、路由或参数无效，或可记录模式依赖未覆盖的旧采样默认值时抛出错误。
    */
-  prepare(config: ModelConfig): PreparedModel {
+  prepare(config: ModelConfig, options: { recordable?: boolean } = {}): PreparedModel {
     const provider = requiredId(config.provider, "provider");
     const adapter = this.#adapters.get(provider);
     if (!adapter) throw new TypeError("Model provider is not registered");
@@ -94,11 +105,30 @@ export class LlmRuntime {
       model: requiredId(config.model, "model"),
       ...(config.endpointId === undefined ? {} : { endpointId: requiredId(config.endpointId, "endpointId") }),
     });
+    if (options.recordable &&
+        ((config.params?.temperature === undefined && adapter.defaultParams?.temperature !== undefined) ||
+         (config.params?.stop === undefined && adapter.defaultParams?.stop !== undefined))) {
+      throw new TypeError("当前日志不能记录未显式覆盖的模型默认采样参数");
+    }
+    const info = adapter.modelInfo;
+    const reasoningEffort = config.params?.reasoningEffort ?? info?.defaultReasoningEffort ?? adapter.defaultParams?.reasoningEffort;
+    if (reasoningEffort !== undefined && info?.supportedReasoningEfforts &&
+        !info.supportedReasoningEfforts.includes(reasoningEffort)) {
+      throw new RangeError("reasoningEffort is not supported by the model");
+    }
+    const maxOutputTokens = config.params?.maxOutputTokens ?? info?.defaultMaxTokens ?? adapter.defaultParams?.maxOutputTokens;
     const effectiveParams = validateParams({
       temperature: config.params?.temperature ?? adapter.defaultParams?.temperature,
       topP: config.params?.topP ?? adapter.defaultParams?.topP,
-      maxOutputTokens: config.params?.maxOutputTokens ?? adapter.defaultParams?.maxOutputTokens,
+      maxOutputTokens,
+      reasoningEffort,
+      stop: config.params?.stop ?? adapter.defaultParams?.stop,
     });
+    const defaults = {
+      ...(config.params?.maxOutputTokens === undefined && maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {}),
+      ...(config.params?.reasoningEffort === undefined && reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    };
+    const adapterDefaults = Object.keys(defaults).length ? Object.freeze(defaults) : undefined;
     const timeouts = Object.freeze({
       requestTimeoutMs: timeoutMs(config.timeouts?.requestTimeoutMs ?? localConfig.model.requestTimeoutMs),
       idleTimeoutMs: timeoutMs(config.timeouts?.idleTimeoutMs ?? localConfig.model.idleTimeoutMs),
@@ -107,6 +137,7 @@ export class LlmRuntime {
     return Object.freeze({
       route,
       effectiveParams,
+      ...(adapterDefaults ? { adapterDefaults } : {}),
       generate: (input: ModelInput, signal: AbortSignal) =>
         generate(adapter, { ...input, route, effectiveParams, timeouts }, signal),
     });
