@@ -93,7 +93,7 @@
 - [ ] 3.4 实现取消与派发的原子状态转换及逐调用结算。验证待审批及已批准但未派发时保存 ABORTED_BEFORE_DISPATCH，已派发后取消等待且尚无最终结果时保存 ABORTED，已完成调用保留原结果。核对下一轮上下文按调用标识配对这些结果。
 - [ ] 3.5 实现独立串行批次调度器并接入模型驱动。完整 assistant 消息进入 live Session 后可即时展示，含文字与完整调用的 assistant 消息通过持久化检查后才进入工具阶段；追加失败或未通过检查时，审批与工具执行次数为零。按模型顺序从 Assistant 调用块复制 `id`、`name` 及原始 `arguments` 到 `tool/call`，重放核对声明。消费执行服务结果并保存配对 tool/result；用不同 Step 重用同一 callId 验证结果与审批不串联，用未完成参数验证生成期只展示、不派发。需要续答时，先持久化结果并关闭当前 Step，再进入下一 Step 的第一个 Attempt，标识按来源和范围关联。工具正文前显式 session.flush 并重查取消；验证调度可先于审批、无效参数仅结算本次调用，其他调用仍可处理、模型可在下一 Step 修正、记录不等于正文开始、检查点失败及等待时取消效果为零、有调度无结果时崩溃恢复补齐 TOOL_OUTCOME_UNKNOWN；用户明确拒绝审批、取消、派发异常或符合中止条件的副作用工具超时时，停止后续派发，按模型顺序补齐未执行调用的配对结果，并由 Turn 驱动结算，本轮不再请求模型。验证明确拒绝即使发生在已有成功结束意向的批次中也会停止本轮。
 - [x] 3.6 定义自有结构化工具成功值合约，先校验快照 value，再纯 render(args,value) 生成 content 和可选 presentationMeta。验证无效值不调用成功渲染、输出 Schema、render 或 presentationMeta 失败均返回带模型可见 content 的 INVALID_TOOL_OUTPUT，省略成功值且不推断副作用已撤销、模型与 UI 派生自同份值、只有成功能携带 concludeTurn；同步中文 API 契约。
-- [ ] 3.7 按 design §4.2 和 3.8 确认的契约持久化工具结果。验证 `turn`、`step`、消息工具来源与结果块标识配对，并核对 `sourceEventSeqs`；已有操作保存 operationId，参数校验失败尚无操作时省略。成功及失败均保存带 isError 和 content 的模型消息，两支均可带事件级 meta；有 error.info 时仅投影 name/code，否则仅以内容说明失败。普通持久结果省略原始 value、输出定义与转换函数。验证重放不重新 render、UI 元数据不进入模型上下文、错误内容不泄漏秘密。
+- [x] 3.7 按 design §4.2 和 3.8 确认的契约持久化工具结果。验证 `turn`、`step`、消息工具来源与结果块标识配对，并核对 `sourceEventSeqs`；已有操作保存 operationId，参数校验失败尚无操作时省略。成功及失败均保存带 isError 和 content 的模型消息，两支均可带事件级 meta；有 error.info 时仅投影 name/code，否则仅以内容说明失败。普通持久结果省略原始 value、输出定义与转换函数。验证重放不重新 render、UI 元数据不进入模型上下文、错误内容不泄漏秘密。
 
 ## 4. MCP 与工具端幂等
 
