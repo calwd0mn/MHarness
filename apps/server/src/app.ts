@@ -23,6 +23,8 @@ import { SessionCommandController } from "./commands.ts";
 import { createMockAdapter } from "./model/providers/mock.ts";
 import { LlmRuntime } from "./model/runtime.ts";
 import { registerSessionRoutes } from "./session/routes.ts";
+import { ApprovalService } from "./approval/service.ts";
+import { registerApprovalRoutes } from "./approval/routes.ts";
 
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
 
@@ -105,10 +107,11 @@ export function createApp(store: SessionStore, logger = false) {
  * @param path - 新版库路径，父目录必须存在。
  * @param logger - 是否启用 HTTP 日志，默认关闭。
  * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
+ * @param options - 可注入驱动共享的审批服务；默认提供 HTTP 审批渠道。
  * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
  */
-export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn) {
+export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService } = {}) {
   const ownership = await acquireInstanceOwnership(path);
   let persistence: SqliteSessionPersistence;
   try {
@@ -155,5 +158,6 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     }
   });
   registerSessionRoutes(app, sessionsPath, persistence, commands, agents);
+  registerApprovalRoutes(app, sessionsPath, persistence, agents, options.approvalService ?? new ApprovalService());
   return app;
 }
