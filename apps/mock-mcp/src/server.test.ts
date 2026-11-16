@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { MockLedger } from "./ledger.ts";
 import { startMockMcp } from "./server.ts";
 
 test("真实 MCP 重复写入在重启后返回相同结果且只产生一次效果", async () => {
@@ -29,11 +33,6 @@ test("真实 MCP 重复写入在重启后返回相同结果且只产生一次效
   } finally { await server.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { once } from "node:events";
-import { DatabaseSync } from "node:sqlite";
-import { MockLedger } from "./ledger.ts";
-
 async function ready(child: ChildProcessWithoutNullStreams): Promise<string> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => finish(new Error("子进程启动超时")), 5000);
@@ -45,7 +44,7 @@ async function ready(child: ChildProcessWithoutNullStreams): Promise<string> {
       if (error) reject(error); else resolve(value!);
     };
     const onData = (chunk: Buffer) => finish(undefined, chunk.toString().trim());
-    const onExit = () => finish(new Error("子进程启动前退出"));
+    const onExit = () => finish(new Error(`子进程启动前退出: ${child.stderr.read()?.toString() ?? ""}`));
     const onError = (error: Error) => finish(error);
     child.stdout.once("data", onData);
     child.once("exit", onExit);
@@ -63,11 +62,15 @@ async function stop(child: ChildProcessWithoutNullStreams): Promise<void> {
   try { await exited; } finally { clearTimeout(timer); }
 }
 
-test("独立 MCP 进程在数据库写锁竞争中共同去重", async () => {
+test("独立 MCP 进程在数据库写锁竞争中共同去重", { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "mock-mcp-concurrent-"));
   const path = join(dir, "mock.sqlite");
   const children: ChildProcessWithoutNullStreams[] = [];
-  const serverScript = `import { startMockMcp } from './src/server.ts';
+  const serverScript = `import { writeSync } from 'node:fs';
+    import { MockLedger } from './src/ledger.ts';
+    import { startMockMcp } from './src/server.ts';
+    const write = MockLedger.prototype.write;
+    MockLedger.prototype.write = function (...args) { writeSync(1, 'entered\\n'); return write.apply(this, args); };
     const server = await startMockMcp(0, process.argv[1]);
     console.log(server.url);
     process.stdin.once('data', async () => { await server.close(); process.exit(0); });`;
@@ -90,12 +93,12 @@ test("独立 MCP 进程在数据库写锁竞争中共同去重", async () => {
       return client;
     }));
     try {
-      let finished = 0;
-      const calls = clients.map((client) => client.callTool({ name: "mock_write", arguments: { text: "one", operationId: "shared" } }).then((result) => { finished++; return result; }));
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      assert.equal(finished, 0);
+      const entered = Promise.all(children.slice(0, 2).map(ready));
+      const calls = Promise.all(clients.map((client) => client.callTool({ name: "mock_write", arguments: { text: "one", operationId: "shared" } }, undefined, { signal: AbortSignal.timeout(7000) })));
+      void calls.catch(() => {});
+      assert.deepEqual(await entered, ["entered", "entered"]);
       await stop(lock);
-      const results = await Promise.all(calls);
+      const results = await calls;
       assert.deepEqual(results[0], results[1]);
       assert.equal(results[0]?.isError, undefined);
       const db = new DatabaseSync(path);
