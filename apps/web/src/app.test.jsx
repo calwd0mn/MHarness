@@ -1,0 +1,180 @@
+// @vitest-environment jsdom
+import React, { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { App } from "./App.tsx";
+
+const connections = [];
+class Source {
+  constructor(url) { this.url = url; this.closed = false; connections.push(this); }
+  close() { this.closed = true; }
+  frame(frame) { this.onmessage?.({ data: JSON.stringify(frame) }); }
+}
+const snapshot = (id, records = [], assistantStream = { revision: 0 }) => ({ type: "snapshot", sessionId: id, inheritedEventCount: 0, cursor: records.length - 1, records, assistantStream });
+let root;
+let container;
+const flush = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); }); };
+const sendFrame = async (connection, frame) => { await act(async () => { connection.frame(frame); }); await flush(); };
+const click = async (button) => { await act(async () => { button.click(); }); await flush(); };
+const button = (text) => [...container.querySelectorAll("button")].find(item => item.textContent.includes(text));
+const enter = async (value) => { const textarea = container.querySelector("textarea"); await act(async () => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, value); textarea.dispatchEvent(new Event("input", { bubbles: true })); }); };
+const submit = async () => { await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); }); await flush(); };
+
+beforeEach(async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  connections.length = 0;
+  localStorage.clear();
+  localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a", "b"], selected: "a" }));
+  vi.stubGlobal("EventSource", Source);
+  vi.stubGlobal("fetch", vi.fn());
+  container = document.createElement("div"); document.body.append(container);
+  root = createRoot(container);
+  await act(async () => { root.render(<App />); });
+});
+afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
+
+test("首屏和切换只订阅选中会话，旧回调不能覆盖当前画面", async () => {
+  expect(connections.map(item => item.url)).toEqual(["/api/sessions/a/follow"]);
+  await click(button("会话 2"));
+  expect(connections[0].closed).toBe(true);
+  expect(connections.map(item => item.url)).toEqual(["/api/sessions/a/follow", "/api/sessions/b/follow"]);
+  await sendFrame(connections[0], snapshot("a"));
+  await sendFrame(connections[1], snapshot("b"));
+  expect(container.textContent).toContain("已连接");
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+test("网络结果未知时相同正文沿用编号，改文使用新编号", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockRejectedValue(new Error("lost"));
+  await enter("你好"); await submit();
+  expect(container.textContent).toContain("发送结果未知");
+  const first = JSON.parse(fetch.mock.calls[0][1].body).requestId;
+  await click(button("重试此消息")); await submit();
+  expect(JSON.parse(fetch.mock.calls[1][1].body).requestId).toBe(first);
+  await enter("修改"); await submit();
+  expect(JSON.parse(fetch.mock.calls[2][1].body).requestId).not.toBe(first);
+});
+
+const record = (seq, type, data, extra = {}) => ({ type: "event", event: { seq, time: seq + 1, type, data, ...extra } });
+const userRecord = (requestId) => record(0, "user/message", { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId, content: [{ type: "text", text: "你好" }] }, { surfaceOp: "append" });
+const ok = () => ({ ok: true, json: async () => ({ accepted: true }) });
+for (const eventFirst of [true, false]) test(`受理${eventFirst ? "事件" : "HTTP"}先到只显示一条用户消息`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let resolve;
+  fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await enter("你好"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).requestId;
+  if (eventFirst) {
+    await sendFrame(connections[0], userRecord(id));
+    const users = [...container.querySelectorAll("article.user")];
+    expect(users).toHaveLength(1);
+    expect(users[0].textContent).toBe("你你好");
+  }
+  await act(async () => { resolve(ok()); }); await flush();
+  const afterResponse = [...container.querySelectorAll("article.user")];
+  expect(afterResponse).toHaveLength(1);
+  expect(afterResponse[0].textContent).toBe(eventFirst ? "你你好" : "你你好已受理，等待同步");
+  if (!eventFirst) await sendFrame(connections[0], userRecord(id));
+  const finalUsers = [...container.querySelectorAll("article.user")];
+  expect(finalUsers).toHaveLength(1);
+  expect(finalUsers[0].textContent).toBe("你你好");
+});
+
+test("忙碌保留正文，取消通过当前会话接口发出", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockResolvedValueOnce({ status: 409, ok: false }).mockResolvedValueOnce({ ok: true });
+  await enter("你好"); await submit();
+  expect(container.textContent).toContain("未受理");
+  expect(container.querySelector("textarea").value).toBe("你好");
+  await click(button("取消任务"));
+  expect(fetch.mock.calls[1][0]).toBe("/api/sessions/a/cancel");
+  expect(container.textContent).toContain("已请求取消");
+});
+
+test("执行错误不重连，失败终态可仅凭快照恢复", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  await sendFrame(connections[0], { type: "agent/error", turn: 1, message: "模型失败" });
+  expect(container.textContent).toContain("执行错误：模型失败");
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "turn/end", { turn: 1, reason: { kind: "error", error: { code: "UNKNOWN", message: "模型失败" } } })];
+  await sendFrame(connections[0], records[0]); await sendFrame(connections[0], records[1]);
+  expect(container.textContent).toContain("本轮失败：模型失败");
+  expect(connections).toHaveLength(1);
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", records));
+  expect(container.textContent).toContain("本轮失败：模型失败");
+  expect(connections).toHaveLength(3);
+});
+
+test("切走后切回恢复增长的草稿并结算为唯一回答", async () => {
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 })];
+  const stream = (text, revision = 1) => ({ revision, activeAttempt: { attemptId: "draft", turn: 1, step: 1, chunks: [{ type: "text", delta: text }], nextIndex: 1 } });
+  await sendFrame(connections[0], snapshot("a", records, stream("部分")));
+  expect(container.textContent).toContain("部分");
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a", records, stream("部分增长")));
+  expect(container.textContent).toContain("部分增长");
+  const draftNode = container.querySelector("article.assistant");
+  await sendFrame(connections[2], { type: "assistant-stream", frame: { type: "chunk", attemptId: "draft", revision: 2, index: 1, chunk: { type: "text", delta: "完成" } } });
+  expect(container.textContent).toContain("部分增长完成");
+  const final = record(2, "assistant/message", { turn: 1, step: 1, message: { id: "m", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "text", text: "部分增长完成" }] }, finishReason: { kind: "stop" }, stream: [], includeInModelContext: true }, { surfaceOp: "append" });
+  await sendFrame(connections[2], { type: "assistant-stream", frame: { type: "end", attemptId: "draft", revision: 3, turn: 1, step: 1, index: 2, outcome: { kind: "committed", eventType: "assistant/message", seq: 2 } } });
+  await sendFrame(connections[2], final);
+  expect([...container.querySelectorAll("article.assistant")].map(node => node.textContent)).toEqual([expect.stringContaining("部分增长完成")]);
+  expect(container.querySelector("article.assistant")).toBe(draftNode);
+});
+
+
+test("断线等待期间保留画面，重连只安装新 follow 快照", async () => {
+  await sendFrame(connections[0], snapshot("a", [userRecord("old")]));
+  await act(async () => { connections[0].onerror(); });
+  expect(container.textContent).toContain("正在同步");
+  expect(container.textContent).toContain("你好");
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+  expect(connections).toHaveLength(2);
+  await sendFrame(connections[1], snapshot("a"));
+  expect(container.textContent).not.toContain("你好");
+  expect(container.textContent).toContain("已连接");
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+test("消息事件确认后即使响应丢失仍保持受理，再发相同正文使用新编号", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let reject;
+  fetch.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; })).mockResolvedValueOnce(ok());
+  await enter("你好"); await submit();
+  const first = JSON.parse(fetch.mock.calls[0][1].body).requestId;
+  await sendFrame(connections[0], userRecord(first));
+  await act(async () => { reject(new Error("lost")); }); await flush();
+  expect(container.textContent).not.toContain("发送结果未知");
+  expect(container.querySelectorAll("article.user")).toHaveLength(1);
+  await enter("你好"); await submit();
+  expect(JSON.parse(fetch.mock.calls[1][1].body).requestId).not.toBe(first);
+});
+
+test("终止错误保留已显示内容并等待主动重试", async () => {
+  await sendFrame(connections[0], snapshot("a", [userRecord("old")]));
+  await sendFrame(connections[0], { type: "error", error: { code: "follow_sync_failed", message: "同步故障", details: {} } });
+  expect(container.textContent).toContain("你好");
+  expect(container.textContent).toContain("同步故障");
+  await act(async () => { connections[0].onerror(); await new Promise(resolve => setTimeout(resolve, 300)); });
+  expect(connections).toHaveLength(1);
+  await click(button("重新同步"));
+  expect(connections).toHaveLength(2);
+  await sendFrame(connections[1], snapshot("a"));
+  expect(container.textContent).not.toContain("你好");
+});
+
+test("继承的同编号消息不能确认子会话的新提交", async () => {
+  vi.spyOn(crypto, "randomUUID").mockReturnValue("same");
+  const inherited = userRecord("same");
+  await sendFrame(connections[0], { ...snapshot("a", [inherited]), inheritedEventCount: 1 });
+  fetch.mockImplementation(() => new Promise(() => {}));
+  await enter("你好"); await submit();
+  expect(container.textContent).toContain("正在发送");
+  const own = userRecord("same"); own.event.seq = 1; own.event.data.id = "u2";
+  await sendFrame(connections[0], own);
+  expect(container.textContent).not.toContain("正在发送");
+  expect(container.querySelectorAll("article.user")).toHaveLength(2);
+  vi.restoreAllMocks();
+});
