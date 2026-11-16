@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Session } from "@mharness/session/server";
 import { ApprovalCheckpointError, ApprovalService } from "../approval/service.ts";
+import type { ApprovalOutcome } from "../approval/contracts.ts";
 import { ToolDispatch } from "./dispatch.ts";
 import { prepareToolOperation } from "./operation.ts";
 import { ToolRegistry } from "./registry.ts";
@@ -41,7 +42,7 @@ export async function runToolBatch(session: Session, registry: ToolRegistry, app
     const prepared = prepareToolOperation(session, registry, { ...identity, callId: call.id });
     if (prepared.kind === "settled") continue;
     if (prepared.decision === "ask") {
-      let outcome;
+      let outcome: ApprovalOutcome;
       try { outcome = await approvals.request(session, prepared.operation, "工具需要审批。", signal); }
       catch (error) {
         if (error instanceof ApprovalCheckpointError) onStorageFailure?.(error.cause);
