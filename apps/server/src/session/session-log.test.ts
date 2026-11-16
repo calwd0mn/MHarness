@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { SessionAppendInput } from "../../../../packages/session/src/events.ts";
+import type { SessionAppendInput, SessionEvent } from "../../../../packages/session/src/events.ts";
 import { Session, SessionStore } from "../../../../packages/session/src/session.ts";
 
 const header = { sessionId: "session-1", createdAt: 100 };
@@ -151,6 +151,31 @@ test("会话日志保留请求、原始工具调用、审批和工具结果记�
     type: "tool/call", data: { turn: 1, step: 1, callId: "call-1", name: "read", arguments: '{"id":1}' },
   }), /声明/);
   assert.equal(session.seq, 10);
+});
+
+test("追加结果按输入类别保留具体事件分支", () => {
+  const session = new Session(header);
+
+  function appendTurnOrCall(input: Extract<SessionAppendInput, { type: "turn/start" | "tool/call" }>) {
+    const event = session.append(input) satisfies Extract<SessionEvent, { type: typeof input.type }>;
+    return event.type === "tool/call" ? event.data.callId : event.data.turn;
+  }
+
+  assert.equal(appendTurnOrCall({ type: "turn/start", data: { turn: 1 } }), 1);
+  session.append({ type: "step/start", data: { turn: 1, step: 1 } });
+  session.append({ type: "assistant/message", surfaceOp: "append", data: {
+    turn: 1, step: 1,
+    message: {
+      id: "assistant-1", role: "assistant", source: { provider: "mock", model: "demo" },
+      content: [{ type: "tool-call", id: "call-1", name: "read", arguments: "{}" }],
+    },
+    finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true,
+  } });
+  const event = session.append({
+    type: "tool/call", data: { turn: 1, step: 1, callId: "call-1", name: "read", arguments: "{}" },
+  });
+  const callId: string = event.data.callId;
+  assert.equal(callId, "call-1");
 });
 
 test("Assistant 消息追加和重放只接受约定的模型路由字段", () => {

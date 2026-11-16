@@ -20,7 +20,7 @@
 | --- | --- |
 | `apps/web` | React 与 Vite，负责页面、前端 Session 和 `follow` 帧消费。 |
 | `apps/server` | Fastify 5 应用启动与固定装配，组合业务模块，并维护 Agent 执行、模型适配和工具治理。 |
-| `packages/session` | Session 业务模块，维护会话核心、持久化能力和 Session API；通过独立入口向浏览器暴露公开契约，向后端暴露服务端能力。目标架构移除 `packages/protocol`。 |
+| `packages/session` | Session 业务模块，维护会话核心、持久化能力和 Session API；通过独立入口向浏览器暴露公开契约，向后端暴露服务端能力。 |
 | `apps/mock-mcp` | 工具接入阶段加入的本地模拟 MCP 服务，独立启动，用于验证工具调用、超时及幂等。 |
 
 后端启动入口固定装配 SessionStore、SessionPersistence、AgentManager、LlmRuntime、Provider Adapter、工具批次调度器、工具执行服务、ApprovalService 与 MCP Client。SessionStore 管理内存 Session，Session 持有不可变日志和派生缓存；AgentManager 管理每会话 ReActAgent 及写 handle 的释放权。ReActAgent 驱动 Turn/Step，协调输入、活跃草稿和订阅顺序。工具执行服务负责参数与结果校验、策略和正文，审批服务负责等待及返回审批决定，批次调度器负责派发顺序和配对结果写日志。HTTP/SSE 负责请求与连接，网络等待在会话提交串行区外执行。
@@ -68,22 +68,25 @@ Turn 完成回到 idle，浏览器断线不销毁 Agent。AgentManager 显式关
 
 #### 1.3 业务模块拥有契约与预期组织
 
-目标架构放弃中央 `packages/protocol`，不以另一个跨业务 `contracts` 或全局 `types` 包替代。契约由决定其语义的业务模块维护，定义位置、复用范围和公共入口分别设计。以下图与目录是预期组织，不表示现有代码已经迁移；Context 和任务 1.1–1.4 中的共享协议描述保留为已有实现的历史记录。本次记录设计，不据此勾选实现任务；代码迁移时需同步相关规范、任务、消费者及 README。
+契约由决定其语义的业务模块维护，原 `packages/protocol` 已移除。旧包所剩审批定义没有消费者，后续按 3.3 在审批能力中实现。以下图与目录记录本阶段实际边界。Context 和任务 1.1–1.4 中的共享协议描述保留为历史记录。
 
 ```mermaid
 flowchart LR
     WEB["前端 Session 功能"] --> CONTRACT["session/contracts"]
-    APP["后端装配"] --> SERVER["session/server"]
+    APP["后端装配与会话路由"] --> SERVER["session/server"]
+    APP --> CONTRACT
 
     subgraph SESSION["Session 业务模块"]
         CONTRACT --> DATA["api/ 下的公开 Schema 与类型"]
-        SERVER --> ROUTES["路由与事件封装"]
-        ROUTES --> DATA
-        ROUTES --> SERVICE["Session 服务与核心"]
-        SERVICE --> EVENTS["Session 事件数据"]
+        SERVER --> SERVICE["创建与持久历史用例"]
+        SERVER --> CORE["Session 核心"]
+        SERVER --> SQLITE["SQLite 事件存储"]
+        SERVICE --> DATA
+        CORE --> EVENTS["Session 事件数据"]
         DATA --> EVENTS
         SERVICE --> PORT["持久化接口"]
-        SQLITE["SQLite 实现"] --> PORT
+        SQLITE --> PORT
+        SQLITE --> CORE
     end
 ```
 
@@ -94,32 +97,23 @@ apps/
   server/src/
     index.ts                     启动与关闭
     app.ts                       固定装配、注册业务路由
-    agent/
-      agent-manager.ts           Agent 实例与生命周期
-      commands.ts                会话命令与显式 Agent 激活策略
-      react-agent.ts             执行循环
-    model/
-      runtime.ts                 统一模型入口、配置与失败流归一化
-      adapter.ts                 厂商接入接口及相关参数、结果
-      providers/                 具体模型接入
-  web/src/features/session/
-    session-api.ts               HTTP 调用与响应解析
-    session-stream.ts            SSE 消费与重连
-    session-state.ts             页面状态、草稿与发送占位
-    components/                  会话界面
 packages/
   session/src/
     api/
-      submission.ts              消息提交请求、响应 Schema 与类型
-      history.ts                 原始事件记录封装与历史查询结果
-      follow.ts                  SSE 业务帧
+      submission.ts              会话创建与旧版提交契约
+      prompt.ts                  新版 prompt 请求与受理契约
+      history.ts                 旧版历史契约
+      raw-history.ts             原始事件与新版持久历史封装
+      follow.ts                  当前 SSE 帧契约
       contracts.ts               选择性导出浏览器可用契约
-      routes.ts                  Session 路由注册
+      use-cases.ts               持久化创建与历史查询
     session.ts                   Session 行为及相关参数、结果
     events.ts                    内部持久事件及边界校验
-    service.ts                   创建、读取等 Session 用例
     persistence.ts               持久化接口及相关参数、结果
-    storage/sqlite.ts            SQLite 实现及专有结构
+    writer.ts                    固定窗口写入缓冲与持久性检查点
+    recovery.ts                  遗留 Turn 修复与只读推导
+    storage/sqlite-persistence.ts SQLite 事件存储及事务核对
+    storage/ownership.ts         进程间实例与会话写入锁
     server.ts                    服务端公共入口
 ```
 
@@ -127,13 +121,13 @@ packages/
 
 | 定义 | 所有者与位置 | 消费方式 |
 | --- | --- | --- |
-| 消息提交请求、响应 | Session API 的 `api/submission.ts` | 运行时边界用 Zod 4 定义并用 `z.infer` 推导类型；路由和浏览器共用。 |
-| 历史记录封装 | Session API 的 `api/history.ts` | 历史查询与 `api/follow.ts` 共用 `{ type: "event", event }`，事件正文沿用 Session 事件的数据契约。 |
+| 消息提交请求、响应 | Session API 的 `api/prompt.ts` | 运行时边界用 Zod 4 定义并用 `z.infer` 推导类型；正式路由和浏览器共用。 |
+| 历史记录封装 | Session API 的 `api/raw-history.ts` | 历史查询使用 `{ type: "event", event }`，供后续 follow 共用。事件正文沿用 Session 事件的数据契约。 |
 | SSE 业务帧 | Session API 的 `api/follow.ts` | 服务端发布与浏览器消费共用。 |
 | Session 事件 | `events.ts` | 日志、持久化、模型派生和历史契约共用纯数据定义。 |
 | Session 操作选项与结果 | 默认共置于 `session.ts` 或使用它的功能文件 | 已校验的进程内结构直接用 TypeScript 类型。 |
 | SessionPersistence、SessionHandle 及相关约定 | `persistence.ts` | 由会话能力定义，调用方与 SQLite 实现共同遵守。 |
-| SQLite 行结构与事务辅助类型 | `storage/sqlite.ts` | 不上提到公共契约。 |
+| SQLite 行结构与事务辅助类型 | `storage/sqlite-persistence.ts` | 留在 SQLite 实现内。 |
 | Agent 活动状态与取消资源 | 使用它的 Agent 实现文件 | 不作为浏览器可传输对象。 |
 | 发送占位、订阅代次与草稿状态 | 前端对应功能文件 | 不进入后端持久契约。 |
 

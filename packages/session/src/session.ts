@@ -1,9 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   sessionPositionSchema,
   snapshotSessionEvent,
   type SessionAppendInput,
   type SessionEvent,
 } from "./events.ts";
+import { SessionToolCalls } from "./tool-calls.ts";
 
 /** 独立于事件日志的元数据。分支记录直接父会话，创建时间使用 Unix 毫秒。 */
 export type SessionHeader = Readonly<{
@@ -30,9 +32,19 @@ export interface SessionSnapshot {
   readonly events: readonly SessionEvent[];
 }
 
+type SurfaceEvent = Extract<SessionEvent, { surfaceOp: unknown }>;
+/** 从当前 surface 提取的不可变模型消息。 */
+export type SessionMessage = Extract<SurfaceEvent, { type: "user/message" }>["data"]
+  | Extract<SurfaceEvent, { type: "assistant/message" | "tool/result" }>["data"]["message"];
+
+function messageOf(event: SurfaceEvent): SessionMessage {
+  return event.type === "user/message" ? event.data : event.data.message;
+}
+
 type ReportListenerError = (error: unknown) => void;
 
 type UnionKeys<T> = T extends unknown ? keyof T : never;
+type AppendedEvent<Input extends SessionAppendInput> = Extract<SessionEvent, { type: Input["type"] }>;
 
 // TypeScript 的结构化赋值允许变量携带额外字段，需要按实参的键补做检查。
 type UnexpectedAppendFields<Input> = Input extends { readonly type: infer Type; readonly data: infer Data }
@@ -80,8 +92,13 @@ function reportListenerError(error: unknown): void {
 /** 在内存中接受和读取会话事件。事件接受可同步观察。 */
 export class Session {
   readonly #events: SessionEvent[] = [];
+  readonly #toolCalls = new SessionToolCalls();
   readonly #notifications: { "session/event": Notifications<SessionEvent> };
+  #checkpoint?: { readonly flush: (eventCount: number) => Promise<void> };
   #appending = false;
+  #surface: SurfaceEvent[] = [];
+  #messages: SessionMessage[] | undefined = [];
+  #replaceGeneration = 0;
 
   /** 此 Session 持有的独立元数据快照。 */
   readonly header: SessionHeader;
@@ -136,12 +153,12 @@ export class Session {
   /**
    * 接受一条记录并向当前监听器同步发布。
    * @param candidate - 载荷的字段须符合事件类别。调用方不得传入序号，省略时间时使用当前 Unix 毫秒。
-   * @returns 已接受的不可变事件。
-   * @throws 候选事件无效、尝试自行写入分支标记，或在当前追加中重入时抛出。
+   * @returns 已接受的不可变事件，与日志和通知共享同一快照。单一事件类别可直接读取该类别的载荷，联合输入返回对应类别的联合。
+   * @throws 事件载荷或日志关联无效、尝试自行写入分支标记，或在当前追加中重入时抛出。
    */
   append<const Input extends SessionAppendInput>(
     candidate: Input & ([UnexpectedAppendFields<NoInfer<Input>>] extends [never] ? unknown : never),
-  ): SessionEvent {
+  ): AppendedEvent<Input> {
     if (this.#appending) throw new Error("会话事件追加不允许重入");
     this.#appending = true;
     try {
@@ -149,25 +166,79 @@ export class Session {
       if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
       this.#accept(event);
       this.#notifications["session/event"].emit(event);
-      return event;
+      // 快照沿用输入的事件类别，经过共享 Schema 校验后可以按该类别收窄。
+      return event as AppendedEvent<Input>;
     } finally {
       this.#appending = false;
     }
   }
 
   #accept(event: SessionEvent): void {
-    if (event.type === "tool/call") {
-      const { turn, step, callId, name, arguments: rawArguments } = event.data;
-      const assistant = this.#events.findLast((entry) =>
-        entry.type === "assistant/message" && entry.data.turn === turn && entry.data.step === step);
-      const block = assistant?.type === "assistant/message"
-        ? assistant.data.message.content.find((part) => part.type === "tool-call" && part.id === callId)
-        : undefined;
-      if (block?.type !== "tool-call" || block.name !== name || block.arguments !== rawArguments) {
-        throw new Error("工具调用与 Assistant 声明不一致");
+    const recordToolCall = this.#toolCalls.prepare(event);
+    if ("surfaceOp" in event) this.#acceptSurface(event);
+    recordToolCall?.();
+    this.#events.push(event);
+  }
+
+  #acceptSurface(event: SurfaceEvent): void {
+    const sources = "sourceEventSeqs" in event ? event.sourceEventSeqs : undefined;
+    if (sources && (new Set(sources).size !== sources.length || sources.some((seq) => seq >= event.seq))) {
+      throw new Error("surface 来源无效");
+    }
+    if (event.surfaceOp === "append") {
+      this.#surface.push(event);
+      this.#messages?.push(messageOf(event));
+      return;
+    }
+    const { start, end } = event.surfaceOp;
+    const from = this.#surface.findIndex((entry) => entry.seq === start);
+    const to = this.#surface.findIndex((entry) => entry.seq === end);
+    if (from < 0 || to < from || !sources || this.#surface.slice(from, to + 1).some((entry) => !sources.includes(entry.seq))) {
+      throw new Error("surface 替换范围或来源无效");
+    }
+    const selected = this.#surface.slice(from, to + 1);
+    if (event.type === "tool/result") {
+      const original = selected[0];
+      if (selected.length !== 1 || original?.type !== "tool/result") throw new Error("工具结果替换范围无效");
+      const normalize = (value: typeof event.data) => ({ ...value, message: { ...value.message,
+        content: [{ ...value.message.content[0], content: [] }] } });
+      if (!isDeepStrictEqual(normalize(event.data), normalize(original.data))) {
+        throw new Error("工具结果替换只能改变模型内容");
+      }
+    } else {
+      const selectedSet = new Set(selected.map((entry) => entry.seq));
+      for (const entry of this.#surface) {
+        if (entry.type !== "tool/result") continue;
+        const assistant = this.#surface.find((candidate) => candidate.type === "assistant/message"
+          && candidate.data.turn === entry.data.turn && candidate.data.step === entry.data.step
+          && candidate.data.message.content.some((part) => part.type === "tool-call" && part.id === entry.data.message.source.callId));
+        if (assistant && selectedSet.has(assistant.seq) !== selectedSet.has(entry.seq)) {
+          throw new Error("surface 替换拆散工具配对");
+        }
+      }
+      for (const entry of selected) {
+        if (entry.type === "assistant/message" && entry.data.message.content.some((part) => part.type === "tool-call"
+          && !selected.some((result) => result.type === "tool/result" && result.data.turn === entry.data.turn
+            && result.data.step === entry.data.step && result.data.message.source.callId === part.id))) {
+          throw new Error("surface 替换拆散工具配对");
+        }
       }
     }
-    this.#events.push(event);
+    this.#surface.splice(from, to - from + 1, event);
+    this.#messages = undefined;
+    this.#replaceGeneration++;
+  }
+
+  /** 已接受的 surface 替换次数，重放时按日志恢复。 */
+  get replaceGeneration(): number { return this.#replaceGeneration; }
+
+  /**
+   * 按当前 surface 顺序返回模型消息的独立数组。
+   * @returns 数组由调用方拥有；其中消息节点与不可变日志共享。
+   */
+  deriveMessages(): SessionMessage[] {
+    this.#messages ??= this.#surface.map(messageOf);
+    return this.#messages.slice();
   }
 
   /**
@@ -193,6 +264,31 @@ export class Session {
    */
   on(type: "session/event", listener: (event: SessionEvent) => void): () => void {
     return this.#notifications[type].on(listener);
+  }
+
+  /**
+   * 绑定此 Session 的持久化检查点，调用方须在接收新事件前完成绑定。
+   * @param checkpoint - 负责确认调用时传入的事件数已提交。
+   * @returns 解除本次绑定的函数。
+   * @throws 已有绑定时抛出。
+   */
+  bindCheckpoint(checkpoint: (eventCount: number) => Promise<void>): () => void {
+    if (this.#checkpoint) throw new Error("会话已绑定持久化检查点");
+    const binding = { flush: checkpoint };
+    this.#checkpoint = binding;
+    return () => {
+      if (this.#checkpoint === binding) this.#checkpoint = undefined;
+    };
+  }
+
+  /**
+   * 确认调用开始时已接受的事件全部提交。
+   * @returns 检查点覆盖目标前缀后兑现。
+   * @throws 未绑定、排空失败或持久前缀未达到目标时拒绝。
+   */
+  async flush(): Promise<void> {
+    if (!this.#checkpoint) throw new Error("会话未绑定持久化检查点");
+    await this.#checkpoint.flush(this.seq);
   }
 }
 

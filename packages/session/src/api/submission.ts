@@ -1,11 +1,14 @@
 /** Session 创建、消息提交与取消的 HTTP 契约。 */
 import { z } from "zod";
+import { isValidSessionId } from "../session-id.ts";
 
 /** 创建会话无需参数，请求体只接受空对象。 */
 export const createSessionRequestSchema = z.strictObject({});
 
-/** 会话标识由服务端分配，路径参数要求非空。 */
-export const sessionParamsSchema = z.strictObject({ sessionId: z.string().min(1) });
+/** 会话标识由服务端分配，须为可无损持久化和传输的非空文本。 */
+export const sessionParamsSchema = z.strictObject({
+  sessionId: z.string().refine(isValidSessionId, "会话标识无效"),
+});
 
 /** 消息在校验时去除首尾空白，去除后必须非空。 */
 export const submitMessageRequestSchema = z.strictObject({ text: z.string().trim().min(1) });

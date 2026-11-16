@@ -66,3 +66,21 @@ DSH 映射见阅读笔记第 8 节。正式 SQLite 接线按任务 1.9 验收。
 - [x] 运行 `pnpm typecheck`、`pnpm --filter @mharness/server test` 和 `openspec validate agent-harness-prototype --strict`，通过后勾选 OpenSpec 的 1.20。
 
 1.20 的验证结果：新增用例在旧接口下因三处预期错误未触发而无法通过类型检查。实现后全仓类型检查、服务端 23 个测试及 OpenSpec 严格校验均通过，中文 JSDoc 已按实现人工核对。
+
+## 任务 1.21 `Session.append()` 返回具体事件类型
+
+本轮范围为 `agent-harness-prototype` 的任务 1.21，依据 design §2。
+
+1. 在现有日志测试中补上两种编译期用例。单独追加 `tool/call` 时，直接读取 `event.data.callId`，并验证其类型为 `string`。传入 `tool/call` 与 `turn/start` 的联合时，检查返回值可赋给这两个已接受事件分支的联合，并能按 `event.type` 访问各自的载荷。先用 `pnpm typecheck` 确认旧签名因这两项验收失败。
+
+   `@apps/server/src/session/session-log.test.ts`
+
+2. 在 `Session.append()` 中沿用 1.20 的泛型输入与字段检查，按 `Input["type"]` 从共享 Schema 已推导出的只读 `SessionEvent` 联合中筛出匹配分支。返回类型精确到事件类别，字段类型来自 Schema，`seq` 和 `time` 仍来自已接受的快照。将类型收窄集中在已校验事件的返回处，现有 JSON 校验、日志关联检查、冻结、写入与同步通知按原顺序执行。按 `jsdoc-contracts` 更新中文 `@returns`，说明单类别与联合输入的返回语义。
+
+   `@packages/session/src/session.ts`
+
+3. 运行 `pnpm typecheck`、`pnpm --filter @mharness/server test` 和 `openspec validate agent-harness-prototype --strict`。核对现有用例覆盖无效追加的拒绝、序号连续性、快照隔离与深度冻结、同步通知以及严格重放。验收通过后只勾选 OpenSpec 的 1.21，并记录验证结果。
+
+   `@openspec/changes/agent-harness-prototype/tasks.md:58`
+
+实现前，全仓类型检查在新增用例中确认旧签名无法直接读取 `callId`，也无法将联合输入的结果赋给对应的事件分支。实现后，全仓类型检查、26 项服务端测试和 OpenSpec 严格校验均通过。已对照实现人工核对返回值的中文 JSDoc。

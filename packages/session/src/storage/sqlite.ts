@@ -71,7 +71,7 @@ export class SessionStore {
   /**
    * 打开存储并初始化表结构。
    * @param path - SQLite 文件路径，传入 `:memory:` 可创建仅当前连接可见的存储。
-   * @throws 数据库无法打开或表结构无法初始化时抛出错误。
+   * @throws 数据库无法打开、使用新版格式或表结构无法初始化时抛出错误。
    */
   constructor(path: string) {
     this.db = new DatabaseSync(path, {
@@ -81,6 +81,9 @@ export class SessionStore {
 
     try {
       this.writeTransaction(() => {
+        if (this.db.prepare("PRAGMA user_version").get()?.user_version !== 0) {
+          throw new Error("旧版会话存储不能打开已版本化的数据库");
+        }
         this.db.exec(`
           CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY NOT NULL

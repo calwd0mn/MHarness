@@ -57,15 +57,6 @@ importers:
         specifier: ^7.0.0
         version: 7.3.8(@types/node@24.19.2)(tsx@4.23.15)
 
-  packages/protocol:
-    dependencies:
-      '@mharness/session':
-        specifier: workspace:*
-        version: link:../session
-      zod:
-        specifier: ^4.0.0
-        version: 4.6.7
-
   packages/session:
     dependencies:
       zod:

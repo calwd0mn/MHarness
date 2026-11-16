@@ -1,16 +1,34 @@
 import {
   createSessionRequestSchema,
   createSessionResponseSchema,
+  rawSessionHistorySchema,
   sessionHistoryResponseSchema,
   sessionParamsSchema,
   submitMessageRequestSchema,
   submitMessageResponseSchema,
 } from "@mharness/session/contracts";
-import type { SessionStore } from "@mharness/session/server";
+import {
+  acquireInstanceOwnership,
+  createPersistedSession,
+  readPersistedSessionHistory,
+  recoverInterruptedSession,
+  SqliteSessionPersistence,
+  type SessionStore,
+} from "@mharness/session/server";
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
+
+const sessionsPath = `${localConfig.apiPrefix}/sessions`;
+
+function createHttpApp(logger: boolean) {
+  const app = Fastify({ logger });
+  app.get(`${localConfig.apiPrefix}${healthPath}`, async () =>
+    healthResponseSchema.parse({ status: "ok" }),
+  );
+  return app;
+}
 
 /**
  * 组装会话 HTTP 接口，并在开始处理请求前结算遗留 Turn。
@@ -20,8 +38,7 @@ import { localConfig } from "../../../config/local.ts";
  * @returns 尚未监听端口的 Fastify 应用，可用于请求注入测试。
  */
 export function createApp(store: SessionStore, logger = false) {
-  const app = Fastify({ logger });
-  const sessionsPath = `${localConfig.apiPrefix}/sessions`;
+  const app = createHttpApp(logger);
 
   app.addHook("onReady", async () => {
     store.recoverInterruptedTurns();
@@ -30,10 +47,6 @@ export function createApp(store: SessionStore, logger = false) {
   app.addHook("onClose", async () => {
     store.close();
   });
-
-  app.get(`${localConfig.apiPrefix}${healthPath}`, async () =>
-    healthResponseSchema.parse({ status: "ok" }),
-  );
 
   app.post(sessionsPath, async (request, reply) => {
     const body = createSessionRequestSchema.safeParse(
@@ -80,5 +93,57 @@ export function createApp(store: SessionStore, logger = false) {
     });
   });
 
+  return app;
+}
+
+/**
+ * 取得新版库的在线实例锁并组装会话创建和持久历史接口。应用开始服务前完成遗留会话修复。
+ * @param path - 新版库路径，父目录必须存在。
+ * @param logger - 是否启用 HTTP 日志，默认关闭。
+ * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
+ * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
+ */
+export async function createEventSessionApp(path: string, logger = false) {
+  const ownership = await acquireInstanceOwnership(path);
+  let persistence: SqliteSessionPersistence;
+  try {
+    persistence = new SqliteSessionPersistence(path);
+  } catch (error) {
+    await ownership.release();
+    throw error;
+  }
+  const app = createHttpApp(logger);
+  app.addHook("onReady", async () => {
+    for (const { header } of await persistence.list()) {
+      const handle = await persistence.open(header.sessionId, "write");
+      if (!handle) throw new Error(`待恢复会话已不可见: ${header.sessionId}`);
+      try {
+        await recoverInterruptedSession(handle);
+      } finally {
+        await handle.close();
+      }
+    }
+  });
+  app.addHook("onClose", async () => {
+    try {
+      await persistence.close();
+    } finally {
+      await ownership.release();
+    }
+  });
+  app.post(sessionsPath, async (request, reply) => {
+    const body = createSessionRequestSchema.safeParse(request.body === undefined ? {} : request.body);
+    if (!body.success) return reply.code(400).send({ code: "invalid_request" });
+    const sessionId = randomUUID();
+    await createPersistedSession(persistence, { sessionId, createdAt: Date.now() });
+    return reply.code(201).send(createSessionResponseSchema.parse({ sessionId }));
+  });
+  app.get(`${sessionsPath}/:sessionId`, async (request, reply) => {
+    const params = sessionParamsSchema.safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ code: "invalid_request" });
+    const history = await readPersistedSessionHistory(persistence, params.data.sessionId);
+    if (!history) return reply.code(404).send({ code: "session_not_found" });
+    return rawSessionHistorySchema.parse(history);
+  });
   return app;
 }

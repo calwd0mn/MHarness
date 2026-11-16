@@ -23,3 +23,7 @@ export type {
   SessionParams,
   SubmitMessageRequest,
 } from "./submission.ts";
+export { rawSessionEventFrameSchema, rawSessionHistorySchema } from "./raw-history.ts";
+export type { RawSessionEventFrame, RawSessionHistory } from "./raw-history.ts";
+export { promptRequestSchema, promptResponseSchema } from "./prompt.ts";
+export type { PromptRequest, PromptResponse } from "./prompt.ts";

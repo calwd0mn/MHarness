@@ -1,13 +1,20 @@
 import { SessionStore } from "@mharness/session/server";
-import { mkdirSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { localConfig } from "../../../config/local.ts";
-import { createApp } from "./app.ts";
+import { createApp, createEventSessionApp } from "./app.ts";
 
-const dataDirectory = new URL("../../../data/", import.meta.url);
-mkdirSync(dataDirectory, { recursive: true });
-const store = new SessionStore(fileURLToPath(new URL("mharness.sqlite", dataDirectory)));
-const app = createApp(store, true);
+const repository = fileURLToPath(new URL("../../../", import.meta.url));
+const configuredPath = process.env[localConfig.sessionDatabasePathVariable];
+if (configuredPath !== undefined && !configuredPath.trim()) {
+  throw new Error(`${localConfig.sessionDatabasePathVariable} 需要非空的新版数据库路径`);
+}
+const databasePath = resolve(repository, configuredPath ?? "data/mharness.sqlite");
+await mkdir(dirname(databasePath), { recursive: true });
+const app = configuredPath === undefined
+  ? createApp(new SessionStore(databasePath), true)
+  : await createEventSessionApp(databasePath, true);
 
 function shutdown() {
   void app.close().catch((error: unknown) => {
