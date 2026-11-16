@@ -863,7 +863,10 @@ test("批次前取消不派发并保留工具配对", async () => {
   })({ session, turn: 1, step: 1, signal: controller.signal, publish: (notice) => { if (notice.type === "assistant/end") controller.abort(); }, blockStorage: () => assert.fail() });
   assert.equal(batches, 0);
   const events = session.snapshot().events;
-  assert.equal(events.find((e) => e.type === "tool/result")?.data.error?.code, "TOOL_NOT_STARTED");
+  const result = events.find((e) => e.type === "tool/result");
+  assert.equal(result?.data.error?.code, "ABORTED_BEFORE_DISPATCH");
+  assert.deepEqual(result?.data.message.content[0].content, [{ type: "text", text: "用户取消，工具未执行。" }]);
+  assert.equal(events.some((e) => e.type === "tool/call" || e.type === "approval/asked"), false);
   const end = events.at(-1);
   assert.equal(end?.type === "turn/end" && end.data.reason.kind, "aborted");
 });

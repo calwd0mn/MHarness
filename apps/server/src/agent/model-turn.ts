@@ -387,7 +387,9 @@ export function createModelTurnDriver(
               else if (batch.kind === "rejected") turnReason = { kind: "blocked" };
               else turnReason = { kind: "error", error: { code: "UNKNOWN", message: "本轮执行失败" } };
             } else {
-              for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message: "工具尚未派发", info: { name: "ToolError", code: "TOOL_NOT_STARTED" } }, content: [{ type: "text", text: "工具尚未派发" }] });
+              const message = signal.aborted ? "用户取消，工具未执行。" : "工具尚未派发";
+              const code = signal.aborted ? "ABORTED_BEFORE_DISPATCH" : "TOOL_NOT_STARTED";
+              for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message, info: { name: "ToolError", code } }, content: [{ type: "text", text: message }] });
               if (signal.aborted) turnReason = { kind: "aborted", reason: "user" };
               else if (options.toolRegistry && count + 1 >= maxSteps && finish.kind === "tool_calls") turnReason = { kind: "error", error: { code: "MAX_STEPS", message: "模型步数预算已耗尽" } };
             }
