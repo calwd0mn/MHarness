@@ -1,0 +1,5 @@
+.markdown { min-width: 0; overflow-wrap: anywhere; }
+.markdown pre { overflow: auto; white-space: pre; margin: 0; padding: 16px; }
+.markdown code { font-family: var(--mh-font-mono); }
+.code { border-radius: 16px; background: var(--mh-surface-muted); overflow: hidden; }
+.code button { margin: 8px; }

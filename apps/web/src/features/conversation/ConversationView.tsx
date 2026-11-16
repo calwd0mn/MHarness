@@ -1,3 +1,4 @@
+import { AssistantMarkdown } from "./AssistantMarkdown.tsx";
 import { Button } from "../../components/ui/Button.tsx";
 import { lastTurn } from "../../session/view.ts";
 import type { useConversation } from "../../session/use-conversation.ts";
@@ -109,7 +110,8 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
               className={message.role === "你" ? "user" : "assistant"}
             >
               <strong>{message.role}</strong>
-              <p>{message.text}</p>
+              {message.reasoning && <details><summary>推理</summary><p>{message.reasoning}</p></details>}
+              {message.role === "助手" ? <AssistantMarkdown text={message.text} /> : <p>{message.text}</p>}
               {message.note && <small>{message.note}</small>}
             </article>
           ))}
@@ -162,4 +164,5 @@ export function Composer({ text, setText, selected, submission, send }: Pick<Ret
         </form>
   );
 }
+
 

@@ -1,7 +1,7 @@
 import type { RawSessionEventFrame } from "@mharness/session/contracts";
 import type { FollowState } from "./follow-controller.ts";
 
-type Message = { key: string; role: string; text: string; note?: string };
+type Message = { key: string; role: string; text: string; note?: string; reasoning?: string };
 /** 根据原始事件和实时草稿构造消息；结算等待期间仅显示草稿。 */
 export function messages(state: FollowState): Message[] {
   const result: Message[] = [];
@@ -35,11 +35,13 @@ export function messages(state: FollowState): Message[] {
         .filter((block) => block.type === "text")
         .map((block) => block.text)
         .join("");
-      if (text)
+      const reasoning = event.data.message.content.filter((block) => block.type === "reasoning").map((block) => block.text).join("");
+      if (text || reasoning)
         result.push({
           key: state.settledNodeIds[event.seq] ?? `event-${event.seq}`,
           role: "助手",
           text,
+          reasoning,
         });
     }
     if (event.type === "assistant/attempt" && event.data.text)
@@ -55,12 +57,14 @@ export function messages(state: FollowState): Message[] {
       .filter((chunk) => chunk.type === "text")
       .map((chunk) => chunk.delta)
       .join("");
-    if (text)
+    const reasoning = state.draft.chunks.filter((chunk) => chunk.type === "reasoning").map((chunk) => chunk.delta).join("");
+    if (text || reasoning)
       result.push({
         key: state.draft.nodeId,
         role: "助手",
         text,
         note: "正在生成",
+        reasoning,
       });
   }
   return result;

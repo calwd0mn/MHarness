@@ -217,3 +217,30 @@ test("发送保留原文空白，迟到忙碌响应不覆盖新草稿", async ()
   await click(button("会话 1"));
   expect(container.querySelector("textarea").value).toBe("新草稿");
 });
+
+test("助手 Markdown 安全显示链接、代码并可复制", async () => {
+  const { AssistantMarkdown } = await import("./features/conversation/AssistantMarkdown.tsx");
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  await act(async () => root.render(<AssistantMarkdown text={'# 标题\n\n<script>alert(1)</script>\n\n[危险](javascript:alert(1)) [安全](https://example.com)\n\n```js\nconst x = 1;\n```'} />));
+  expect(container.querySelector("h1").textContent).toBe("标题");
+  expect(container.querySelector("script")).toBeNull();
+  expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+  expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+  await click(button("复制"));
+  expect(writeText).toHaveBeenCalledWith("const x = 1;\n");
+  expect(container.textContent).toContain("已复制");
+});
+
+
+test("流式推理独立折叠，未闭合代码块可读且复制失败可见", async () => {
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 })];
+  const stream = { revision: 1, activeAttempt: { attemptId: "draft", turn: 1, step: 1, chunks: [{ type: "reasoning", delta: "思考内容" }, { type: "text", delta: "```js\n未完成" }], nextIndex: 2 } };
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+  await sendFrame(connections[0], snapshot("a", records, stream));
+  expect(container.querySelector("details summary").textContent).toContain("推理");
+  expect(container.querySelector("details").textContent).toContain("思考内容");
+  expect(container.querySelector("pre").textContent).toContain("未完成");
+  await click(button("复制"));
+  expect(container.textContent).toContain("复制失败");
+});
