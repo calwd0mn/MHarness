@@ -120,6 +120,7 @@ function compact(entries: { time: number; chunk: LlmChunk }[]) {
 /**
  * 创建有限步数的 Turn 驱动，检查点成功后启动模型并结算每个 Step。
  * 未配置工具注册表时工具调用追加 TOOL_NOT_STARTED 并以 blocked 结束；耗尽步数时不再派发。
+ * 已完成批次中的成功结束意向使 Turn 以 completed 结束，不再请求模型续答。
  * @param options - Runtime 及每次请求读取的配置和系统提示词。
  * @returns 可注入 Agent 的异步驱动；取消信号传给当前模型请求和工具批次。
  */
@@ -382,7 +383,10 @@ export function createModelTurnDriver(
                 throw error;
               }
               const batch = await runToolBatch(session, options.toolRegistry!, approvals, { turn, step }, toolCalls, signal, checkpoint, storageFailure);
-              if (batch.kind === "completed") continued = true;
+              if (batch.kind === "completed") {
+                if (batch.concludeTurn) turnReason = { kind: "completed" };
+                else continued = true;
+              }
               else if (batch.kind === "aborted") turnReason = { kind: "aborted", reason: "user" };
               else if (batch.kind === "rejected") turnReason = { kind: "blocked" };
               else turnReason = { kind: "error", error: { code: "UNKNOWN", message: "本轮执行失败" } };
