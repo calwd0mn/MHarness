@@ -11,6 +11,14 @@ pnpm dev
 
 `pnpm typecheck` 检查全部工作区包的 TypeScript 类型。
 
+## 工具基础模块
+
+`apps/server/src/tools/` 提供本地工具注册、参数准备、结构化结果归一化和 Session 结果追加入口。输入 Zod 定义同时导出模型可见 JSON Schema，准备失败区分未知工具、非法 JSON 与参数不符合约束；准备不会请求审批或执行正文。调用方执行已准备调用前须完成审批、持久化检查点与取消检查。
+
+本地成功值通过输出契约校验后，从同份不可变参数和值派生模型内容及展示数据。普通异常只返回安全说明。Session 结果保存已派生内容、展示元数据和可用错误分类，省略原始业务值；重放不会重新渲染。`pnpm --filter @mharness/server test` 包含输入 JSON Schema 对照、结果失败及 SQLite 重开测试。
+
+这些基础入口尚未接入正式 Turn 的工具批次；审批、MCP、超时与工具页面交互仍按 OpenSpec 后续任务推进。
+
 ## Session 模块
 
 - 浏览器契约入口为 `@mharness/session/contracts`，共享原始事件 Schema、持久历史封装及 prompt 契约。
