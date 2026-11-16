@@ -21,9 +21,19 @@ export function useApprovals() {
   const [, render] = useState(0);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   function publish() { if (mounted.current) render((version) => version + 1); }
+  /** 按会话、审批及操作身份读取页面内状态；尚无请求时返回 undefined。
+   * @param session - 审批所属会话标识。
+   * @param approval - 审批标识。
+   * @param operation - 审批绑定的操作标识。
+   * @returns 当前请求状态，或尚未提交时的 undefined。
+   */
   function get(session: string, approval: string, operation: string) {
     return entries.current.get(identity(session, approval, operation))?.state;
   }
+  /** 用当前会话的权威事件关闭已结算请求，并使其在途令牌失效。
+   * @param session - 事件窗口所属会话。
+   * @param records - 按序接纳的完整原始事件窗口。
+   */
   function observe(session: string, records: readonly RawSessionEventFrame[]) {
     let changed = false;
     for (const tool of projectTools(records)) {
@@ -38,6 +48,13 @@ export function useApprovals() {
     }
     if (changed) publish();
   }
+  /** 对指定审批提交决定；相同身份已有请求或终态时不再发送。
+   * @param session - 审批所属会话。
+   * @param approval - 审批标识。
+   * @param operation - 绑定操作标识，用于隔离替代请求。
+   * @param outcome - 单次允许或拒绝；未知结果后仅可重试原决定。
+   * @returns 请求及响应处理结束时兑现；卸载页面不取消已发送的后端请求。
+   */
   async function submit(session: string, approval: string, operation: string, outcome: ApprovalOutcome) {
     const key = identity(session, approval, operation);
     const previous = entries.current.get(key)?.state;

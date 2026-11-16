@@ -13,7 +13,15 @@ const records = [
   frame(5, "tool/operation", { turn: 1, step: 1, callId: "call", operationId: "op", toolName: "示例工具", toolVersion: "1.0", validatedArgs: { query: "隔离夹具" } }),
   frame(6, "approval/asked", { id: "approval", operationId: "op", toolName: "示例工具", reason: "隔离审批示例" }),
 ];
-const mode = new URLSearchParams(location.search).get("theme");
+const parameters = new URLSearchParams(location.search);
+const mode = parameters.get("theme");
+const scenario = parameters.get("scenario");
+const complete = [...records,
+  frame(7, "tool/result", { turn: 1, step: 1, operationId: "op", message: { id: "result", role: "user", source: { kind: "tool", callId: "call" }, content: [{ type: "tool-result", toolCallId: "call", isError: false, content: [{ type: "text", text: "隔离工具结果" }] }] } }, { surfaceOp: "append", sourceEventSeqs: [4] }),
+  frame(8, "step/end", { turn: 1, step: 1 }),
+  frame(9, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+];
+let fixtureConnections = 0;
 if (mode === "light" || mode === "dark") {
   const light = { "--mh-workspace": "#fff", "--mh-sidebar": "#f9fafb", "--mh-surface": "#fff", "--mh-surface-muted": "#f5f6f7", "--mh-text": "#0f1115", "--mh-text-secondary": "#61666b", "--mh-text-muted": "#727780", "--mh-line": "rgb(0 0 0 / 8%)", "--mh-stroke": "rgb(0 0 0 / 14%)", "--mh-hover": "rgb(38 49 72 / 6%)", "--mh-active": "rgb(38 49 72 / 10%)", "--mh-primary": "#0f1115", "--mh-primary-hover": "#43454a", "--mh-on-primary": "#fff", "--mh-focus": "#4176e6", "--mh-error": "#b42318", "--mh-error-surface": "#fff4f2", "--mh-selection": "#e4edfd" };
   const dark = { "--mh-workspace": "#232324", "--mh-sidebar": "#1b1b1c", "--mh-surface": "#2c2c2e", "--mh-surface-muted": "#353638", "--mh-text": "#f9fafb", "--mh-text-secondary": "#cfd3d6", "--mh-text-muted": "#adb2b8", "--mh-line": "rgb(255 255 255 / 8%)", "--mh-stroke": "rgb(255 255 255 / 16%)", "--mh-hover": "rgb(255 255 255 / 8%)", "--mh-active": "rgb(255 255 255 / 14%)", "--mh-primary": "#f9fafb", "--mh-primary-hover": "#ebeef2", "--mh-on-primary": "#0f1115", "--mh-focus": "#83aaff", "--mh-error": "#ffaaa2", "--mh-error-surface": "#3a2424", "--mh-selection": "#34415b" };
@@ -26,8 +34,12 @@ class FixtureSource {
   onerror: (() => void) | null = null;
   constructor(url: string) {
     const id = decodeURIComponent(url.split("/").at(-2) ?? "fixture");
-    const windowRecords = id === "fixture" ? records : [];
-    queueMicrotask(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "snapshot", sessionId: id, inheritedEventCount: 0, cursor: windowRecords.length - 1, records: windowRecords, assistantStream: { revision: 0 } }) })));
+    const windowRecords = id === "fixture" ? (scenario === "result" ? complete : records) : [];
+    const fail = id === "fixture" && scenario === "failed" && fixtureConnections++ === 0;
+    queueMicrotask(() => {
+      this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "snapshot", sessionId: id, inheritedEventCount: 0, cursor: windowRecords.length - 1, records: windowRecords, assistantStream: { revision: 0 } }) }));
+      if (fail) setTimeout(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "error", error: { code: "follow_sync_failed", message: "隔离同步故障", details: {} } }) })), 100);
+    });
   }
   close() {}
 }

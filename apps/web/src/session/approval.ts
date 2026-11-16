@@ -3,7 +3,7 @@ import { localConfig } from "../../../../config/local.ts";
 /** 审批答复只支持单次允许或拒绝。 */
 export type ApprovalOutcome = "allowed-once" | "rejected";
 /** HTTP 替身适配的答复结果；unknown 表示不能确认服务端是否保存。 */
-export type ApprovalResponse = { kind: "decided"; outcome: ApprovalOutcome | "cancelled" | "unavailable" } | { kind: "inactive" | "missing" | "unknown" };
+export type ApprovalResponse = { kind: "decided"; outcome: ApprovalOutcome | "cancelled" | "unavailable" } | { kind: "inactive" } | { kind: "missing" } | { kind: "unknown" };
 
 /** 提交指定审批决定；网络失败或无法识别的响应返回 unknown，调用方可用同一决定重试。
  * @param sessionId - 审批所属会话。

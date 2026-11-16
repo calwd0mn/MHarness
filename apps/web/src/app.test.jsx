@@ -525,3 +525,45 @@ test("审批请求切走后 HTTP 确认仍归原会话，切回可见", async ()
   expect(container.textContent).toContain("已允许");
   expect(container.textContent).toContain("等待结果");
 });
+
+const completeWindow = () => [
+  record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 }),
+  record(2, "user/message", { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [{ type: "text", text: "查询" }] }, { surfaceOp: "append" }),
+  record(3, "assistant/message", { turn: 1, step: 1, message: { id: "m", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "text", text: "准备查询" }, { type: "tool-call", id: "x", name: "工具", arguments: "{}" }] }, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true }, { surfaceOp: "append" }),
+  record(4, "tool/call", { turn: 1, step: 1, callId: "x", name: "工具", arguments: "{}" }),
+  record(5, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op", toolName: "工具", toolVersion: "1", validatedArgs: {} }),
+  record(6, "approval/asked", { id: "p", operationId: "op", toolName: "工具", reason: "原因" }),
+];
+const toolResult = () => record(7, "tool/result", { turn: 1, step: 1, operationId: "op", message: { id: "result", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "工具结果" }] }] } }, { surfaceOp: "append", sourceEventSeqs: [4] });
+
+test("完整事件增量展示正文和工具结果，终态关闭审批并保留历史", async () => {
+  const events = completeWindow(); await sendFrame(connections[0], snapshot("a", events));
+  let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await click(button("单次允许"));
+  await sendFrame(connections[0], toolResult());
+  expect(container.textContent).toContain("查询"); expect(container.textContent).toContain("准备查询");
+  expect(container.textContent).toContain("工具结果"); expect(button("单次允许")).toBeFalsy();
+  await sendFrame(connections[0], record(8, "step/end", { turn: 1, step: 1 }));
+  await sendFrame(connections[0], record(9, "turn/end", { turn: 1, reason: { kind: "completed" } }));
+  await act(async () => resolve({ status: 200, ok: true, json: async () => ({ id: "p", outcome: "allowed-once" }) })); await flush();
+  expect(container.textContent).toContain("工具结果"); expect(container.textContent).toContain("本轮结束：completed");
+  expect(container.textContent).not.toContain("已允许");
+});
+
+test("同步终止失败保留工具历史但禁用审批，快照恢复后启用", async () => {
+  const events = completeWindow(); await sendFrame(connections[0], snapshot("a", events));
+  await sendFrame(connections[0], { type: "error", error: { code: "follow_sync_failed", message: "同步故障", details: {} } });
+  expect(container.textContent).toContain("准备查询"); expect(container.textContent).toContain("工具");
+  expect(button("单次允许").disabled).toBe(true);
+  await click(button("重新同步")); await sendFrame(connections[1], snapshot("a", events));
+  expect(button("单次允许").disabled).toBe(false);
+});
+
+test("没有工具结果的轮次终态关闭待审批操作", async () => {
+  await sendFrame(connections[0], snapshot("a", completeWindow()));
+  await sendFrame(connections[0], record(7, "step/end", { turn: 1, step: 1 }));
+  await sendFrame(connections[0], record(8, "turn/end", { turn: 1, reason: { kind: "interrupted" } }));
+  expect(button("单次允许")).toBeFalsy();
+  expect(container.textContent).toContain("审批已失效");
+  expect(container.textContent).toContain("准备查询");
+});
