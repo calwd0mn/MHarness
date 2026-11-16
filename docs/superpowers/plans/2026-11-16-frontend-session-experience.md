@@ -35,3 +35,11 @@ Markdown 固定采用 react-markdown 10.1.0，官方发布页 https://github.com
 隔离夹具：`apps/web/fixture.html`，本地模拟 follow、HTTP；`?theme=light`/`?theme=dark` 可切换夹具主题，不接数据库或真实工具。开发中 IAB 实验：深色 1280×720 与 390×844 无横向溢出且输入可见；展开工具后 resize 到窄屏底部差约 0.14px；640×320 文档可滚动，输入聚焦后可见；浅色窄屏导航折叠、新建及切换草稿和审批答复可操作。以上是开发中初验，最终提交重载、截图及触屏 hover、真实媒体偏好、缩放等尚由独立浏览器验收确认，不以 DOM 测试替代。6.3/6.4 正式后端联调未完成，不予勾选。
 
 最终浏览器复验（IAB Chromium，代码提交 `e6e65ba`）：light 1280×720 的新建、取消、允许、拒绝均实测 H36/R12；审批详情 Enter 确认后摘要为等待结果、详情为已允许且按钮移除。dark 390×844 导航折叠及审批可操作、无横向溢出，Tab 聚焦允许按钮具有实线焦点轮廓。截图：`C:/Users/Risc4/.codex/visualizations/2026/11/16/01a1e461-3f4e-7bf1-9044-a968c96bc170/frontend-session-desktop-light.jpg`、`C:/Users/Risc4/.codex/visualizations/2026/11/16/01a1e461-3f4e-7bf1-9044-a968c96bc170/frontend-session-mobile-dark.jpg`。真实系统主题切换、触屏 hover 媒体仿真、reduced-motion 媒体仿真、实际浏览器缩放未验收；夹具强制主题和 viewport 不等同这些检查。
+
+## 独立审查后的修复（2026-11-16）
+
+- 6.11 `5d654e0`（父 `3966364`）：主动编辑并清空后迟到 409、创建成功抢选择、创建失败串通知三项均先失败后通过；补卸载不订阅回归，原忙碌无编辑恢复测试继续通过。
+- 6.12 `2d2bad7`（父 `5d654e0`）：无正文 failed/cancelled/truncated 与后续 Turn 回归先失败后通过；状态行不暴露 reason、不生成空助手消息。
+- 6.15 `1fbcd0e`（父 `2d2bad7`）：unknown 切回丢重试约束和 pending 切回解锁两项先失败后通过；补事件先到、跨切换迟到 HTTP 与原会话归属。`e5025c5` 精确拆分答复结果类型并补充控制方法契约，`abe30ad` 修正卡片参数说明。
+- 6.16 `e5025c5`（父 `1fbcd0e`）：真实 App 的完整事件窗口、结果/终态关闭和同步失败/恢复三项新增测试首次即通过，是此前验收覆盖缺口，非虚报 red。隔离夹具可用 `fixture.html?scenario=result` 检查工具结果与轮次终态，`fixture.html?scenario=failed` 检查同步失败后点击重新同步恢复；可与 `theme=light` 或 `theme=dark` 组合。
+- 新鲜执行 `pnpm typecheck`、`pnpm --filter @mharness/web test`（Session 40、App 46）、`pnpm --filter @mharness/web build` 和 `git diff --check 4856b44..HEAD` 均通过。构建保留既有 Zod/Rollup 注释警告。以上修复等待独立复核，不替代复核结论；正式 6.3/6.4 联调仍未完成。
