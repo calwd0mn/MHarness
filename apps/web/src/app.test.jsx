@@ -187,3 +187,33 @@ test("通用按钮在忙碌时禁用并提供文字反馈", async () => {
   expect(control.getAttribute("aria-busy")).toBe("true");
   expect(control.textContent).toContain("处理中");
 });
+
+test("切换会话时分别保留编辑草稿和输入焦点节点", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  const input = container.querySelector("textarea");
+  input.focus();
+  await enter("甲草稿");
+  await click(button("会话 2"));
+  await sendFrame(connections[1], snapshot("b"));
+  expect(container.querySelector("textarea")).toBe(input);
+  expect(input.value).toBe("");
+  await enter("乙草稿");
+  await click(button("会话 1"));
+  await sendFrame(connections[2], snapshot("a"));
+  expect(input.value).toBe("甲草稿");
+  await click(button("会话 2"));
+  expect(input.value).toBe("乙草稿");
+});
+
+test("发送保留原文空白，迟到忙碌响应不覆盖新草稿", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let resolve;
+  fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
+  await enter("  原文\n"); await submit();
+  expect(JSON.parse(fetch.mock.calls[0][1].body).content[0].text).toBe("  原文\n");
+  await enter("新草稿");
+  await click(button("会话 2"));
+  await act(async () => resolve({ status: 409, ok: false })); await flush();
+  await click(button("会话 1"));
+  expect(container.querySelector("textarea").value).toBe("新草稿");
+});
