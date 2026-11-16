@@ -27,3 +27,5 @@ export { rawSessionEventFrameSchema, rawSessionHistorySchema } from "./raw-histo
 export type { RawSessionEventFrame, RawSessionHistory } from "./raw-history.ts";
 export { promptRequestSchema, promptResponseSchema } from "./prompt.ts";
 export type { PromptRequest, PromptResponse } from "./prompt.ts";
+export { approvalDecisionRequestSchema, approvalDecisionSchema } from "./approval.ts";
+export type { ApprovalReply, ApprovalOutcome } from "./approval.ts";
