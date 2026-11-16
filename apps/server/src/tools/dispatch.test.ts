@@ -214,3 +214,21 @@ test("停止等待的取消不会渲染迟到值，本地协作取消仍可确�
     assert.equal(outcome.kind, executionBoundary === "local" ? "completed" : "aborted");
   }
 });
+
+test("派发拒绝超出计时器上界的超时并接受上界", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let called = false;
+  const policy = { executionBoundary: "remote", cancellationGuarantee: "none" } as const;
+  assert.throws(() => new ToolDispatch<string>().dispatch(async () => { called = true; return "unexpected"; }, { ...policy, timeoutMs: 2_147_483_648 }));
+  assert.equal(called, false);
+  const gate = new ToolDispatch<string>();
+  const work = deferred<string>();
+  let settled = false;
+  const result = gate.dispatch(() => work.promise, { ...policy, timeoutMs: 2_147_483_647 });
+  void result.then(() => { settled = true; });
+  t.mock.timers.tick(1);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  work.resolve("完成");
+  assert.deepEqual(await result, { kind: "completed", value: "完成" });
+});

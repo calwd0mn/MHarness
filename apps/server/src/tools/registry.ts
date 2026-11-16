@@ -12,6 +12,7 @@ export interface ToolGovernance {
   readonly supportsIdempotency: boolean;
   readonly supportsResultQuery: boolean;
   readonly approvalPolicy: "allow" | "deny" | "ask";
+  /** 等待时间以毫秒计，必须大于 0 且不超过 2_147_483_647。 */
   readonly timeoutMs: number;
 }
 type GovernanceOptions = Partial<Omit<ToolGovernance, "executionBoundary">>;
@@ -46,7 +47,7 @@ interface LocalTool {
 }
 function governance(options: GovernanceOptions, executionBoundary: "local" | "remote"): ToolGovernance {
   const timeoutMs = options.timeoutMs ?? localConfig.tools.timeoutMs;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("timeoutMs 必须为正有限数");
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) throw new Error("timeoutMs 必须大于 0 且不超过 2_147_483_647 毫秒");
   const sideEffect = options.sideEffect ?? "unknown";
   return Object.freeze({ executionBoundary, cancellationGuarantee: options.cancellationGuarantee ?? "none", sideEffect,
     supportsIdempotency: options.supportsIdempotency ?? false, supportsResultQuery: options.supportsResultQuery ?? false,
@@ -64,7 +65,7 @@ function freezeJson(value: unknown): void {
 /**
  * 以同一 Zod 定义创建本地工具并推导正文参数类型，不调用正文。
  * 仅支持严格对象与可等价导出的 JSON 子集；转换、自定义校验和默认值会被拒绝。
- * @param options - 可信身份、输入与输出定义、治理配置、结束意向和正文；未提供超时时采用集中默认值，未提供输出定义时不能产生规范化成功结果。
+ * @param options - 可信身份、输入与输出定义、治理配置、结束意向和正文；超时须大于 0 且不超过 2_147_483_647 毫秒，未提供时采用集中默认值；未提供输出定义时不能产生规范化成功结果。
  * @returns 可注册的本地工具。
  * @throws 输入定义不受支持或超时无效时抛出错误。
  */
@@ -100,7 +101,7 @@ export class ToolRegistry {
   }
   /**
    * 保存远程治理信息，不提供远程输入校验或派发；地址不改变取消退出保证。
-   * @param options - 可信远程工具注册信息；未提供超时时采用集中默认值。
+   * @param options - 可信远程工具注册信息；超时须大于 0 且不超过 2_147_483_647 毫秒，未提供时采用集中默认值。
    * @throws 名称重复或超时无效时抛出错误。
    */
   registerRemote(options: GovernanceOptions & { name: string; version: string; executionBoundary: "remote"; endpoint: string }): void {

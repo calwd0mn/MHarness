@@ -15,7 +15,7 @@ type Guarantee = "cooperative-exit" | "none";
 export interface DispatchPolicy {
   readonly executionBoundary: "local" | "remote";
   readonly cancellationGuarantee: Guarantee;
-  /** 从派发正文开始计算的等待时间，单位为毫秒。 */
+  /** 从派发正文开始计算的等待时间，单位为毫秒，必须大于 0 且不超过 2_147_483_647。 */
   readonly timeoutMs: number;
 }
 
@@ -74,7 +74,7 @@ export class ToolDispatch<T> {
   dispatch(body: (signal: AbortSignal) => Promise<T>, policy: DispatchPolicy): Promise<DispatchOutcome<T>>;
   dispatch(body: (signal: AbortSignal) => Promise<T>, policy: Guarantee | DispatchPolicy): Promise<DispatchOutcome<T>> {
     if (this.dispatched) throw new Error("工具调用不能重复派发");
-    if (typeof policy !== "string" && (!Number.isFinite(policy.timeoutMs) || policy.timeoutMs <= 0)) throw new Error("timeoutMs 必须为正有限数");
+    if (typeof policy !== "string" && (!Number.isFinite(policy.timeoutMs) || policy.timeoutMs <= 0 || policy.timeoutMs > 2_147_483_647)) throw new Error("timeoutMs 必须大于 0 且不超过 2_147_483_647 毫秒");
     this.dispatched = true;
     if (this.state === "settled") return this.result;
     this.waitForExit = typeof policy === "string" ? policy === "cooperative-exit" : policy.executionBoundary === "local" && policy.cancellationGuarantee === "cooperative-exit";
