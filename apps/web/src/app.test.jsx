@@ -258,3 +258,32 @@ test("阅读位置按会话保存，主动上滚后可返回最新", async () =>
   expect(area.scrollTop).toBe(1000);
   expect(button("返回最新")).toBeFalsy();
 });
+
+test("工具投影按 Step 区分复用的调用编号并保留结果和参数", async () => {
+  const { projectTools } = await import("./session/tools.ts");
+  const events = [
+    record(0, "tool/call", { turn: 1, step: 1, callId: "x", name: "one", arguments: '{"raw":1}' }),
+    record(1, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op1", toolName: "one", toolVersion: "1", validatedArgs: { value: 1 } }),
+    record(2, "tool/call", { turn: 1, step: 2, callId: "x", name: "two", arguments: "{}" }),
+    record(3, "tool/result", { turn: 1, step: 1, operationId: "op1", message: { id: "r", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "完成" }] }] }, meta: { extra: "保留" } }, { surfaceOp: "append", sourceEventSeqs: [0] }),
+  ];
+  const tools = projectTools(events);
+  expect(tools).toHaveLength(2);
+  expect(tools[0]).toMatchObject({ name: "one", status: "成功", rawArguments: '{"raw":1}', operationId: "op1", version: "1", validatedArgs: { value: 1 } });
+  expect(tools[1]).toMatchObject({ name: "two", status: "准备调用" });
+  expect(JSON.stringify(tools[0])).toContain("保留");
+  expect(projectTools(events.slice(0, 3))[1].status).toBe("准备调用");
+});
+
+test("切回会话时等快照内容安装后恢复被空画面夹取的位置", async () => {
+  await sendFrame(connections[0], snapshot("a", [userRecord("a")]));
+  const area = container.querySelector(".messages");
+  let top = 0;
+  Object.defineProperties(area, { scrollHeight: { configurable: true, get: () => container.querySelector("article.user") ? 1000 : 200 }, clientHeight: { configurable: true, value: 200 }, scrollTop: { configurable: true, get: () => top, set: value => { top = Math.max(0, Math.min(value, area.scrollHeight - area.clientHeight)); } } });
+  await act(async () => { area.scrollTop = 100; area.dispatchEvent(new Event("scroll")); });
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1"));
+  expect(area.scrollTop).toBe(0);
+  await sendFrame(connections[2], snapshot("a", [userRecord("a")]));
+  expect(area.scrollTop).toBe(100);
+});

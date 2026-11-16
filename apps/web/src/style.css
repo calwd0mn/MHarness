@@ -204,4 +204,5 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 
-`n.messages .return-latest { position: sticky; bottom: 0; align-self: center; background: var(--mh-surface); box-shadow: 0 0 0 1px var(--mh-stroke); }
+
+.messages .return-latest { position: sticky; bottom: 0; align-self: center; background: var(--mh-surface); box-shadow: 0 0 0 1px var(--mh-stroke); }

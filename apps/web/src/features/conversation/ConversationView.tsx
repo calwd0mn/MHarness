@@ -1,3 +1,5 @@
+import { projectTools } from "../../session/tools.ts";
+import { ToolCard } from "./ToolCard.tsx";
 import { useLayoutEffect, useRef, useState } from "react";
 import { AssistantMarkdown } from "./AssistantMarkdown.tsx";
 import { Button } from "../../components/ui/Button.tsx";
@@ -81,9 +83,11 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
   const area = useRef<HTMLDivElement>(null);
   const positions = useRef<Record<string, { top: number; following: boolean }>>({});
   const [following, setFollowing] = useState(true);
+  const restored = useRef<string | null>(null);
   useLayoutEffect(() => {
     const node = area.current;
     if (!node || !selected) return;
+    restored.current = null;
     const saved = positions.current[selected] ?? { top: 0, following: true };
     setFollowing(saved.following);
     node.scrollTop = saved.following ? node.scrollHeight : saved.top;
@@ -91,6 +95,11 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
   useLayoutEffect(() => {
     const node = area.current;
     if (!node || !selected) return;
+    if (state.sessionId === selected && state.status === "ready" && restored.current !== selected) {
+      const saved = positions.current[selected];
+      if (saved && !saved.following) node.scrollTop = saved.top;
+      restored.current = selected;
+    }
     const follow = () => { if (positions.current[selected]?.following !== false) node.scrollTop = node.scrollHeight; };
     follow();
     const observer = new MutationObserver(follow);
@@ -149,6 +158,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
               {message.note && <small>{message.note}</small>}
             </article>
           ))}
+          {state.sessionId === selected && projectTools(state.records).map((tool) => <ToolCard key={tool.key} tool={tool} />)}
           {submission && !confirmedRecord && (
             <article className="user">
               <strong>你</strong>
