@@ -150,11 +150,15 @@ HTTP 历史、SSE 快照和增量 SHALL 使用同一 `{ type: "event", event }` 
 - **THEN** 同步窗口包含压缩和替换事件，聊天继续显示原始问答，模型历史可按 surface 派生摘要
 
 ### Requirement: Attempt 实时帧
-`AssistantStreamAttempt` SHALL 管理 Agent 生命周期内唯一的 `attemptId` 和连续递增的实时 `revision`。`start`、`chunk`、`end` 均携带两者，`start` 和 `end` 还携带 `turn`、`step`。取得异步流对象并检查取消后，读取首个 chunk 前发送 `start`。`chunk.index` 从 0 开始，`end.index` 等于已发送 chunk 数。每次 `start` 后均有对应 `end`，包括零 chunk；发出 `end` 后停止该流的增量。
+每次模型请求 SHALL 拥有 Agent 生命周期内唯一的 `attemptId`。对外实时帧 SHALL 按实际发布顺序分配连续递增的 `revision`。`start`、`chunk`、`end` 均携带两者，`start` 和 `end` 还携带 `turn`、`step`。取得异步流对象并检查取消后，读取首个模型分片前发送 `start`。草稿的 `chunk.index` 从 0 开始，`end.index` 等于已发送草稿分片数。每次 `start` 后均有对应 `end`，包括零分片。发出 `end` 后停止该次增量。
 
 #### Scenario: 按序交付模型增量
 - **WHEN** Attempt 发出 `start` 后产生两个增量
 - **THEN** 两个 `chunk` 的 `index` 分别为 0、1，随后 `end.index` 为 2，实时 `revision` 连续
+
+#### Scenario: 内部事件穿插在草稿分片之间
+- **WHEN** 统一流在两个草稿增量之间交付内容块边界，或在结尾交付 `usage` 与 `finish`
+- **THEN** 实时订阅与快照活动草稿采用相同投影。实时 `revision` 和草稿 `index` 只按对外帧推进，`end.index` 及快照中的 `nextIndex` 等于各自已包含的草稿分片数
 
 #### Scenario: 开始发布之前的失败或取消
 - **WHEN** 输入准备或持久化检查点失败、取得流对象时同步抛错，或在 `start` 前已取消
@@ -237,11 +241,11 @@ HTTP 历史、SSE 快照和增量 SHALL 使用同一 `{ type: "event", event }` 
 
 ### Requirement: 模型分片与聊天展示
 
-SSE SHALL 在 `assistant-stream` 中交付 `text`、`reasoning` 和 `tool-call-delta` 分片，快照活动草稿 SHALL 使用同一分片格式。Web SHALL 将正文和 reasoning 分开处理，reasoning 可折叠或隐藏。工具参数分片 SHALL 在数据层保留和累积。工具卡片和已结算的正文从原始事件派生。
+SSE SHALL 将模型增量投影为 `assistant-stream` 的 `text`、`reasoning` 和 `tool-call-delta`，活动草稿快照 SHALL 使用同一投影。工具的 `toolIndex` SHALL 按工具块首次出现的顺序从 0 分配。内容块边界、`usage` 和模型 `finish` 通过原始结算记录交付。Web SHALL 分别处理正文和 reasoning，reasoning 可折叠或隐藏。工具参数分片 SHALL 在数据层保留和累积。工具卡片和结算正文从原始事件派生。
 
 #### Scenario: 模型生成工具参数
-- **WHEN** Web 收到尚处于生成阶段的工具参数分片
-- **THEN** 数据层按工具索引累积，页面保留忙碌提示，直到 `tool/call` 到来才建立工具卡片
+- **WHEN** 模型在正文、推理等内容块之后生成工具参数分片
+- **THEN** 首个工具的 `toolIndex` 为 0，数据层按该工具索引累积，页面保留忙碌提示，直到 `tool/call` 到来才建立工具卡片
 
 #### Scenario: 成功消息含 reasoning 或只有工具声明
 - **WHEN** Assistant 消息带 reasoning 块，或内容仅包含工具调用声明

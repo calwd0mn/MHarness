@@ -105,7 +105,7 @@ test("加载通知同步连接观察，取消等待驱动退出并关闭释放�
   let stopped = false;
   const manager = new AgentManager(store, async ({ session, turn, step, signal, publish }) => {
     publish({ type: "assistant/start", attemptId: "a", turn, step });
-    publish({ type: "assistant/chunk", attemptId: "a", index: 0, chunk: { type: "text", delta: "x" } });
+    publish({ type: "assistant/chunk", attemptId: "a", index: 0, chunk: { type: "text-delta", index: 0, text: "x" } });
     await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     publish({ type: "assistant/end", attemptId: "a", turn, step, index: 1, outcome: { kind: "abandoned" } });
     session.append({ type: "step/end", data: { turn, step } });

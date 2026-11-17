@@ -22,12 +22,33 @@ import { ToolRegistry } from "./tools/registry.ts";
 import type { RunTurn } from "./agent/react-agent.ts";
 import { SessionCommandController } from "./commands.ts";
 import { createMockAdapter } from "./model/providers/mock.ts";
+import { createDeepSeekAdapter } from "./model/providers/deepseek.ts";
+import type { ModelConfig } from "./model/runtime.ts";
 import { LlmRuntime } from "./model/runtime.ts";
 import { registerSessionRoutes } from "./session/routes.ts";
 import { ApprovalService } from "./approval/service.ts";
 import { registerApprovalRoutes } from "./approval/routes.ts";
 
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
+
+function configuredModel(): ModelConfig {
+  const provider = process.env.MHARNESS_MODEL_PROVIDER ?? "mock";
+  if (provider === "mock") return { provider, model: "test-model" };
+  if (provider !== "deepseek") throw new TypeError("不支持的模型 Provider");
+  const number = (name: string) => process.env[name] === undefined ? undefined : Number(process.env[name]);
+  const stopValue = process.env.MHARNESS_MODEL_STOP;
+  const stop: unknown = stopValue === undefined ? undefined : JSON.parse(stopValue);
+  if (stop !== undefined && (!Array.isArray(stop) || stop.some((value: unknown) => typeof value !== "string"))) throw new TypeError("MHARNESS_MODEL_STOP 需要 JSON 字符串数组");
+  const maxOutputTokens = number("MHARNESS_MODEL_MAX_TOKENS");
+  const temperature = number("MHARNESS_MODEL_TEMPERATURE");
+  const reasoningEffort = process.env.MHARNESS_MODEL_REASONING_EFFORT;
+  return { provider, model: "deepseek-v4-pro", params: {
+    ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+    ...(temperature === undefined ? {} : { temperature }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...(stop === undefined ? {} : { stop: stop as string[] }),
+  } };
+}
 
 function createHttpApp(logger: boolean) {
   const app = Fastify({ logger });
@@ -108,11 +129,11 @@ export function createApp(store: SessionStore, logger = false) {
  * @param path - 新版库路径，父目录必须存在。
  * @param logger - 是否启用 HTTP 日志，默认关闭。
  * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
- * @param options - 可注入默认驱动的工具注册表与共享审批服务；默认提供 HTTP 审批渠道。
+ * @param options - 可注入工具注册表、共享审批服务和模型 HTTP 传输；默认提供 HTTP 审批渠道。
  * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
  */
-export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService; toolRegistry?: ToolRegistry } = {}) {
+export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService; toolRegistry?: ToolRegistry; modelFetch?: typeof fetch } = {}) {
   const ownership = await acquireInstanceOwnership(path);
   let persistence: SqliteSessionPersistence;
   try {
@@ -132,8 +153,12 @@ export async function createEventSessionApp(path: string, logger = false, runTur
         { delayMs: 150, chunk: { type: "text", delta: text } },
         { chunk: { type: "finish", reason: { kind: "stop" } } },
       ];
-    }) }),
-    config: () => ({ provider: "mock", model: "test-model" }),
+    }), deepseek: () => {
+      const apiKey = process.env.DEEPSEEK_API_KEY;
+      if (!apiKey?.trim()) throw new TypeError("DEEPSEEK_API_KEY 必须配置");
+      return createDeepSeekAdapter({ apiKey, ...(options.modelFetch ? { fetch: options.modelFetch } : {}) });
+    } }),
+    config: configuredModel,
     systemPrompt: () => "你是一个中文助手。",
   });
   const agents = new AgentManager(persistence, driver);

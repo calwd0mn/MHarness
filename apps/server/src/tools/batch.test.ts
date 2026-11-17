@@ -242,7 +242,7 @@ test("真实 Agent 在工具检查点等待期间取消不会执行正文", asyn
   } finally { release(); await manager.close(); await store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test("stop 结束但携带调用时只结算未派发结果", async () => {
+test("stop 结束但携带调用时以协议错误结算且不派发", async () => {
   const session = new Session({ sessionId: "stop-call", createdAt: 0 }); session.bindCheckpoint(async () => {});
   let executions = 0;
   const drive = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => [
@@ -251,7 +251,11 @@ test("stop 结束但携带调用时只结算未派发结果", async () => {
   ]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: makeRegistry((n) => { executions++; return n; }) });
   await drive({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
   assert.equal(executions, 0);
-  assert.equal(session.snapshot().events.find((e) => e.type === "tool/result")?.data.error?.code, "TOOL_NOT_STARTED");
+  const events = session.snapshot().events;
+  const attempt = events.find((event) => event.type === "assistant/attempt");
+  assert.equal(attempt?.data.outcome, "failed");
+  assert.deepEqual(attempt?.data.reason, { code: "PROTOCOL", message: "Provider stream violated the expected protocol" });
+  assert.equal(events.some((event) => event.type === "assistant/message" || event.type === "tool/call" || event.type === "tool/result" || event.type === "approval/asked"), false);
 });
 
 test("审批 asked 与 decided 检查点失败关闭存储准入，渠道失败不关闭", async () => {

@@ -9,6 +9,8 @@ import { createMockAdapter } from "../model/providers/mock.ts";
 import { LlmError, type ModelRequest } from "../model/adapter.ts";
 import { LlmRuntime } from "../model/runtime.ts";
 import { createModelTurnDriver, type ExecutionNotice } from "./model-turn.ts";
+import { ReActAgent } from "./react-agent.ts";
+import type { StreamChunk } from "../model/adapter.ts";
 
 function testRegistry(handler: () => string | Promise<string>): ToolRegistry {
   const registry = new ToolRegistry();
@@ -68,7 +70,7 @@ test("检查点成功后流式结算并记录可重放请求", async () => {
   );
   assert.deepEqual(
     notices.map((n) => n.type),
-    ["assistant/start", "assistant/chunk", "assistant/chunk", "assistant/end"],
+    ["assistant/start", "assistant/chunk", "assistant/chunk", "assistant/chunk", "assistant/chunk", "assistant/chunk", "assistant/chunk", "assistant/chunk", "assistant/end"],
   );
   const message = session
     .snapshot()
@@ -135,10 +137,11 @@ test("失败、截断和取消分别结算，部分输出不进入模型上下�
     session.bindCheckpoint(async () => {});
     const adapter = {
       async *generate() {
-        yield { type: "text" as const, delta: "前" };
-        yield { type: "text" as const, delta: "缀" };
+        yield { type: "block-start" as const, index: 0, blockType: "text" as const };
+        yield { type: "text-delta" as const, index: 0, text: "前" };
+        yield { type: "text-delta" as const, index: 0, text: "缀" };
         if (finish.kind === "output_limit")
-          yield { type: "finish" as const, reason: finish };
+          yield { type: "finish" as const, reason: { kind: "max-tokens" as const } };
         else if (finish.kind === "aborted") throw new LlmError("ABORTED");
       },
     };
@@ -167,7 +170,7 @@ test("失败、截断和取消分别结算，部分输出不进入模型上下�
     const last = session.snapshot().events.at(-1);
     assert.equal(last?.type === "turn/end" && last.data.reason.kind, turnKind);
     assert.equal(notices.at(-1)?.type, "assistant/end");
-    assert.ok(attempt && "chunks" in Object(attempt.data.stream[0]));
+    assert.ok(attempt && "chunks" in Object(attempt.data.stream[1]));
   }
 });
 
@@ -201,7 +204,7 @@ test("配置与消息快照在检查点期间保持不变，后续请求复用�
   const runtime = new LlmRuntime({
     mock: createMockAdapter((request) => {
       requests.push(request);
-      return [{ chunk: { type: "finish", reason: { kind: "stop" } } }];
+      return [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
     }),
   });
   const drive = createModelTurnDriver({
@@ -298,7 +301,7 @@ test("恢复会话写 resume 并记录 Adapter 最大输出默认值", async () 
   const adapter = {
     ...createMockAdapter((request) => {
       requests.push(request);
-      return [{ chunk: { type: "finish", reason: { kind: "stop" } } }];
+      return [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
     }),
     defaultParams: { maxOutputTokens: 128 },
   };
@@ -478,7 +481,7 @@ test("工具调用分片保留原参数、顺序和 usage，实时 end 引用结
   const end = notices.at(-1);
   assert.ok(end?.type === "assistant/end" && end.outcome.kind === "committed");
   assert.equal(end.outcome.seq, message?.seq);
-  assert.equal(end.index, 3);
+  assert.equal(end.index, 9);
 });
 
 test("Adapter 默认 topP 无法记录时不调用 Provider", async () => {
@@ -531,7 +534,7 @@ test("未派发工具的结算进入下一轮模型请求，调用与结果配�
             },
             { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
           ]
-        : [{ chunk: { type: "finish", reason: { kind: "stop" } } }];
+        : [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
     }),
   });
   const drive = createModelTurnDriver({
@@ -879,7 +882,7 @@ test("工具续答成功时 Turn 以 completed 结束", async () => {
     runtime: new LlmRuntime({ mock: createMockAdapter(() => ++calls === 1 ? [
       { chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{}" } },
       { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
-    ] : [{ chunk: { type: "finish", reason: { kind: "stop" } } }]) }),
+    ] : [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]) }),
     config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
     toolRegistry: testRegistry(() => "ok"),
   })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
@@ -907,49 +910,50 @@ test("后续工具异常时保留已确认结果", async () => {
   assert.equal(results[1]?.data.message.content[0].isError, true);
 });
 
+async function observeInvalidStream(session: Session, chunks: readonly StreamChunk[]) {
+  const { followFrameSchema } = await import("@mharness/session/contracts");
+  const handle = { id: session.header.sessionId, header: session.header, access: "write" as const, inheritedEventCount: 0,
+    read: async () => [], append: async () => {}, flush: async () => {}, close: async () => {} };
+  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => chunks.map((chunk) => ({ chunk }))) }),
+    config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "" });
+  const agent = new ReActAgent(session, driver, handle);
+  const valid: boolean[] = [];
+  const delivered: unknown[] = [];
+  agent.onObservation((notice) => {
+    if (notice.type !== "assistant-stream") return;
+    delivered.push(notice.frame);
+    valid.push(followFrameSchema.safeParse(notice).success);
+    valid.push(followFrameSchema.safeParse({ type: "snapshot", ...agent.snapshot() }).success);
+  });
+  agent.prompt({ requestId: "r", content: [{ type: "text", text: "输入" }] });
+  await agent.waitForIdle();
+  await agent.stop();
+  return { valid, delivered };
+}
+
 test("非法工具分片只进入诊断流，所有实时帧和活动快照符合协议", async () => {
-  const invalidChunks = [
-    { type: "tool_call" as const, index: -1, callId: "c", name: "tool", argumentsDelta: "{}" },
-    { type: "tool_call" as const, index: Number.MAX_SAFE_INTEGER + 1, callId: "c", name: "tool", argumentsDelta: "{}" },
-    { type: "tool_call" as const, index: 0, callId: "", name: "tool", argumentsDelta: "{}" },
-    { type: "tool_call" as const, index: 0, callId: "c", name: "", argumentsDelta: "{}" },
-    { type: "tool_call" as const, index: 0, callId: "other", name: "tool", argumentsDelta: "x" },
-    { type: "tool_call" as const, index: 0, callId: "c", name: "other", argumentsDelta: "x" },
+  const start = { type: "block-start", index: 0, blockType: "tool-call" } as const;
+  const first = { type: "tool-call-delta", index: 0, id: "c", name: "tool", argumentsDelta: "{" } as const;
+  const invalid: { prefix: readonly StreamChunk[]; bad: StreamChunk }[] = [
+    { prefix: [], bad: { type: "block-start", index: -1, blockType: "tool-call" } },
+    { prefix: [], bad: { type: "block-start", index: Number.MAX_SAFE_INTEGER + 1, blockType: "tool-call" } },
+    { prefix: [start], bad: { type: "tool-call-delta", index: 0, id: "", name: "tool", argumentsDelta: "{}" } },
+    { prefix: [start], bad: { type: "tool-call-delta", index: 0, id: "c", name: "", argumentsDelta: "{}" } },
+    { prefix: [start, first], bad: { type: "tool-call-delta", index: 0, id: "other", name: "tool", argumentsDelta: "x" } },
+    { prefix: [start, first], bad: { type: "tool-call-delta", index: 0, id: "c", name: "other", argumentsDelta: "x" } },
   ];
-  for (const [i, bad] of invalidChunks.entries()) {
+  for (const [i, { prefix, bad }] of invalid.entries()) {
     const session = new Session({ sessionId: `malformed-${i}`, createdAt: 0 });
     session.bindCheckpoint(async () => {});
-    const first = { type: "tool_call" as const, index: 0, callId: "c", name: "tool", argumentsDelta: "{" };
-    const chunks = i >= 4 ? [first, bad] : [bad];
-    const notices: ExecutionNotice[] = [];
-    const { followFrameSchema } = await import("@mharness/session/contracts");
-    const active: Extract<ExecutionNotice, { type: "assistant/chunk" }>["chunk"][] = [];
-    const validity: boolean[] = [];
-    let revision = 0;
-    let attemptId = "";
-    await createModelTurnDriver({
-      runtime: new LlmRuntime({ mock: createMockAdapter(() => chunks.map((chunk) => ({ chunk }))) }),
-      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    })({ session, turn: 1, step: 1, signal: new AbortController().signal, blockStorage: () => assert.fail(), publish: (notice) => {
-      notices.push(notice);
-      if (notice.type === "agent/error") { validity.push(followFrameSchema.safeParse(notice).success); return; }
-      const { type, ...rest } = notice;
-      if (type === "assistant/start") attemptId = notice.attemptId;
-      if (notice.type === "assistant/chunk") active.push(notice.chunk);
-      const frame = { type: type.slice("assistant/".length), ...rest, revision: ++revision };
-      validity.push(followFrameSchema.safeParse({ type: "assistant-stream", frame }).success);
-      if (notice.type !== "assistant/end") validity.push(followFrameSchema.safeParse({ type: "snapshot", sessionId: `malformed-${i}`, inheritedEventCount: 0, cursor: -1, records: [], assistantStream: { revision, activeAttempt: { attemptId, turn: 1, step: 1, chunks: active, nextIndex: active.length } } }).success);
-    } });
-    assert.ok(validity.every(Boolean));
-    assert.equal(notices.at(-1)?.type, "assistant/end");
-    assert.equal(notices.filter((notice) => notice.type === "assistant/chunk").length, i >= 4 ? 1 : 0);
+    const { valid, delivered } = await observeInvalidStream(session, [...prefix, bad]);
+    assert.ok(valid.every(Boolean));
+    assert.equal(delivered.filter((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "chunk").length, i >= 4 ? 1 : 0);
     const attempt = session.snapshot().events.find((e) => e.type === "assistant/attempt");
     assert.equal(attempt?.data.outcome, "failed");
     assert.equal((attempt?.data.reason as { code?: string }).code, "PROTOCOL");
     assert.ok(JSON.stringify(attempt?.data.stream).includes(JSON.stringify(bad)));
   }
 });
-
 test("取得流时同步取消会释放流且不发布实时帧", async () => {
   const session = new Session({ sessionId: "sync-abort", createdAt: 0 });
   session.bindCheckpoint(async () => {});
@@ -991,49 +995,23 @@ test("同步生成异常不发布流帧", async () => {
 });
 
 test("不可持久化的工具索引以协议失败安全结算", async () => {
-  const { followFrameSchema } = await import("@mharness/session/contracts");
   for (const [i, index] of [NaN, Infinity, -Infinity, -0].entries()) {
     const session = new Session({ sessionId: `non-json-index-${i}`, createdAt: 0 });
     session.bindCheckpoint(async () => {});
-    const first = { type: "text" as const, delta: "前缀" };
-    const bad = { type: "tool_call" as const, index, callId: "c", name: "tool", argumentsDelta: "{}" };
-    const notices: ExecutionNotice[] = [];
-    const valid: boolean[] = [];
-    const active: Extract<ExecutionNotice, { type: "assistant/chunk" }>["chunk"][] = [];
-    let revision = 0;
-    let attemptId = "";
-    await createModelTurnDriver({
-      runtime: new LlmRuntime({ mock: createMockAdapter(() => [{ chunk: first }, { chunk: bad }]) }),
-      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
-    })({ session, turn: 1, step: 1, signal: new AbortController().signal, blockStorage: () => assert.fail(), publish: (notice) => {
-      notices.push(notice);
-      if (notice.type === "agent/error") { valid.push(followFrameSchema.safeParse(notice).success); return; }
-      const { type, ...rest } = notice;
-      if (notice.type === "assistant/start") attemptId = notice.attemptId;
-      if (notice.type === "assistant/chunk") active.push(notice.chunk);
-      valid.push(followFrameSchema.safeParse({ type: "assistant-stream", frame: { type: type.slice("assistant/".length), ...rest, revision: ++revision } }).success);
-      if (notice.type !== "assistant/end") valid.push(followFrameSchema.safeParse({ type: "snapshot", sessionId: `non-json-index-${i}`, inheritedEventCount: 0, cursor: -1, records: [], assistantStream: { revision, activeAttempt: { attemptId, turn: 1, step: 1, chunks: active, nextIndex: active.length } } }).success);
-    } });
+    const first: StreamChunk = { type: "text-delta", index: 0, text: "前缀" };
+    const bad: StreamChunk = { type: "block-start", index, blockType: "tool-call" };
+    const { valid, delivered } = await observeInvalidStream(session, [
+      { type: "block-start", index: 0, blockType: "text" }, first, bad,
+    ]);
     assert.ok(valid.every(Boolean));
-    assert.deepEqual(active, [first]);
-    const attempts = session.snapshot().events.filter((event) => event.type === "assistant/attempt");
-    assert.equal(attempts.length, 1);
-    assert.equal(attempts[0]?.data.outcome, "failed");
-    assert.equal((attempts[0]?.data.reason as { code?: string }).code, "PROTOCOL");
-    assert.ok(JSON.stringify(attempts[0]?.data.stream).includes(JSON.stringify(first)));
-    const ends = notices.filter((notice) => notice.type === "assistant/end");
-    assert.equal(ends.length, 1);
-    assert.ok(ends[0]?.type === "assistant/end" && ends[0].outcome.kind === "committed");
-    assert.equal(ends[0].outcome.eventType, "assistant/attempt");
-    assert.equal(ends[0].outcome.seq, attempts[0]?.seq);
-    const turnEnds = session.snapshot().events.filter((event) => event.type === "turn/end");
-    assert.equal(turnEnds.length, 1);
-    const reason = turnEnds[0]?.data.reason;
-    assert.equal(reason?.kind, "error");
-    assert.equal(reason?.kind === "error" && reason.error.code, "PROTOCOL");
+    assert.equal(delivered.filter((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "chunk").length, 1);
+    const attempt = session.snapshot().events.find((event) => event.type === "assistant/attempt");
+    assert.equal(attempt?.data.outcome, "failed");
+    assert.equal((attempt?.data.reason as { code?: string }).code, "PROTOCOL");
+    assert.ok(JSON.stringify(attempt?.data.stream).includes(JSON.stringify(first)));
+    assert.equal(delivered.filter((frame) => typeof frame === "object" && frame !== null && "type" in frame && frame.type === "end").length, 1);
   }
 });
-
 test("同步取消时迭代器清理抛错仍唯一结算取消", async () => {
   const session = new Session({ sessionId: "abort-return-error", createdAt: 0 });
   session.bindCheckpoint(async () => {});

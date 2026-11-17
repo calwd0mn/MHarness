@@ -2,7 +2,7 @@ import { localConfig } from "../../../../config/local.ts";
 import { LlmError } from "./adapter.ts";
 import type {
   GenerationParams,
-  LlmChunk,
+  StreamChunk,
   LlmFinishReason,
   ModelAdapter,
   ModelInput,
@@ -33,7 +33,7 @@ export interface PreparedModel {
    * @param signal - 调用方取消信号，可用于用户取消或 Turn 预算耗尽。调用方负责区分来源。
    * @returns 统一异步流，Adapter 失败或取消通过终止事件交付。
    */
-  generate(input: ModelInput, signal: AbortSignal): AsyncIterable<LlmChunk>;
+  generate(input: ModelInput, signal: AbortSignal): AsyncIterable<StreamChunk>;
 }
 
 function requiredId(value: string, field: string): string {
@@ -78,13 +78,13 @@ function timeoutMs(value: number): number {
 
 /** 解析模型配置并统一流终态。每次生成只调用一次选定的 Adapter。 */
 export class LlmRuntime {
-  readonly #adapters: ReadonlyMap<string, ModelAdapter>;
+  readonly #adapters: ReadonlyMap<string, ModelAdapter | (() => ModelAdapter)>;
 
   /**
    * 固定此实例可选择的 Provider 及其 Adapter。
-   * @param adapters - 以后端配置中的 Provider 标识为键的 Adapter 注册表。
+   * @param adapters - 以后端配置中的 Provider 标识为键的 Adapter 或每次准备时调用的 Adapter 供应者。
    */
-  constructor(adapters: Readonly<Record<string, ModelAdapter>>) {
+  constructor(adapters: Readonly<Record<string, ModelAdapter | (() => ModelAdapter)>>) {
     this.#adapters = new Map(Object.entries(adapters));
   }
 
@@ -97,8 +97,9 @@ export class LlmRuntime {
    */
   prepare(config: ModelConfig, options: { recordable?: boolean } = {}): PreparedModel {
     const provider = requiredId(config.provider, "provider");
-    const adapter = this.#adapters.get(provider);
-    if (!adapter) throw new TypeError("Model provider is not registered");
+    const registration = this.#adapters.get(provider);
+    if (!registration) throw new TypeError("Model provider is not registered");
+    const adapter = typeof registration === "function" ? registration() : registration;
 
     const route = Object.freeze({
       provider,
@@ -124,6 +125,7 @@ export class LlmRuntime {
       reasoningEffort,
       stop: config.params?.stop ?? adapter.defaultParams?.stop,
     });
+    adapter.validateParams?.(effectiveParams);
     const defaults = {
       ...(config.params?.maxOutputTokens === undefined && maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {}),
       ...(config.params?.reasoningEffort === undefined && reasoningEffort !== undefined ? { reasoningEffort } : {}),
@@ -148,7 +150,7 @@ async function* generate(
   adapter: ModelAdapter,
   request: ModelRequest,
   signal: AbortSignal,
-): AsyncGenerator<LlmChunk> {
+): AsyncGenerator<StreamChunk> {
   let reason: LlmFinishReason | undefined;
   try {
     signal.throwIfAborted();

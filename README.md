@@ -11,6 +11,38 @@ pnpm dev
 
 `pnpm typecheck` 检查全部工作区包的 TypeScript 类型。
 
+## DeepSeek 最小验证
+
+默认仍使用 Mock。要手动验证 DeepSeek，在 PowerShell 7 中配置凭据、临时数据库与低输出上限，然后启动后端：
+
+```powershell
+$env:MHARNESS_MODEL_PROVIDER = 'deepseek'
+$env:DEEPSEEK_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'DeepSeek API key' -AsSecureString)).Password
+$env:MHARNESS_MODEL_MAX_TOKENS = '64'
+$env:MHARNESS_SESSION_DB_PATH = Join-Path $env:TEMP ("mharness-deepseek-" + [guid]::NewGuid() + '.sqlite')
+pnpm --filter @mharness/server dev
+```
+
+在另一个 PowerShell 7 窗口提交一次纯文本并查询历史：
+
+```powershell
+$api = 'http://127.0.0.1:3000/api'
+$session = Invoke-RestMethod -Method Post -Uri "$api/sessions" -ContentType 'application/json' -Body '{}'
+$body = @{ requestId = [guid]::NewGuid().ToString(); content = @(@{ type = 'text'; text = '请用一句话打招呼。' }) } | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/messages" -ContentType 'application/json' -Body $body
+Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)" | ConvertTo-Json -Depth 30
+```
+
+受理返回后可能需要稍后重新查询历史。预期看到 `request/header` 中的 `deepseek-v4-pro`、Assistant 正式回答及 `turn/end` 的 `completed`；`max-tokens` 表示输出上限截断。真实请求会使用相应 Provider 账户。自动测试使用受控传输，不访问外部账户；本次实现未执行真实密钥验证。
+
+可选配置 `MHARNESS_MODEL_REASONING_EFFORT` 为 `none`、`low`、`high` 或 `max`，以及 `MHARNESS_MODEL_TEMPERATURE`、`MHARNESS_MODEL_STOP`（JSON 字符串数组）。推理模式不接受显式温度。退出后端后，在原窗口清除模型配置和凭据即可恢复 Mock：
+
+```powershell
+Remove-Item Env:MHARNESS_MODEL_PROVIDER, Env:DEEPSEEK_API_KEY, Env:MHARNESS_MODEL_MAX_TOKENS, Env:MHARNESS_SESSION_DB_PATH -ErrorAction SilentlyContinue
+Remove-Item Env:MHARNESS_MODEL_REASONING_EFFORT, Env:MHARNESS_MODEL_TEMPERATURE, Env:MHARNESS_MODEL_STOP -ErrorAction SilentlyContinue
+pnpm --filter @mharness/server dev
+```
+
 ## 工具执行与审批
 
 `apps/server/src/tools/` 提供本地工具注册、参数准备、结构化结果归一化和 Session 结果追加入口。输入 Zod 定义同时导出模型可见 JSON Schema，准备失败区分未知工具、非法 JSON 与参数不符合约束；准备不会请求审批或执行正文。调用方执行已准备调用前须完成审批、持久化检查点与取消检查。
@@ -56,7 +88,7 @@ pnpm dev
 
 ```powershell
 $api = 'http://127.0.0.1:5173/api'
-$session = Invoke-RestMethod -Method Post -Uri "$api/sessions"
+$session = Invoke-RestMethod -Method Post -Uri "$api/sessions" -ContentType 'application/json' -Body '{}'
 $accepted = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/messages" -ContentType 'application/json' -Body '{"requestId":"req-1","content":[{"type":"text","text":"你好"}]}'
 $history = Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)"
 $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/cancel"
@@ -67,7 +99,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。当前模型为模拟 Adapter；真实 Provider 和压缩按 OpenSpec 的后续任务交付。
+- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。默认模型为模拟 Adapter；可按 DeepSeek 最小验证说明显式启用真实 Provider。会话压缩按 OpenSpec 后续任务交付。
 
 ## 审批答复接口
 

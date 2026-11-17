@@ -18,9 +18,11 @@ function messages(session: Session): ModelMessage[] {
   return session.deriveMessages().map((message): ModelMessage => {
     if (message.role === "assistant") {
       const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+      const reasoningBlocks = message.content.filter((block) => block.type === "reasoning");
+      const reasoning = reasoningBlocks.map((block) => block.text).join("");
       const toolCalls = message.content.filter((block) => block.type === "tool-call")
         .map((block) => ({ callId: block.id, name: block.name, arguments: block.arguments }));
-      return { role: "assistant", text, ...(toolCalls.length ? { toolCalls } : {}) };
+      return { role: "assistant", text, ...(reasoningBlocks.length ? { reasoning } : {}), ...(toolCalls.length ? { toolCalls } : {}) };
     }
     if (message.source.kind === "tool") return {
       role: "tool", callId: message.source.callId,

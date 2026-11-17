@@ -263,7 +263,9 @@ Agent 生命周期的第一次请求使用 `initial`，从已有日志恢复或 
 
 成功生成追加 `assistant/message`，在 `data` 中保存 `turn`、`step`、`message`、`finishReason`、`stream`、可用时的 `usage` 及 `includeInModelContext: true`。`message` 包含 ID、角色、来源和有序内容块。完整工具调用块保存 `id`、`name` 及原始 `arguments`。成功消息落盘后才进入工具阶段。非成功生成追加 `assistant/attempt`，保存 `turn`、`step`、`outcome`、`reason`、`stream` 及 `includeInModelContext: false`。取消或截断可保存非空展示文字，失败流只用于诊断。表中列出的结算共同使用紧凑流格式。
 
-紧凑流将可合并的连续文本及工具分片成组保存，保留组内每段原边界、顺序及相对时序，其余 chunk 保留单条记录。独立分片用 `{ time, chunk }` 表示，其中 `time` 是相对流起点的毫秒数。重放可以无损恢复统一流。Runtime 将 Provider 给出的展示用 reasoning 归一为 `{ type: "reasoning", delta }`。成功结算时按生成顺序把可用 reasoning 保存为消息的 `{ type: "reasoning", text }` 块，页面的折叠状态与消息重放独立。`deriveMessages()` 从已结算的正式消息派生模型历史，Provider 请求按 Adapter 的编码规则构造，实时 `attemptId` 随 `AssistantStreamAttempt` 管理。
+`AssistantStreamAccumulator` 按到达顺序积累模型流。独立分片用 `{ time, chunk }` 保存，其中 `time` 是相对流起点的毫秒数。相邻、同一内容块及类型且可合并的增量可存为 `{ chunks: [{ time, chunk }, ...] }`，保留每段的边界、顺序和时间。解开紧凑记录即可得到当次带时序的分片。新结算保存 §3.2 的 `StreamChunk`。现有 SQLite 记录的 `text`、`reasoning`、`tool_call` 等旧分片照原样读取和交付，诊断读取支持两种表示。
+
+`BlockAssembler` 依据内容块索引组装文本、推理和工具调用，按块首次出现的顺序生成正式消息内容，并提供模型结束原因、用量和可展示的部分文字。一个块以首次 `block-end.block` 提供的完整内容为准，后续增量或重复关闭保持该组装结果。成功消息中的 `{ type: "reasoning", text }` 由推理块组装。`deriveMessages()` 从已结算的正式消息派生历史，Provider Adapter 按要求编码其中的文本、调用、配对结果和推理块。会话历史和快照按 §8 交付原始结算事件。
 
 | Attempt outcome | 持久结算 | includeInModelContext |
 | --- | --- | --- |
@@ -276,13 +278,30 @@ Agent 生命周期的第一次请求使用 `initial`，从已有日志恢复或 
 
 ### 3.1 Turn 驱动统一决定继续或结算
 
-Adapter 映射厂商结束原因，`LlmRuntime` 将异常归一为终止 `finish` chunk。正常无工具的模型回答以 `{ kind: "completed" }` 结算 Turn。`tool_calls` 结束当前模型尝试并进入同一 Step 的工具阶段。达到输出上限时先保存 Assistant 截断结算，再以 `{ kind: "max-tokens" }` 结束 Turn。用户取消以 `aborted` 结算，请求失败以结构化 `error` 结算。
+Turn 驱动拥有步数预算、工具调度、Step 推进和 Turn 结算。每次模型请求有独立的 `AssistantStreamAttempt`。同一个 Step 包含模型决策及该决策产生的工具批次，因而会在 Attempt 结算后继续处理该批工具。需要模型续答时，先保存工具结果和 `step/end`，通过检查点后开启下一 Step，重新派生请求并创建新 Attempt。经压缩后的同 Step 重试也创建新 Attempt。
+
+Turn 驱动根据统一结束原因和组装结果决定结算。`stop` 携带可用正文、推理等允许的内容块时以正式消息结算，Turn 以 `{ kind: "completed" }` 结束。`tool-calls` 要求至少一个工具块，且所有工具块均已收到 `block-end` 并具有完整的调用标识、名称和原始参数。此时写入 `assistant/message`，持久 `finishReason.kind` 为 `tool_calls`，通过检查点后进入同一 Step 的工具阶段，继续参数校验、权限检查和审批。
+
+`stop` 携带工具块，或 `tool-calls` 缺少工具块或包含未关闭或结构不完整的工具块时，以 `PROTOCOL` 结算失败 `assistant/attempt`。`stop` 完全没有内容块时以 `EMPTY_RESPONSE` 结算失败。两种失败均保存安全的紧凑流，归入失败 Turn。模型流的 `max-tokens` 结算为 `assistant/attempt`，持久 `reason` 为 `output_limit`，随后以 `{ kind: "max-tokens" }` 结束 Turn。用户取消以 `aborted` 结算，请求失败以结构化 `error` 结算。
 
 工具批次默认完成后继续请求模型。任一成功工具结果携带 `concludeTurn: true` 时，当前 Step 仍派发并结算本批剩余调用，再把结束意向交给 Turn 驱动。剩余工具返回明确错误也算已结算，错误与成功结果一起持久化。Turn 以 `reason.kind: "completed"` 完成，不开启下一 Step，也不额外生成总结。用户取消、派发异常或满足副作用工具超时规则等原有中止条件优先于该意向。当前 Session 有活动 Turn 时拒绝新提交，第一版在批次结束后无需检查待处理输入队列。
 
 #### 3.2 LlmRuntime 与 Provider Adapter
 
-Agent 负责检查点、Session 事件追加、工具调度、Step/Turn 推进和实时流。`LlmRuntime` 解析校验生效配置并选择 Adapter。检查点成功后创建 `AssistantStreamAttempt`，取得异步流对象，检查取消，再发 `start` 并读取第一个 chunk。准备或检查点失败、创建流同步抛错、发 `start` 前取消时，使用相应的 Agent 结算路径。`start` 表示实时发布开始，网络请求是否已到达 Provider 取决于底层流。Adapter 负责厂商请求序列化、鉴权、流协议转换、超时和取消清理。
+`LlmRuntime` 在准备阶段校验生效配置并选择 Adapter。Adapter 负责请求序列化、鉴权、厂商协议转换、超时和取消清理。Adapter 与 Runtime 共用 `StreamChunk`，Runtime 将归一后的同一模型流交给 Agent。内容块 `index` 在一次请求内从 0 分配，适用于文本、推理和工具调用。可交错的分片按其内容块索引关联。
+
+| `StreamChunk.type` | 作用 |
+| --- | --- |
+| `block-start` | 以 `index` 和 `blockType` 开始一个内容块。 |
+| `text-delta`、`reasoning-delta` | 以 `index` 定位内容块，`text` 为本次到达的文本增量。 |
+| `tool-call-delta` | 以 `index` 定位内容块，`id` 为调用标识，`argumentsDelta` 为原始参数分片，首个调用分片携带 `name`。 |
+| `block-end` | 以 `index` 定位内容块，并携带组装完成的 `block`。 |
+| `usage` | `usage` 保存累计输入和输出 token 数。 |
+| `finish` | `reason` 保存模型请求的终态。Adapter 正常结束时交付 `stop`、`tool-calls` 或 `max-tokens`，Runtime 统一交付其正常、失败或取消终态。 |
+
+`AssistantStreamAttempt` 组合 `AssistantStreamAccumulator` 和 `BlockAssembler`，并以同一份分片快照记录、组装和发布。Accumulator 在接收分片时捕获时间并生成脱离调用方对象的快照。Assembler 校验按索引交付的类型、块边界、工具标识及调用完整性，Tool 层继续校验完整的原始参数。可安全记录的非法分片可进入失败诊断，只有已通过流校验的分片可发布实时草稿。内部 `AssistantStreamFrame` 用 `start`、`chunk`、`end` 表达 Attempt 边界，内层 `chunk` 携带 `StreamChunk`。 [DSH AssistantStreamAttempt](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/agent-loop/src/assistant-stream.ts#L16-L110)
+
+模型检查点成功后，Turn 驱动创建 Attempt，取得异步流对象并检查取消，再发布 `start` 并读取第一个 chunk。准备或检查点失败、创建流同步抛错、`start` 前取消时，沿相应执行路径结算。Turn 驱动选择结算记录并执行 Session 追加。追加接受后，Attempt 发布带引用的 `end: committed`。如果已发布 `start` 且最终无法引用结算事件，则发布一次 `end: abandoned`。`start` 表示实时发布开始，网络发送时机由底层流决定。
 
 | Adapter 观察到的情况 | `LlmError` 代码 |
 | --- | --- |
@@ -296,6 +315,10 @@ Runtime 捕获异常并输出一个终止 chunk。例如 `{ type: "finish", reas
 Agent 收到错误终止后追加失败 `assistant/attempt` 及已接收的紧凑流。已发送 `start` 时，追加成功后发 `end` 并引用该结算。会话压缩里程碑中，只有 Adapter 明确报告输入上下文超限才触发压缩恢复，每个 Turn 最多重试一次。先结算原失败，再在同一步执行压缩，成功后写 `series` header、重新派生 surface 消息并通过检查点后重试。压缩失败、取消或重试仍超限时结算 Turn。Runtime 和 Adapter 每次生成只调用一次，SDK 的隐式重试关闭。
 
 请求级超时与 Agent 的 Turn 总预算独立。调用方取消、超时或提前结束消费时，Adapter 须中止实际请求及读取，释放流、计时器和监听器。超时值按集中配置提供，具体数值在模拟 Adapter 验证时确定。
+
+Task 2.6 首接 DeepSeek 官方 Chat Completions，首个模型为 `deepseek-v4-pro`。后端使用 Node.js `fetch` 向官方 HTTPS 入口发起 HTTP 请求并读取 SSE 响应。凭据以 Bearer 鉴权随出站请求使用，准备时与生效生成参数绑定。Adapter 每次请求最多开启一个正文块和一个推理块，并为每个 Provider 工具索引开启一个工具块。各块按首次开启顺序获得统一内容块索引，增量随解析交付。使用推理模式且提供工具时，从正式 Assistant 消息的推理块重建 Provider 所需的 `reasoning_content`。 [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/) · [推理模式与工具调用](https://api-docs.deepseek.com/guides/thinking_mode/)
+
+Adapter 暂存从 `finish_reason` 映射的统一结束原因以及最新用量。收到 `[DONE]` 后按块开启顺序交付 `block-end`，接着交付可用的最新用量和唯一的 `finish`。存在显式结束原因时优先采用该原因。缺少结束原因时，至少一个工具块且所有工具块结构完整则补为 `tool-calls`，其余情况补为 `stop`。这是 DeepSeek Adapter 的固定规则。流在 `[DONE]` 前结束时报告 `STREAM_CLOSED`，已收到的 `finish_reason` 仅保留在 Adapter 的待结算状态中。Agent 按 §3.1 检查内容和终态，再决定实际结算。
 
 ### 4. 工具能力由注册信息决定
 
@@ -428,9 +451,9 @@ operationId 是逻辑操作标识，toolCallId 是模型协议标识，分别保
 | --- | --- |
 | `text` | `delta` 为正文分片。 |
 | `reasoning` | `delta` 为 Provider 提供的 reasoning 展示分片。 |
-| `tool-call-delta` | `toolIndex`、`argumentsDelta`、可选的 `callId`、`name`。同一工具的首片提供 `callId` 和 `name`，后续片重带时与首片一致。Runtime 的 `tool_call.index` 对应线上的 `toolIndex`。 |
+| `tool-call-delta` | `toolIndex`、`argumentsDelta`、可选的 `callId`、`name`。同一工具的首片提供 `callId` 和 `name`，后续片重带时与首片一致。按工具块首次出现的顺序，将统一流的内容块索引映射为从 0 开始的 `toolIndex`。 |
 
-Runtime 的 usage 和 finish 由结算事件携带。SSE 的实时 `revision` 从基线 0 跨所有已发布的 `start`、`chunk`、`end` 连续推进，同一 Agent 内跨 Attempt 延续。每个 Attempt 的帧 `index` 从 0 开始，`end.index` 等于已发布的 chunk 数。活动草稿的 `nextIndex` 等于 `chunks.length`，也是下一帧的预期 `index`。事件、执行错误和终止错误各自按订阅队列顺序交付。
+ReActAgent 的对外观察入口将内部 `AssistantStreamFrame` 投影为 SSE 草稿帧，实时订阅与活动草稿快照共用该投影。`text-delta` 和 `reasoning-delta` 分别成为 `text` 和 `reasoning`。内容块边界、用量及模型结束原因通过结算记录交付。SSE 的实时 `revision` 从基线 0 跨所有对外发布的 `start`、`chunk`、`end` 连续推进，同一 Agent 内跨 Attempt 延续。每个 Attempt 的草稿帧 `index` 从 0 开始，`end.index` 等于已发布的草稿分片数。活动草稿的 `nextIndex` 等于 `chunks.length`，也是下一帧的预期 `index`。事件、执行错误和终止错误各自按订阅队列顺序交付。
 
 #### 8.2 快照截点、草稿交接和视图
 
@@ -477,7 +500,7 @@ Runtime 的 usage 和 finish 由结算事件携带。SSE 的实时 `revision` �
 {"type":"snapshot","sessionId":"s2","inheritedEventCount":0,"cursor":3,"records":[{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}},{"type":"event","event":{"type":"step/start","seq":1,"time":1700000000001,"data":{"turn":1,"step":1}}},{"type":"event","event":{"type":"user/message","seq":2,"time":1700000000002,"surfaceOp":"append","data":{"turn":1,"requestId":"req-1","id":"1692aee5-495e-4a65-a350-62e3da31b3d2","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"查询设备 A-17"}]}}},{"type":"event","event":{"type":"request/header","seq":3,"time":1700000000003,"data":{"reason":"initial","header":{"config":{"provider":"mock","model":"test-model"}}}}}],"assistantStream":{"revision":3,"activeAttempt":{"attemptId":"a-1","turn":1,"step":1,"nextIndex":2,"chunks":[{"type":"reasoning","delta":"需要查询设备资料。"},{"type":"text","delta":"我来查询。"}]}}}
 {"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a-1","revision":4,"index":2,"chunk":{"type":"tool-call-delta","toolIndex":0,"callId":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}}}
 {"type":"assistant-stream","frame":{"type":"end","attemptId":"a-1","revision":5,"turn":1,"step":1,"index":3,"outcome":{"kind":"committed","eventType":"assistant/message","seq":4}}}
-{"type":"event","event":{"type":"assistant/message","seq":4,"time":1700000000017,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"1692aee5-495e-4a65-a350-62e3da31b3d3","role":"assistant","source":{"kind":"model","provider":"mock","model":"test-model"},"content":[{"type":"reasoning","text":"需要查询设备资料。"},{"type":"text","text":"我来查询。"},{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}]},"finishReason":{"kind":"tool_calls"},"includeInModelContext":true,"stream":[{"time":0,"chunk":{"type":"reasoning","delta":"需要查询设备资料。"}},{"time":4,"chunk":{"type":"text","delta":"我来查询。"}},{"time":7,"chunk":{"type":"tool_call","index":0,"callId":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}},{"time":8,"chunk":{"type":"finish","reason":{"kind":"tool_calls"}}}]}}}
+{"type":"event","event":{"type":"assistant/message","seq":4,"time":1700000000017,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"1692aee5-495e-4a65-a350-62e3da31b3d3","role":"assistant","source":{"provider":"mock","model":"test-model"},"content":[{"type":"reasoning","text":"需要查询设备资料。"},{"type":"text","text":"我来查询。"},{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}]},"finishReason":{"kind":"tool_calls"},"includeInModelContext":true,"stream":[{"time":0,"chunk":{"type":"block-start","index":0,"blockType":"reasoning"}},{"time":0,"chunk":{"type":"reasoning-delta","index":0,"text":"需要查询设备资料。"}},{"time":4,"chunk":{"type":"block-end","index":0,"block":{"type":"reasoning","text":"需要查询设备资料。"}}},{"time":4,"chunk":{"type":"block-start","index":1,"blockType":"text"}},{"time":4,"chunk":{"type":"text-delta","index":1,"text":"我来查询。"}},{"time":7,"chunk":{"type":"block-end","index":1,"block":{"type":"text","text":"我来查询。"}}},{"time":7,"chunk":{"type":"block-start","index":2,"blockType":"tool-call"}},{"time":7,"chunk":{"type":"tool-call-delta","index":2,"id":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}},{"time":8,"chunk":{"type":"block-end","index":2,"block":{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}}},{"time":8,"chunk":{"type":"finish","reason":{"kind":"tool-calls"}}}]}}}
 {"type":"event","event":{"type":"tool/call","seq":5,"time":1700000000018,"data":{"turn":1,"step":1,"callId":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}}}
 {"type":"event","event":{"type":"tool/operation","seq":6,"time":1700000000019,"data":{"turn":1,"step":1,"callId":"call-1","operationId":"op-1","toolName":"lookup","toolVersion":"1","validatedArgs":{"device":"A-17"}}}}
 ```
@@ -544,5 +567,4 @@ Runtime 的 usage 和 finish 由结算事件携带。SSE 的实时 `revision` �
 
 ## Open Questions
 
-- 首个真实 Provider 和接入方式在实施对应任务时确定，沿用既定的 Model Adapter 合约。
 - 各项有限预算的默认数值在模拟工具验收时调整，并集中配置。

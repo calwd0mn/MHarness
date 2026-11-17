@@ -112,11 +112,11 @@ test("SQLite 重开后按每个结算前缀重建真实请求", async () => {
     assert.deepEqual(initial?.data.header.adapterDefaults, { maxTokens: 128, reasoningEffort: "low" });
     const expectedMessages = [
       [{ role: "user", text: "原文" }],
-      [{ role: "user", text: "原文" }, { role: "assistant", text: "答" }],
-      [{ role: "user", text: "原文" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }],
-      [{ role: "user", text: "摘要" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }],
-      [{ role: "user", text: "新摘要" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }],
-      [{ role: "user", text: "新摘要" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }, { role: "assistant", text: "答" }],
+      [{ role: "user", text: "原文" }, { role: "assistant", text: "答", reasoning: "想" }],
+      [{ role: "user", text: "原文" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }],
+      [{ role: "user", text: "摘要" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }],
+      [{ role: "user", text: "新摘要" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }],
+      [{ role: "user", text: "新摘要" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }, { role: "assistant", text: "答", reasoning: "想" }],
     ];
     for (const [index, settlement] of settlements.entries()) {
       const prefix = new Session(read.header, { seed: { kind: "restore", events: events.slice(0, settlement.seq), inheritedEventCount: 0 } });
@@ -253,23 +253,34 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
     async *generate(request) {
       requests.push(structuredClone(request));
       if (requests.length === 1) {
-        now = 1002; yield { type: "text", delta: "先" };
-        now = 1005; yield { type: "text", delta: "查" };
-        now = 1009; yield { type: "reasoning", delta: "想" };
-        now = 1014; yield { type: "text", delta: "再查" };
-        now = 1020; yield { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{" };
-        now = 1024; yield { type: "tool_call", index: 0, argumentsDelta: "}" };
-        now = 1030; yield { type: "finish", reason: { kind: "tool_calls" } };
+        now = 1002; yield { type: "block-start", index: 0, blockType: "text" };
+        yield { type: "text-delta", index: 0, text: "先" };
+        now = 1005; yield { type: "text-delta", index: 0, text: "查" };
+        now = 1009; yield { type: "block-start", index: 1, blockType: "reasoning" };
+        yield { type: "reasoning-delta", index: 1, text: "想" };
+        now = 1014; yield { type: "text-delta", index: 0, text: "再查" };
+        now = 1020; yield { type: "block-start", index: 2, blockType: "tool-call" };
+        yield { type: "tool-call-delta", index: 2, id: "c", name: "lookup", argumentsDelta: "{" };
+        now = 1024; yield { type: "tool-call-delta", index: 2, argumentsDelta: "}" };
+        now = 1030; yield { type: "block-end", index: 0, block: { type: "text", text: "先查再查" } };
+        yield { type: "block-end", index: 1, block: { type: "reasoning", text: "想" } };
+        yield { type: "block-end", index: 2, block: { type: "tool-call", id: "c", name: "lookup", arguments: "{}" } };
+        yield { type: "finish", reason: { kind: "tool-calls" } };
       } else if (requests.length === 2) {
-        yield { type: "text", delta: "截断片段" };
-        yield { type: "finish", reason: { kind: "output_limit" } };
+        yield { type: "block-start", index: 0, blockType: "text" };
+        yield { type: "text-delta", index: 0, text: "截断片段" };
+        yield { type: "finish", reason: { kind: "max-tokens" } };
       } else if (requests.length === 3) {
-        yield { type: "text", delta: "取消片段" };
+        yield { type: "block-start", index: 0, blockType: "text" };
+        yield { type: "text-delta", index: 0, text: "取消片段" };
         throw new LlmError("ABORTED");
       } else if (requests.length === 4) {
-        yield { type: "text", delta: "失败片段" };
+        yield { type: "block-start", index: 0, blockType: "text" };
+        yield { type: "text-delta", index: 0, text: "失败片段" };
       } else {
-        yield { type: "text", delta: "最终" };
+        yield { type: "block-start", index: 0, blockType: "text" };
+        yield { type: "text-delta", index: 0, text: "最终" };
+        yield { type: "block-end", index: 0, block: { type: "text", text: "最终" } };
         yield { type: "finish", reason: { kind: "stop" } };
       }
     },
@@ -286,7 +297,7 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
     assert.equal(requests.length, 5);
     assert.deepEqual(requests[4]?.messages, [
       { role: "user", text: "问题1" },
-      { role: "assistant", text: "先查再查", toolCalls: [{ callId: "c", name: "lookup", arguments: "{}" }] },
+      { role: "assistant", text: "先查再查", reasoning: "想", toolCalls: [{ callId: "c", name: "lookup", arguments: "{}" }] },
       { role: "tool", callId: "c", text: JSON.stringify([{ type: "text", text: "工具尚未派发" }]) },
       { role: "user", text: "问题2" }, { role: "user", text: "问题3" }, { role: "user", text: "问题4" }, { role: "user", text: "问题5" },
     ]);
@@ -307,13 +318,19 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
       return [entry];
     });
     assert.deepEqual(timed, [
-      { time: 2, chunk: { type: "text", delta: "先" } },
-      { time: 5, chunk: { type: "text", delta: "查" } },
-      { time: 9, chunk: { type: "reasoning", delta: "想" } },
-      { time: 14, chunk: { type: "text", delta: "再查" } },
-      { time: 20, chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{" } },
-      { time: 24, chunk: { type: "tool_call", index: 0, argumentsDelta: "}" } },
-      { time: 30, chunk: { type: "finish", reason: { kind: "tool_calls" } } },
+      { time: 2, chunk: { type: "block-start", index: 0, blockType: "text" } },
+      { time: 2, chunk: { type: "text-delta", index: 0, text: "先" } },
+      { time: 5, chunk: { type: "text-delta", index: 0, text: "查" } },
+      { time: 9, chunk: { type: "block-start", index: 1, blockType: "reasoning" } },
+      { time: 9, chunk: { type: "reasoning-delta", index: 1, text: "想" } },
+      { time: 14, chunk: { type: "text-delta", index: 0, text: "再查" } },
+      { time: 20, chunk: { type: "block-start", index: 2, blockType: "tool-call" } },
+      { time: 20, chunk: { type: "tool-call-delta", index: 2, id: "c", name: "lookup", argumentsDelta: "{" } },
+      { time: 24, chunk: { type: "tool-call-delta", index: 2, argumentsDelta: "}" } },
+      { time: 30, chunk: { type: "block-end", index: 0, block: { type: "text", text: "先查再查" } } },
+      { time: 30, chunk: { type: "block-end", index: 1, block: { type: "reasoning", text: "想" } } },
+      { time: 30, chunk: { type: "block-end", index: 2, block: { type: "tool-call", id: "c", name: "lookup", arguments: "{}" } } },
+      { time: 30, chunk: { type: "finish", reason: { kind: "tool-calls" } } },
     ]);
     const attempts = events.filter((event) => event.type === "assistant/attempt");
     assert.deepEqual(attempts.map((event) => [event.data.outcome, event.data.text, event.data.includeInModelContext]), [
@@ -321,7 +338,7 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
     ]);
     const failedMessages = [
       { role: "user", text: "问题1" },
-      { role: "assistant", text: "先查再查", toolCalls: [{ callId: "c", name: "lookup", arguments: "{}" }] },
+      { role: "assistant", text: "先查再查", reasoning: "想", toolCalls: [{ callId: "c", name: "lookup", arguments: "{}" }] },
       { role: "tool", callId: "c", text: JSON.stringify([{ type: "text", text: "工具尚未派发" }]) },
       { role: "user", text: "问题2" }, { role: "user", text: "问题3" }, { role: "user", text: "问题4" },
     ];
@@ -331,7 +348,8 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
     const failedPrefix = new Session(read.header, { seed: { kind: "restore", events: events.slice(0, failed.seq), inheritedEventCount: 0 } });
     assert.deepEqual(rebuildRequestContext(failedPrefix).input.messages, failedMessages);
     assert.deepEqual(failed.data.stream, [
-      { time: 0, chunk: { type: "text", delta: "失败片段" } },
+      { time: 0, chunk: { type: "block-start", index: 0, blockType: "text" } },
+      { time: 0, chunk: { type: "text-delta", index: 0, text: "失败片段" } },
       { time: 0, chunk: { type: "finish", reason: { kind: "error", failure: { code: "STREAM_CLOSED", message: "Provider stream ended without a finish event" } } } },
     ]);
     assert.deepEqual(attempts[2]?.data.reason, { code: "STREAM_CLOSED", message: "Provider stream ended without a finish event" });

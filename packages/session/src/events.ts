@@ -211,6 +211,15 @@ function copyJson(value: unknown, ancestors = new Set<object>()): JsonValue {
   }
 }
 
+/**
+ * 取得可无损保存为会话 JSON 的独立数据快照，不执行事件或业务字段校验。
+ * @param value - 待记录的 JSON 数据。
+ * @returns 脱离输入对象的数据副本。
+ * @throws 存在非有限数字、负零、循环、访问器或其他不可无损保存的值时抛出 TypeError。
+ */
+export function snapshotSessionJson<T>(value: T): T {
+  return copyJson(value) as T;
+}
 function freezeTree(value: unknown): void {
   if (value === null || typeof value !== "object") return;
   for (const child of Object.values(value)) freezeTree(child);

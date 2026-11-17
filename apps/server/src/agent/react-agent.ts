@@ -5,10 +5,12 @@ import { projectInterruptedSession, type Session, type SessionHandle } from "@mh
 import type { ExecutionNotice } from "./model-turn.ts";
 
 type Event = ReturnType<Session["snapshot"]>["events"][number];
-type Chunk = Extract<ExecutionNotice, { type: "assistant/chunk" }>["chunk"];
+type Chunk =
+  | { type: "text" | "reasoning"; delta: string }
+  | { type: "tool-call-delta"; toolIndex: number; callId?: string; name?: string; argumentsDelta: string };
 type StreamFrame =
   | (Omit<Extract<ExecutionNotice, { type: "assistant/start" }>, "type"> & { type: "start"; revision: number })
-  | (Omit<Extract<ExecutionNotice, { type: "assistant/chunk" }>, "type"> & { type: "chunk"; revision: number })
+  | { type: "chunk"; attemptId: string; index: number; chunk: Chunk; revision: number }
   | (Omit<Extract<ExecutionNotice, { type: "assistant/end" }>, "type"> & { type: "end"; revision: number });
 /** 已接受事件与实时通知按同一同步观察顺序交付。 */
 export type AgentObservation = { type: "event"; event: Event } | { type: "assistant-stream"; frame: StreamFrame }
@@ -37,6 +39,7 @@ export class ReActAgent {
   #recovering?: Promise<void>;
   #revision = 0;
   #active?: ActiveAttempt;
+  #toolIndices = new Map<number, number>();
   readonly #listeners = new Set<(notice: AgentObservation) => void>();
   readonly #unsubscribe: () => void;
 
@@ -118,16 +121,37 @@ export class ReActAgent {
   }
   #publish(notice: ExecutionNotice): void {
     if (notice.type === "agent/error") { this.#emit(notice); return; }
-    const revision = ++this.#revision;
     if (notice.type === "assistant/start") {
+      const revision = ++this.#revision;
+      this.#toolIndices.clear();
       this.#active = { attemptId: notice.attemptId, turn: notice.turn, step: notice.step, chunks: [], nextIndex: 0 };
       this.#emit({ type: "assistant-stream", frame: { ...notice, type: "start", revision } });
     } else if (notice.type === "assistant/chunk") {
-      if (this.#active) { this.#active.chunks.push(structuredClone(notice.chunk)); this.#active.nextIndex++; }
-      this.#emit({ type: "assistant-stream", frame: { ...notice, type: "chunk", revision } });
+      const source = notice.chunk;
+      if (source.type === "block-start" && source.blockType === "tool-call") {
+        this.#toolIndices.set(source.index, this.#toolIndices.size);
+        return;
+      }
+      let chunk: Chunk;
+      if (source.type === "text-delta" || source.type === "reasoning-delta") {
+        chunk = { type: source.type === "text-delta" ? "text" : "reasoning", delta: source.text };
+      } else if (source.type === "tool-call-delta") {
+        const toolIndex = this.#toolIndices.get(source.index);
+        if (toolIndex === undefined) return;
+        chunk = { type: "tool-call-delta", toolIndex, ...(source.id === undefined ? {} : { callId: source.id }),
+          ...(source.name === undefined ? {} : { name: source.name }), argumentsDelta: source.argumentsDelta };
+      } else return;
+      const active = this.#active;
+      if (!active) return;
+      const index = active.nextIndex++;
+      active.chunks.push(structuredClone(chunk));
+      const revision = ++this.#revision;
+      this.#emit({ type: "assistant-stream", frame: { type: "chunk", attemptId: notice.attemptId, index, chunk, revision } });
     } else {
+      const index = this.#active?.nextIndex ?? 0;
       this.#active = undefined;
-      this.#emit({ type: "assistant-stream", frame: { ...notice, type: "end", revision } });
+      const revision = ++this.#revision;
+      this.#emit({ type: "assistant-stream", frame: { ...notice, type: "end", index, revision } });
     }
   }
   /**

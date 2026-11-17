@@ -6,6 +6,7 @@ export { SessionPersistence } from "./persistence.ts";
 export type { SessionAccess, SessionHandle, SessionPersistenceCreateOptions, SessionPersistenceSnapshot } from "./persistence.ts";
 export { projectInterruptedSession, recoverInterruptedSession } from "./recovery.ts";
 export { Session } from "./session.ts";
+export { snapshotSessionJson } from "./events.ts";
 export type { SessionHeader } from "./session.ts";
 export { acquireInstanceOwnership, OwnershipConflictError } from "./storage/ownership.ts";
 export { SqliteSessionPersistence } from "./storage/sqlite-persistence.ts";

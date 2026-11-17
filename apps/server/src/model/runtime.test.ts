@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { test } from "node:test";
 import { LlmError } from "./adapter.ts";
-import type { AdapterChunk, LlmChunk, ModelAdapter, ModelInput, ModelRequest } from "./adapter.ts";
+import type { StreamChunk, ModelAdapter, ModelInput, ModelRequest } from "./adapter.ts";
 import { createMockAdapter } from "./providers/mock.ts";
 import { LlmRuntime } from "./runtime.ts";
 
@@ -12,22 +12,22 @@ const input: ModelInput = {
   messages: [{ role: "user", text: "你好" }],
   tools: [{ name: "lookup", inputSchema: { type: "object" } }],
 };
-const textChunk = { type: "text", delta: "正在查询" } as const;
+const textChunk = { type: "text-delta", index: 0, text: "正在查询" } as const;
 const stopChunk = { type: "finish", reason: { kind: "stop" } } as const;
 
-async function collect(stream: AsyncIterable<LlmChunk>) {
-  const chunks: LlmChunk[] = [];
+async function collect(stream: AsyncIterable<StreamChunk>) {
+  const chunks: StreamChunk[] = [];
   for await (const chunk of stream) chunks.push(chunk);
   return chunks;
 }
 
 test("按已准备的配置选择 Adapter，并保留文本、工具分片、usage 和正常结束的顺序", async () => {
-  const chunks: AdapterChunk[] = [
+  const chunks: StreamChunk[] = [
     textChunk,
-    { type: "tool_call", index: 0, callId: "call-1", name: "lookup", argumentsDelta: '{"q":' },
-    { type: "tool_call", index: 0, argumentsDelta: '"MHarness"}' },
-    { type: "usage", inputTokens: 10, outputTokens: 8 },
-    { type: "finish", reason: { kind: "tool_calls" } },
+    { type: "tool-call-delta", index: 1, id: "call-1", name: "lookup", argumentsDelta: '{"q":' },
+    { type: "tool-call-delta", index: 1, argumentsDelta: '"MHarness"}' },
+    { type: "usage", usage: { inputTokens: 10, outputTokens: 8 } },
+    { type: "finish", reason: { kind: "tool-calls" } },
   ];
   const requests: ModelRequest[] = [];
   const defaultParams = { temperature: 0.8, maxOutputTokens: 1024 };

@@ -34,7 +34,7 @@ test("结束意向保留同批明确错误，并可用同一 Agent 处理下一�
   await handle.flush(); await handle.close();
   const ran: number[] = [];
   let requests = 0;
-  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => ++requests === 1 ? toolChunks(2) : [{ chunk: { type: "finish", reason: { kind: "stop" } } }]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry((n) => { ran.push(n); if (n === 2) throw new HarnessError("业务失败", "BusinessError", "BUSINESS"); return n; }) });
+  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => ++requests === 1 ? toolChunks(2) : [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry((n) => { ran.push(n); if (n === 2) throw new HarnessError("业务失败", "BusinessError", "BUSINESS"); return n; }) });
   const manager = new AgentManager(store, driver);
   try {
     const commands = new SessionCommandController(manager);
@@ -62,7 +62,7 @@ test("结束意向保留同批明确错误，并可用同一 Agent 处理下一�
 test("失败结果不能提出结束意向", async () => {
   const session = new Session({ sessionId: "failed-intent", createdAt: 0 }); session.bindCheckpoint(async () => {});
   let requests = 0;
-  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => ++requests === 1 ? toolChunks(1) : [{ chunk: { type: "finish", reason: { kind: "stop" } } }]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry(() => { throw new HarnessError("失败", "BusinessError", "BUSINESS"); }) });
+  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => ++requests === 1 ? toolChunks(1) : [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry(() => { throw new HarnessError("失败", "BusinessError", "BUSINESS"); }) });
   await driver({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
   assert.equal(requests, 2);
   assert.equal(session.snapshot().events.find((e) => e.type === "tool/result")?.data.error?.code, "BUSINESS");

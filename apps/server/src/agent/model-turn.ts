@@ -3,51 +3,21 @@ import { randomUUID } from "node:crypto";
 import type { Session } from "@mharness/session/server";
 import { LlmError } from "../model/adapter.ts";
 import type {
-  LlmChunk,
+
   LlmFinishReason,
   ModelTool,
 } from "../model/adapter.ts";
 import type { LlmRuntime, ModelConfig } from "../model/runtime.ts";
+import { AssistantStreamAttempt, type AssistantStreamFrame } from "./assistant-stream.ts";
 import { createRequestPreparer } from "./request-context.ts";
 import { ApprovalService } from "../approval/service.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import { runToolBatch } from "../tools/batch.ts";
 import { appendToolResult } from "../tools/result-event.ts";
 
-/** 供会话观察层同步发布的 Attempt 增量；实时版本由观察层分配。 */
-export type ExecutionNotice =
-  | { type: "assistant/start"; attemptId: string; turn: number; step: number }
-  | {
-      type: "assistant/chunk";
-      attemptId: string;
-      index: number;
-      chunk: StreamChunk;
-    }
-  | {
-      type: "assistant/end";
-      attemptId: string;
-      turn: number;
-      step: number;
-      index: number;
-      outcome:
-        | {
-            kind: "committed";
-            eventType: "assistant/message" | "assistant/attempt";
-            seq: number;
-          }
-        | { kind: "abandoned" };
-    }
-  | { type: "agent/error"; turn: number; message: string };
+/** 供会话观察层同步发布的内部模型帧和执行错误。 */
+export type ExecutionNotice = AssistantStreamFrame | { type: "agent/error"; turn: number; message: string };
 
-type StreamChunk =
-  | { type: "text" | "reasoning"; delta: string }
-  | {
-      type: "tool-call-delta";
-      toolIndex: number;
-      callId?: string;
-      name?: string;
-      argumentsDelta: string;
-    };
 /** 一次已受理 Turn 的运行上下文。publish 同步交付实时通知，blockStorage 阻止故障后继续受理。 */
 export type ModelTurnContext = {
   /** 已接受本轮输入并绑定持久化检查点的会话。 */
@@ -88,37 +58,6 @@ type Content = (
   | { type: "tool-call"; id: string; name: string; arguments: string }
 )[];
 
-function compact(entries: { time: number; chunk: LlmChunk }[]) {
-  const result: (
-    | { time: number; chunk: LlmChunk }
-    | { chunks: { time: number; chunk: LlmChunk }[] }
-  )[] = [];
-  for (const entry of entries) {
-    const mergeable =
-      entry.chunk.type === "text" ||
-      entry.chunk.type === "reasoning" ||
-      entry.chunk.type === "tool_call";
-    const previous = result.at(-1);
-    const last =
-      previous && "chunks" in previous
-        ? previous.chunks.at(-1)
-        : previous && "chunk" in previous
-          ? previous
-          : undefined;
-    if (
-      mergeable &&
-      last?.chunk.type === entry.chunk.type &&
-      (entry.chunk.type !== "tool_call" ||
-        (last.chunk.type === "tool_call" &&
-          last.chunk.index === entry.chunk.index))
-    ) {
-      if (previous && "chunks" in previous) previous.chunks.push(entry);
-      else if (last)
-        result.splice(result.length - 1, 1, { chunks: [last, entry] });
-    } else result.push(entry);
-  }
-  return result;
-}
 /**
  * 创建有限步数的 Turn 驱动，检查点成功后启动模型并结算每个 Step。
  * 未配置工具注册表时工具调用追加 TOOL_NOT_STARTED 并以 blocked 结束；耗尽步数时不再派发。
@@ -158,9 +97,9 @@ export function createModelTurnDriver(
     try {
       for (let count = 0; count < maxSteps; count++, step++) {
         let continued = false;
-        let started = false;
-        let ended = false;
-        let index = 0;
+        let attempt: AssistantStreamAttempt | undefined;
+
+
         let storageCode = "UNKNOWN";
         const attemptId = randomUUID();
         const storageFailure = (error: unknown) => {
@@ -204,112 +143,33 @@ export function createModelTurnDriver(
             turnReason = { kind: "aborted", reason: "user" };
             return;
           }
-          publish({ type: "assistant/start", attemptId, turn, step });
-          started = true;
-          const start = Date.now();
-          const recorded: { time: number; chunk: LlmChunk }[] = [];
-          const content: Content = [];
-          const calls = new Map<
-            number,
-            { id: string; name: string; arguments: string }
-          >();
-          let text = "";
-          let usage: { inputTokens: number; outputTokens: number } | undefined;
-          let finish: LlmFinishReason = {
-            kind: "error",
-            failure: {
-              code: "STREAM_CLOSED",
-              message: "Provider stream ended without a finish event",
-            },
-          };
-          for await (const chunk of stream) {
-            // 这些数字不能无损写入会话 JSON，保留它们会使失败结算本身被拒绝。
-            if (chunk.type === "tool_call" && (!Number.isFinite(chunk.index) || Object.is(chunk.index, -0))) {
-              finish = new LlmError("PROTOCOL").toFinishReason();
-              break;
-            }
-            recorded.push({ time: Math.max(0, Date.now() - start), chunk });
-            if (chunk.type === "finish") {
-              finish = chunk.reason;
-              break;
-            }
-            if (chunk.type === "usage") {
-              usage = {
-                inputTokens: chunk.inputTokens,
-                outputTokens: chunk.outputTokens,
-              };
-              continue;
-            }
-            if (chunk.type === "tool_call") {
-              let call = calls.get(chunk.index);
-              if (
-                !Number.isSafeInteger(chunk.index) ||
-                chunk.index < 0 ||
-                (!call && (!chunk.callId || !chunk.name)) ||
-                (call &&
-                  ((chunk.callId !== undefined && chunk.callId !== call.id) ||
-                    (chunk.name !== undefined && chunk.name !== call.name))) ||
-                (!call && [...calls.values()].some((prior) => prior.id === chunk.callId))
-              ) {
-                finish = new LlmError("PROTOCOL").toFinishReason();
-                break;
-              }
-              if (!call) {
-                call = {
-                  id: chunk.callId ?? "",
-                  name: chunk.name ?? "",
-                  arguments: "",
-                };
-                calls.set(chunk.index, call);
-                content.push({ type: "tool-call", ...call });
-              }
-              call.arguments += chunk.argumentsDelta;
-              const block = content.find(
-                (part) => part.type === "tool-call" && part.id === call.id,
-              );
-              if (block?.type === "tool-call") block.arguments = call.arguments;
-              publish({
-                type: "assistant/chunk",
-                attemptId,
-                index: index++,
-                chunk: {
-                  type: "tool-call-delta",
-                  toolIndex: chunk.index,
-                  ...(chunk.callId === undefined
-                    ? {}
-                    : { callId: chunk.callId }),
-                  ...(chunk.name === undefined ? {} : { name: chunk.name }),
-                  argumentsDelta: chunk.argumentsDelta,
-                },
-              });
-            } else {
-              if (chunk.type === "text") text += chunk.delta;
-              const last = content.at(-1);
-              if (last?.type === chunk.type) last.text += chunk.delta;
-              else content.push({ type: chunk.type, text: chunk.delta });
-              publish({
-                type: "assistant/chunk",
-                attemptId,
-                index: index++,
-                chunk,
-              });
-            }
+          attempt = new AssistantStreamAttempt(attemptId, turn, step, publish);
+          attempt.start();
+          const { accumulator, assembler } = attempt;
+          let finish: LlmFinishReason = new LlmError("STREAM_CLOSED").toFinishReason();
+          for await (const incoming of stream) {
+            try { attempt.push(incoming); }
+            catch { finish = new LlmError("PROTOCOL").toFinishReason(); break; }
+            if (incoming.type === "finish") { finish = incoming.reason; break; }
           }
-          if (
-            (finish.kind === "stop" || finish.kind === "tool_calls") &&
-            ([...calls.values()].some((call) => !call.id || !call.name) ||
-              new Set([...calls.values()].map((call) => call.id)).size !==
-                calls.size)
-          ) {
+          const content = assembler.content;
+          const calls = content.filter((part): part is Extract<Content[number], { type: "tool-call" }> => part.type === "tool-call");
+          const text = content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
+          const usage = assembler.usage;
+
+          if ((finish.kind === "stop" && calls.length) || (finish.kind === "tool-calls" && !assembler.completeTools)) {
             finish = new LlmError("PROTOCOL").toFinishReason();
+          }
+          if (finish.kind === "stop" && !content.some((part) => part.type !== "tool-call" && part.text.length > 0)) {
+            finish = new LlmError("EMPTY_RESPONSE").toFinishReason();
           }
           let event: {
             type: "assistant/message" | "assistant/attempt";
             seq: number;
           };
-          if (finish.kind === "stop" || finish.kind === "tool_calls") {
-            turnReason = { kind: finish.kind === "tool_calls" ? "blocked" : "completed" };
-            event = session.append({
+          if (finish.kind === "stop" || finish.kind === "tool-calls") {
+            turnReason = { kind: finish.kind === "tool-calls" ? "blocked" : "completed" };
+            event = attempt.commit(() => session.append({
               type: "assistant/message",
               surfaceOp: "append",
               data: {
@@ -321,62 +181,49 @@ export function createModelTurnDriver(
                   source: prepared.route,
                   content,
                 },
-                finishReason: { kind: finish.kind },
-                stream: compact(recorded),
+                finishReason: { kind: finish.kind === "tool-calls" ? "tool_calls" : "stop" },
+                stream: accumulator.stream,
                 ...(usage ? { usage } : {}),
                 includeInModelContext: true,
               },
-            });
+            }));
           } else {
             const outcome =
               finish.kind === "aborted"
                 ? "cancelled"
-                : finish.kind === "output_limit"
+                : finish.kind === "max-tokens"
                   ? "truncated"
                   : "failed";
             const reason =
-              finish.kind === "output_limit"
+              finish.kind === "max-tokens"
                 ? "output_limit"
                 : finish.kind === "error"
                   ? finish.failure
                   : "aborted";
-            event = session.append({
+            event = attempt.commit(() => session.append({
               type: "assistant/attempt",
               data: {
                 turn,
                 step,
                 outcome,
                 reason,
-                stream: compact(recorded),
+                stream: accumulator.stream,
                 ...(outcome !== "failed" && text ? { text } : {}),
                 includeInModelContext: false,
               },
-            });
+            }));
             turnReason =
               finish.kind === "aborted"
                 ? { kind: "aborted", reason: "user" }
-                : finish.kind === "output_limit"
+                : finish.kind === "max-tokens"
                   ? { kind: "max-tokens" }
                   : finish.kind === "error"
                     ? { kind: "error", error: finish.failure }
                     : { kind: "completed" };
           }
-          publish({
-            type: "assistant/end",
-            attemptId,
-            turn,
-            step,
-            index,
-            outcome: {
-              kind: "committed",
-              eventType: event.type,
-              seq: event.seq,
-            },
-          });
-          ended = true;
-          if (event.type === "assistant/message" && calls.size) {
+          if (event.type === "assistant/message" && calls.length) {
             const toolCalls = content.filter((part): part is Extract<Content[number], { type: "tool-call" }> => part.type === "tool-call");
-            const canDispatch = finish.kind === "tool_calls" && options.toolRegistry && count + 1 < maxSteps && !signal.aborted;
+            const canDispatch = finish.kind === "tool-calls" && options.toolRegistry && count + 1 < maxSteps && !signal.aborted;
             const checkpoint = async () => {
               try { await session.flush(); }
               catch (error) {
@@ -405,7 +252,7 @@ export function createModelTurnDriver(
               const code = signal.aborted ? "ABORTED_BEFORE_DISPATCH" : "TOOL_NOT_STARTED";
               for (const call of toolCalls) appendToolResult(session, { turn, step, callId: call.id, messageId: randomUUID() }, { isError: true, error: { message, info: { name: "ToolError", code } }, content: [{ type: "text", text: message }] });
               if (signal.aborted) turnReason = { kind: "aborted", reason: "user" };
-              else if (options.toolRegistry && count + 1 >= maxSteps && finish.kind === "tool_calls") turnReason = { kind: "error", error: { code: "MAX_STEPS", message: "模型步数预算已耗尽" } };
+              else if (options.toolRegistry && count + 1 >= maxSteps && finish.kind === "tool-calls") turnReason = { kind: "error", error: { code: "MAX_STEPS", message: "模型步数预算已耗尽" } };
             }
           }
         } catch (error) {
@@ -415,15 +262,7 @@ export function createModelTurnDriver(
           };
           publish({ type: "agent/error", turn, message: "本轮执行失败" });
         } finally {
-          if (started && !ended)
-            publish({
-              type: "assistant/end",
-              attemptId,
-              turn,
-              step,
-              index,
-              outcome: { kind: "abandoned" },
-            });
+          attempt?.abandon();
           session.append({ type: "step/end", data: { turn, step } });
         }
         if (!continued) break;

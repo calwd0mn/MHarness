@@ -341,19 +341,27 @@ Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SH
 - **THEN** 结果和审批按所属 Session、Turn、Step 正确关联，不因 callId 相同而相互覆盖或合并。Provider 要求同一请求内工具调用 ID 唯一时，Adapter SHALL 在发送时同步转换相关调用和结果的引用
 
 ### Requirement: 统一模型与工具循环
-系统 SHALL 通过统一模型合约处理文本、Provider 提供的 reasoning、工具调用、结束原因、用量及错误。只有完整且参数通过校验的调用才能进入工具执行。Step SHALL 包含同一次模型决策的 Attempt 及该决策产生的工具批次。需要模型续答时，系统 SHALL 在该批次结果持久化后创建新 Step，其第一次模型请求是新 Step 的第一个 Attempt。系统 SHALL 以有限步数限制循环。
+系统 SHALL 通过统一模型合约处理文本、Provider 提供的 reasoning、工具调用、结束原因、用量及错误。每次模型请求 SHALL 具有独立的 Attempt。Step SHALL 包含该 Step 的模型决策及其工具批次。只有完整且参数通过校验的调用才能进入工具执行。需要模型续答时，系统 SHALL 在工具结果和当前 `step/end` 持久化后开启新 Step，并用新的 Attempt 生成。系统 SHALL 以有限步数限制循环。
 
 #### Scenario: 工具参数仍在生成
 - **WHEN** 模型只返回部分工具参数
 - **THEN** 系统保留工具分片，页面显示整体忙碌状态。工具调用卡片在进入调度后建立
 
 #### Scenario: 模型输出结束并请求工具
-- **WHEN** 当前 Attempt 以 tool_calls 结束并提交完整且通过校验的工具调用
-- **THEN** 系统在当前 Step 处理该批工具，Turn 保持活动
+- **WHEN** 当前 Attempt 收到 `tool-calls`，且至少有一个工具块，所有工具块已由 `block-end` 关闭并具有完整的调用标识、工具名和原始参数
+- **THEN** 系统结算并持久化 Assistant 消息，在当前 Step 按参数 Schema 和权限策略处理该批调用，按需请求审批。工具正文须通过执行前检查点和取消检查，Turn 保持活动
+
+#### Scenario: 结束原因与工具块矛盾
+- **WHEN** `stop` 伴随工具块，或 `tool-calls` 缺少工具块或包含未关闭或结构不完整的工具块
+- **THEN** Agent 以 `PROTOCOL` 结算失败的 `assistant/attempt`，保存诊断流。正式 Assistant 消息、审批请求和工具正文调用的新增数量均为零
+
+#### Scenario: 空响应正常停止
+- **WHEN** Agent 收到 `stop`，且 Attempt 完全没有内容块
+- **THEN** Agent 以 `EMPTY_RESPONSE` 结算失败的 `assistant/attempt`，流记录保留已交付的用量。`stop` 带有可用正文或推理等允许的内容块时可结算为正式消息
 
 #### Scenario: 工具批次结束后需要续答
-- **WHEN** 当前 Step 的工具结果已保存，且没有结束 Turn 的条件
-- **THEN** 下一次模型请求属于新 Step，并包含此前提交的 assistant 文字、对应工具调用与工具结果
+- **WHEN** 当前 Step 的工具结果和 `step/end` 已持久化，且没有结束 Turn 的条件
+- **THEN** 系统开启新 Step，为新 Attempt 重新准备模型请求和流状态，请求包含此前提交的 Assistant 文字、对应工具调用与结果
 
 #### Scenario: 循环预算耗尽
 - **WHEN** Turn 达到配置的最大模型步数
@@ -368,7 +376,43 @@ Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SH
 
 #### Scenario: 请求期间配置改变
 - **WHEN** 请求准备完成后、发送前或生成期间，凭据或生成配置发生变化
-- **THEN** 本次请求继续使用准备时确定的快照，后续请求可使用新配置
+- **THEN** 本次请求继续使用准备时确定的快照。下一次请求使用新配置时，`request/header` 记录其生效配置，模型输入包含从同一会话当前前缀派生的历史
+
+### Requirement: DeepSeek 流的结束边界
+
+DeepSeek Adapter SHALL 暂存 Provider 的结束原因及最新用量，在 `[DONE]` 到达时按开启顺序交付 `block-end`、可用的最新 `usage`，最后交付唯一的 `finish`。`finish` 优先采用 Provider 明确给出的结束原因。缺少原因时，有至少一个工具块且所有工具块均结构完整则补为 `tool-calls`，其余情况补为 `stop`。在 `[DONE]` 前提前结束的流 SHALL 以 `STREAM_CLOSED` 失败。
+
+#### Scenario: 缺少结束原因且工具块完整
+- **WHEN** DeepSeek 交付了完整的工具标识、名称和原始参数字符串，随后发送 `[DONE]`，期间未给出结束原因
+- **THEN** Adapter 先关闭内容块，交付可用的最新用量，再交付 `finish: tool-calls`。执行层继续执行工具校验和治理流程
+
+#### Scenario: 缺少结束原因且响应为空
+- **WHEN** DeepSeek 未生成内容块，未发送结束原因即发送 `[DONE]`
+- **THEN** Adapter 交付可用的最新用量及 `finish: stop`，Agent 以 `EMPTY_RESPONSE` 结算失败 Attempt
+
+#### Scenario: Provider 请求工具后在结束标记前断流
+- **WHEN** DeepSeek 交付了工具参数和 `finish_reason: tool_calls`，在 `[DONE]` 前提前结束流
+- **THEN** Adapter 报 `STREAM_CLOSED`，Agent 保存已收到的分片及失败原因。正式 Assistant 消息、审批请求和工具正文调用的新增数量均为零
+
+### Requirement: 统一内容块流与结算记录
+
+Adapter、Runtime 和执行层 SHALL 共用 `StreamChunk`。内容起止及文本、推理、工具增量 SHALL 按一次请求内的内容块索引关联。Attempt 结算 SHALL 从同一份分片数据组装 Assistant 内容并保存可安全记录的紧凑流。紧凑流 SHALL 可恢复原顺序、分片边界和相对时序。现有记录 SHALL 按原值读取。
+
+#### Scenario: 文本、推理和工具分片交错到达
+- **WHEN** 同一模型请求的不同内容块交错产生 `block-start`、增量与 `block-end`，随后交付 `usage` 及 `finish`
+- **THEN** 结算内容按块首次出现顺序组装，每块的首次 `block-end.block` 确定该块最终内容，工具参数保留原始字符串。展开紧凑流可恢复该次分片边界、顺序和时序
+
+#### Scenario: 块关闭携带完整内容
+- **WHEN** 同一内容块的首次 `block-end.block` 与此前累积的增量不同，或关闭后继续收到该块的增量或重复关闭
+- **THEN** 组装结果采用首次关闭携带的完整内容，正常结束时据此写入正式消息。紧凑流保留可安全记录的实际分片
+
+#### Scenario: 完整内容块之后仍在生成
+- **WHEN** 当前请求发出工具块的 `block-end`，但尚未收到模型 `finish`
+- **THEN** Attempt 保持活动，工具正文的调用次数仍为零
+
+#### Scenario: 重开包含两种紧凑流表示的历史
+- **WHEN** 会话同时包含旧分片表示和统一内容块分片的结算记录，随后重新打开
+- **THEN** 两种紧凑流均按原值读取并可用于诊断，模型历史依据正式消息与工具配对重建
 
 ### Requirement: 模型流失败归一化
 Adapter SHALL 将厂商协议或传输失败表示为带稳定代码的 `LlmError`。缺少协议要求的结束标记用 `STREAM_CLOSED`，网络异常用 `TRANSPORT`，请求等待或流空闲超时用 `TIMEOUT`，调用方取消用 `ABORTED`。
