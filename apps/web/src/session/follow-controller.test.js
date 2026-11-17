@@ -296,3 +296,36 @@ test("零重试次数和空的旧延迟列表立即停止", async () => {
     assert.equal(connections.length, 1); assert.equal(states.at(-1).status, "failed"); controller.dispose();
   }
 });
+
+test("执行错误保持连接并且不消耗后续同步重连预算", async () => {
+  const outcomes = [];
+  for (const withError of [false, true]) {
+    const { controller, connections, states } = followHarness({ retryDelays: [0, 0] });
+    try {
+      connections[0].frame({ type: "snapshot", sessionId: "a", inheritedEventCount: 0, cursor: -1, records: [], assistantStream: { revision: 0 } });
+      await waitFollow();
+      connections[0].frame({ type: "event", event: { type: "turn/start", seq: 0, time: 1, data: { turn: 1 } } });
+      await waitFollow();
+      if (withError) {
+        connections[0].frame({ type: "agent/error", turn: 1, message: "安全错误" });
+        await waitFollow();
+        assert.equal(states.at(-1).agentError, "安全错误");
+        assert.equal(states.at(-1).status, "ready");
+        assert.equal(connections.length, 1);
+      }
+      connections[0].frame({ type: "event", event: { type: "turn/end", seq: 1, time: 2, data: { turn: 1, reason: { kind: "error", error: { code: "UNKNOWN", message: "失败" } } } } });
+      await waitFollow();
+      assert.equal(connections.length, 1);
+      assert.equal(states.at(-1).status, "ready");
+      assert.equal(states.at(-1).records.at(-1).event.type, "turn/end");
+      connections[0].close();
+      await waitFollow();
+      connections[1].error();
+      await waitFollow();
+      connections[2].error();
+      await waitFollow();
+      outcomes.push({ count: connections.length, status: states.at(-1).status });
+    } finally { controller.dispose(); }
+  }
+  assert.deepEqual(outcomes, [{ count: 3, status: "failed" }, { count: 3, status: "failed" }]);
+});
