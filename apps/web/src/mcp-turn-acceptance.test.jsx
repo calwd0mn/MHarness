@@ -3,6 +3,7 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, test, vi } from "vitest";
 import { createServer } from "node:http";
+import { Client, StreamableHTTPClientTransport } from "../../server/src/test-support/mcp-client.ts";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,8 +19,8 @@ import { connectMcpTools } from "../../server/src/tools/mcp.ts";
 import { startMockMcp } from "../../mock-mcp/src/server.ts";
 
 const nativeFetch = globalThis.fetch;
-async function waitFor(check) {
-  const deadline = Date.now() + 8000;
+async function waitFor(check, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let value;
     await act(async () => { value = await check(); await new Promise(resolve => setTimeout(resolve, 10)); });
@@ -36,6 +37,13 @@ async function safePort(start) {
 }
 const scenarios = [
   { name: "正常问答", calls: [], reason: "completed", models: 1, codes: [] },
+  { name: "仅后台写入失败", backgroundFailure: true, calls: [], reason: "completed" },
+  { name: "首次模型检查点失败", checkpoint: "initial", calls: [], reason: "error" },
+  { name: "工具前检查点失败", checkpoint: "dispatch", calls: [["w", "mock_write", "写入"]], reason: "error" },
+  { name: "模型续答前检查点失败", checkpoint: "continuation", calls: [["w", "mock_write", "写入"]], reason: "error" },
+  { name: "流式断线恢复", reconnectStream: true, calls: [], reason: "completed", models: 1, codes: [] },
+  { name: "工具响应丢失", drop: true, calls: [["w", "mock_write", "写入"]], action: "单次允许", hold: "mock_write", reason: "completed", models: 2, codes: ["MCP_TRANSPORT_ERROR"], effects: ["写入"] },
+  { name: "审批期间刷新", refreshApproval: true, calls: [["w", "mock_write", "写入"]], action: "单次允许", reason: "completed", models: 2, codes: [null], effects: ["写入"] },
   { name: "单次允许", calls: [["w", "mock_write", "写入"]], action: "单次允许", reason: "completed", models: 2, codes: [null], effects: ["写入"] },
   { name: "只读超时继续", calls: [["r", "mock_read", "读取"]], hold: "mock_read", reason: "completed", models: 2, codes: ["TOOL_TIMEOUT"] },
   { name: "副作用超时结束", calls: [["w", "mock_write", "写入"], ["r", "mock_read", "后续"]], action: "单次允许", hold: "mock_write", reason: "error", models: 1, codes: ["TOOL_TIMEOUT", "TOOL_NOT_STARTED"], effects: ["写入"] },
@@ -47,7 +55,10 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   const dir = await mkdtemp(join(tmpdir(), "mharness-acceptance-"));
   const requests = [], modelRequests = [], sources = [], held = [];
-  let upstream, proxy, connection, app, root, container, origin;
+  let upstream, proxy, connection, app, root, container, origin, reconnectedAttemptId;
+  let releaseStream, releaseCheckpoint, activeSession, checkpointReached = false, lock;
+  const checkpointGate = new Promise(resolve => { releaseCheckpoint = resolve; });
+  const streamGate = new Promise(resolve => { releaseStream = resolve; });
   try {
     const ledgerPath = join(dir, "ledger.sqlite");
     upstream = await safePort(port => startMockMcp(port, ledgerPath));
@@ -75,7 +86,8 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
             async release() {
               if (!released) {
                 released = true;
-                if (!res.destroyed) {
+                if (scenario.drop) res.destroy();
+                else if (!res.destroyed) {
                   res.writeHead(response.status, Object.fromEntries(response.headers));
                   res.end(bytes);
                 }
@@ -100,21 +112,51 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     const registry = new ToolRegistry();
     connection = await connectMcpTools(registry, `http://127.0.0.1:${proxy.address().port}/mcp`, [
       { name: "mock_read", version: "1", sideEffect: "read-only", approvalPolicy: "allow", ...(scenario.hold === "mock_read" ? { timeoutMs: 1500 } : {}) },
-      { name: "mock_write", version: "1", sideEffect: "side-effect", supportsIdempotency: true, approvalPolicy: "ask", ...(scenario.hold === "mock_write" ? { timeoutMs: 1500 } : {}) },
+      { name: "mock_write", version: "1", sideEffect: "side-effect", supportsIdempotency: true, approvalPolicy: scenario.checkpoint ? "allow" : "ask", ...(scenario.hold === "mock_write" && !scenario.drop ? { timeoutMs: 1500 } : {}) },
     ]);
     const approvalService = new ApprovalService();
-    const driver = createModelTurnDriver({ approvalService, runtime: new LlmRuntime({ mock: createMockAdapter(request => {
+    const scriptedAdapter = createMockAdapter(request => {
       modelRequests.push(structuredClone(request));
       if (modelRequests.length === 1 && scenario.calls.length) return [
+        ...(scenario.checkpoint ? [{ chunk: { type: "text", delta: "已结算答案" } }] : []),
         ...scenario.calls.map(([id, name, text], index) => ({ chunk: { type: "tool_call", index, callId: id, name, argumentsDelta: JSON.stringify({ text }) } })),
         { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
       ];
       return [{ chunk: { type: "text", delta: "验收回答" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
-    }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry });
-    app = await createEventSessionApp(join(dir, "session.sqlite"), false, driver, { approvalService });
+    });
+    const adapter = scenario.reconnectStream || scenario.backgroundFailure ? {
+      async *generate(request) {
+        modelRequests.push(structuredClone(request));
+        yield { type: "text", delta: "验收" };
+        await streamGate;
+        yield { type: "text", delta: "回答" };
+        yield { type: "finish", reason: { kind: "stop" } };
+      },
+    } : scriptedAdapter;
+    const driver = createModelTurnDriver({ approvalService, runtime: new LlmRuntime({ mock: adapter }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry });
+    const runTurn = scenario.checkpoint || scenario.backgroundFailure ? async context => {
+      activeSession = context.session;
+      const original = context.session.flush.bind(context.session);
+      context.session.flush = async () => {
+        const events = context.session.snapshot().events;
+        const types = events.map(event => event.type);
+        const target = scenario.checkpoint === "initial" ? !types.includes("assistant/message")
+          : scenario.checkpoint === "dispatch" ? types.includes("tool/operation") && !types.includes("tool/result")
+          : scenario.checkpoint === "continuation" && types.includes("tool/result");
+        if (target && !checkpointReached) {
+          lock = new DatabaseSync(join(dir, "session.sqlite"));
+          lock.exec("BEGIN IMMEDIATE");
+          checkpointReached = true;
+          await checkpointGate;
+        }
+        return original();
+      };
+      try { await driver(context); } finally { context.session.flush = original; }
+    } : driver;
+    app = await createEventSessionApp(join(dir, "session.sqlite"), false, runTurn, { approvalService });
     origin = await safePort(port => app.listen({ host: "127.0.0.1", port }));
     class NetworkSource {
-      constructor(url) { this.controller = new AbortController(); this.queue = []; this.delivered = []; sources.push(this); void this.read(origin + url); }
+      constructor(url) { this.controller = new AbortController(); this.queue = []; this.delivered = []; this.heartbeats = 0; sources.push(this); void this.read(origin + url); }
       async read(url) {
         try {
           const response = await nativeFetch(url, { signal: this.controller.signal });
@@ -126,15 +168,32 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
               const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
               const data = block.split("\n").find(line => line.startsWith("data:"));
               if (data) this.queue.push(JSON.parse(data.slice(5).trim()));
+              else if (block === ": heartbeat") this.queue.push({ heartbeat: ++this.heartbeats });
             }
           }
         } catch (error) { if (!this.controller.signal.aborted) this.failure = error; }
       }
       close() { this.controller.abort(); }
-      async next() {
-        await waitFor(() => { if (this.failure) throw this.failure; return this.queue.length; });
-        const frame = this.queue.shift(); this.delivered.push(frame);
+      async nextItem(timeoutMs = 8000) {
+        await waitFor(() => { if (this.failure) throw this.failure; return this.queue.length; }, timeoutMs);
+        const frame = this.queue.shift();
+        if (frame.heartbeat) return frame;
+        this.delivered.push(frame);
         await act(async () => this.onmessage?.({ data: JSON.stringify(frame) })); return frame;
+      }
+      async next() {
+        let frame;
+        do { frame = await this.nextItem(); } while (frame.heartbeat);
+        return frame;
+      }
+      async throughHeartbeatAfter(observed) {
+        const deadline = Date.now() + 20000;
+        for (;;) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error("等待告警后的 SSE 心跳超时");
+          const frame = await this.nextItem(remaining);
+          if (frame.heartbeat > observed) return;
+        }
       }
     }
     vi.stubGlobal("fetch", (url, options) => nativeFetch(String(url).startsWith("/") ? origin + url : url, options));
@@ -148,9 +207,140 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     const textarea = container.querySelector("textarea");
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, "开始验收"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
     await act(async () => container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    if (scenario.backgroundFailure) {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        let chunk;
+        do { chunk = await sources[0].next(); } while (chunk.type !== "assistant-stream" || chunk.frame.type !== "chunk");
+        const prefix = (await (await nativeFetch(origin + path)).json()).records;
+        lock = new DatabaseSync(join(dir, "session.sqlite"));
+        lock.exec("BEGIN IMMEDIATE");
+        releaseStream();
+        let end;
+        do { end = await sources[0].next(); } while (end.event?.type !== "turn/end");
+        expect(end.event.data.reason.kind).toBe("completed");
+        await waitFor(() => errors.mock.calls.some(args => String(args[0]).includes("会话后台写入失败")));
+        // 告警后的心跳确认同一连接已排空此前的业务帧，避免漏掉排队中的错误。
+        await sources[0].throughHeartbeatAfter(sources[0].heartbeats);
+        const delivered = sources[0].delivered;
+        expect(delivered.filter(frame => frame.type === "agent/error" || frame.type === "error")).toHaveLength(0);
+        expect(container.textContent).toContain("验收回答");
+        expect(container.textContent).toContain("本轮结束：completed");
+        expect((await (await nativeFetch(origin + path)).json()).records).toEqual(prefix);
+        const live = activeSession.snapshot().events;
+        expect(live.slice(0, prefix.length)).toEqual(prefix.map(record => record.event));
+        lock.exec("ROLLBACK"); lock.close(); lock = undefined;
+        await activeSession.flush();
+        const history = (await (await nativeFetch(origin + path)).json()).records;
+        expect(history.map(record => record.event)).toEqual(live);
+        expect(modelRequests).toHaveLength(1);
+      } finally { errors.mockRestore(); }
+      return;
+    }
+    if (scenario.checkpoint) {
+      if (scenario.checkpoint !== "initial") {
+        let item;
+        do { item = await sources[0].next(); } while (item.event?.type !== (scenario.checkpoint === "dispatch" ? "tool/operation" : "tool/result"));
+        await waitFor(() => container.textContent.includes("已结算答案"));
+      }
+      await waitFor(() => checkpointReached);
+      const prefix = (await (await nativeFetch(origin + path)).json()).records;
+      const beforeFailure = activeSession.snapshot().events;
+      if (scenario.checkpoint === "dispatch") {
+        const operation = beforeFailure.find(event => event.type === "tool/operation");
+        expect(operation).toBeTruthy();
+        expect(prefix.some(record => record.event.seq === operation.seq)).toBe(false);
+      }
+      releaseCheckpoint();
+      let item;
+      do {
+        item = await sources[0].next();
+        if (item.type === "agent/error") {
+          expect(item.message).toBe("本轮执行失败");
+          expect(container.textContent).toContain("本轮执行失败");
+          expect(sources).toHaveLength(1);
+        }
+      } while (item.event?.type !== "turn/end");
+      expect(item.event.data.reason.kind).toBe("error");
+      expect(item.event.data.reason.error.code).toBe("ERR_SQLITE_ERROR");
+      const delivered = sources[0].delivered;
+      const errors = delivered.filter(frame => frame.type === "agent/error");
+      expect(errors).toHaveLength(1);
+      expect(delivered.indexOf(errors[0])).toBeLessThan(delivered.indexOf(item));
+      expect(delivered.filter(frame => frame.type === "error")).toHaveLength(0);
+      expect(delivered.filter(frame => frame.event?.type === "turn/end")).toHaveLength(1);
+      expect(delivered.filter(frame => frame.type === "assistant-stream" && frame.frame.type === "end" && frame.frame.outcome.kind === "abandoned")).toHaveLength(0);
+      expect(JSON.stringify(delivered)).not.toMatch(/database is locked|SQLITE_BUSY/i);
+      expect(modelRequests).toHaveLength(scenario.checkpoint === "initial" ? 0 : 1);
+      expect(requests).toHaveLength(scenario.checkpoint === "continuation" ? 1 : 0);
+      expect(upstream.effects()).toEqual(scenario.checkpoint === "continuation" ? ["写入"] : []);
+      expect((await (await nativeFetch(origin + path)).json()).records).toEqual(prefix);
+      await act(async () => root.unmount());
+      root = createRoot(container);
+      await act(async () => root.render(<App />));
+      await waitFor(() => sources.length === 2);
+      const snapshot = await sources[1].next();
+      expect(snapshot.type).toBe("snapshot");
+      expect(snapshot.records.at(-1).event).toEqual(item.event);
+      if (scenario.checkpoint !== "initial") {
+        expect(snapshot.records.some(record => record.event.type === "assistant/message")).toBe(true);
+        expect(container.textContent).toContain("已结算答案");
+      }
+      expect(container.textContent).toContain("本轮失败");
+      const live = snapshot.records;
+      if (scenario.checkpoint === "continuation") {
+        const result = live.find(record => record.event.type === "tool/result").event;
+        const operation = live.find(record => record.event.type === "tool/operation").event;
+        expect(result.data.error).toBeUndefined();
+        expect(result.data.operationId).toBe(operation.data.operationId);
+        expect(requests[0].arguments.operationId).toBe(operation.data.operationId);
+      }
+      expect(live.slice(0, prefix.length)).toEqual(prefix);
+      lock.exec("ROLLBACK"); lock.close(); lock = undefined;
+      await activeSession.flush();
+      expect((await (await nativeFetch(origin + path)).json()).records).toEqual(live);
+      expect(modelRequests).toHaveLength(scenario.checkpoint === "initial" ? 0 : 1);
+      expect(requests).toHaveLength(scenario.checkpoint === "continuation" ? 1 : 0);
+      return;
+    }
+    if (scenario.reconnectStream) {
+      let chunk;
+      do { chunk = await sources[0].next(); } while (chunk.type !== "assistant-stream" || chunk.frame.type !== "chunk");
+      expect(container.textContent).toContain("验收");
+      const attemptId = chunk.frame.attemptId;
+      reconnectedAttemptId = attemptId;
+      sources[0].close();
+      await act(async () => sources[0].onerror?.());
+      await waitFor(() => sources.length === 2);
+      const snapshot = await sources[1].next();
+      expect(snapshot.type).toBe("snapshot");
+      expect(snapshot.assistantStream.activeAttempt.attemptId).toBe(attemptId);
+      expect(snapshot.assistantStream.activeAttempt.nextIndex).toBe(1);
+      expect(snapshot.assistantStream.activeAttempt.chunks).toEqual([{ type: "text", delta: "验收" }]);
+      expect(container.textContent).toContain("验收");
+      releaseStream();
+    }
     if (scenario.action) {
       let frame; do { frame = await sources[0].next(); } while (frame.event?.type !== "approval/asked");
       expect(requests).toHaveLength(0); expect(upstream.effects()).toEqual([]);
+      if (scenario.refreshApproval) {
+        const asked = frame.event;
+        const committed = await waitFor(async () => {
+          const history = await (await nativeFetch(origin + path)).json();
+          return history.records.some(record => record.event.type === "approval/asked") && history;
+        });
+        expect(committed.records.find(record => record.event.type === "approval/asked").event).toEqual(asked);
+        await act(async () => root.unmount());
+        root = createRoot(container);
+        await act(async () => root.render(<App />));
+        await waitFor(() => sources.length === 2);
+        const snapshot = await sources[1].next();
+        expect(snapshot.type).toBe("snapshot");
+        expect(snapshot.records.find(record => record.event.type === "approval/asked").event).toEqual(asked);
+        expect(modelRequests).toHaveLength(1);
+        expect(requests).toHaveLength(0);
+        expect(upstream.effects()).toEqual([]);
+      }
       const card = [...container.querySelectorAll("details")].find(item => item.textContent.includes("mock_write"));
       expect(card.textContent).toContain("等待审批");
       expect(card.textContent).toContain("工具版本1");
@@ -168,16 +358,27 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
         expect(committed.map(row => [JSON.parse(row.operation_id), JSON.parse(row.text)])).toEqual([[requests[0].arguments.operationId, "写入"]]);
         expect(held[0].envelope.result.structuredContent).toEqual({ text: "写入", operationId: requests[0].arguments.operationId });
       }
+      if (scenario.drop) await held[0].release();
     }
-    let frame; do { frame = await sources[0].next(); } while (frame.event?.type !== "turn/end");
+    const activeSource = sources[scenario.refreshApproval || scenario.reconnectStream ? 1 : 0];
+    let frame; do { frame = await activeSource.next(); } while (frame.event?.type !== "turn/end");
     expect(frame.event.data.reason.kind).toBe(scenario.reason);
     if (scenario.reason === "error") expect(frame.event.data.reason.error.code).toBe("TOOL_TIMEOUT");
     if (scenario.reason === "aborted") expect(frame.event.data.reason.reason).toBe("user");
-    const incremental = sources[0].delivered.filter(item => item.type === "event");
-    const history = await waitFor(async () => { const value = await (await nativeFetch(origin + path)).json(); return value.records.length === incremental.length && value; });
-    expect(incremental).toEqual(history.records);
+    const incremental = activeSource.delivered.filter(item => item.type === "event");
+    const snapshotPrefix = scenario.refreshApproval || scenario.reconnectStream ? activeSource.delivered.find(item => item.type === "snapshot").records : [];
+    const observed = [...snapshotPrefix, ...incremental];
+    const history = await waitFor(async () => { const value = await (await nativeFetch(origin + path)).json(); return value.records.length === observed.length && value; });
+    expect(observed).toEqual(history.records);
     expect(history.records.map(record => record.event.seq)).toEqual(history.records.map((_, index) => index));
     const events = history.records.map(record => record.event);
+    if (scenario.reconnectStream) {
+      const stream = activeSource.delivered.filter(frame => frame.type === "assistant-stream").map(frame => frame.frame);
+      expect(stream.filter(frame => frame.type === "chunk").map(frame => [frame.attemptId, frame.index, frame.chunk.delta])).toEqual([[reconnectedAttemptId, 1, "回答"]]);
+      expect(stream.filter(frame => frame.type === "end").map(frame => [frame.attemptId, frame.outcome.kind])).toEqual([[reconnectedAttemptId, "committed"]]);
+      expect(events.filter(event => event.type === "assistant/attempt")).toHaveLength(0);
+      expect(events.filter(event => event.type === "turn/end")).toHaveLength(1);
+    }
     expect(events.filter(event => event.type === "user/message" && event.data.source.kind === "user")).toHaveLength(1);
     const declarations = events.filter(event => event.type === "assistant/message");
     const results = events.filter(event => event.type === "tool/result");
@@ -202,7 +403,7 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     if (scenario.models === 2) {
       const toolMessages = modelRequests[1].messages.filter(message => message.role === "tool");
       expect(toolMessages.map(message => message.callId)).toEqual([scenario.calls[0][0]]);
-      expect(toolMessages[0].text).toContain(scenario.hold ? "等待工具响应超时" : "写入");
+      if (!scenario.drop) expect(toolMessages[0].text).toContain(scenario.hold ? "等待工具响应超时" : "写入");
     }
     const expectedRequests = scenario.action === "拒绝" || scenario.action === "取消任务" ? 0 : scenario.calls.length ? 1 : 0;
     expect(requests).toHaveLength(expectedRequests);
@@ -227,6 +428,17 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
       expect(JSON.parse(operations[0].arguments)).toEqual({ text: scenario.calls[0][2] });
       expect(JSON.parse(operations[0].tool_name)).toBe("mock_write");
     }
+    if (scenario.drop) {
+      const client = new Client({ name: "acceptance-retry", version: "1" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(upstream.url)));
+      try {
+        const retried = await client.callTool(requests[0]);
+        expect(retried).toEqual(held[0].envelope.result);
+      } finally { await client.close(); }
+      expect(upstream.effects()).toEqual(["写入"]);
+      expect(requests).toHaveLength(1);
+      expect((await (await nativeFetch(origin + path)).json()).records).toEqual(history.records);
+    }
     const statuses = scenario.codes.map(code => code === null ? "成功" : code === "TOOL_NOT_STARTED" ? "未开始" : code === "TOOL_TIMEOUT" ? "超时" : code === "ABORTED_BEFORE_DISPATCH" ? "已取消" : "失败");
     for (const [index, status] of statuses.entries()) {
       const [id, name] = scenario.calls[index];
@@ -242,8 +454,9 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     await act(async () => root.unmount());
     root = createRoot(container);
     await act(async () => root.render(<App />));
-    await waitFor(() => sources.length === 2);
-    const snapshot = await sources[1].next();
+    const finalSourceIndex = scenario.refreshApproval || scenario.reconnectStream ? 2 : 1;
+    await waitFor(() => sources.length === finalSourceIndex + 1);
+    const snapshot = await sources[finalSourceIndex].next();
     expect(snapshot.type).toBe("snapshot");
     expect(snapshot.records).toEqual(history.records);
     expect(container.textContent).toContain(scenario.reason === "error" ? "本轮失败：工具超时，最终结果未确认" : `本轮结束：${scenario.reason}`);
@@ -254,6 +467,8 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     expect((await (await nativeFetch(origin + path)).json()).records).toEqual(history.records);
     expect(upstream.effects()).toEqual(scenario.effects ?? []);
   } finally {
+    releaseStream(); releaseCheckpoint();
+    if (lock) { lock.exec("ROLLBACK"); lock.close(); }
     await Promise.all(held.map(item => item.release()));
     if (root) await act(async () => root.unmount());
     container?.remove();
@@ -267,4 +482,4 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
       }
     }
   }
-}, 25000);
+}, 35000);
