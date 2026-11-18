@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { Session } from "@mharness/session/server";
 import type { ModelInput, ModelMessage, ModelTool } from "../model/adapter.ts";
+import { projectModelMessages } from "../model/request-projection.ts";
 import type { LlmRuntime, ModelConfig, PreparedModel } from "../model/runtime.ts";
 
 type Event = ReturnType<Session["snapshot"]>["events"][number];
@@ -15,21 +16,7 @@ export type RequestContextOptions = {
 };
 
 function messages(session: Session): ModelMessage[] {
-  return session.deriveMessages().map((message): ModelMessage => {
-    if (message.role === "assistant") {
-      const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
-      const reasoningBlocks = message.content.filter((block) => block.type === "reasoning");
-      const reasoning = reasoningBlocks.map((block) => block.text).join("");
-      const toolCalls = message.content.filter((block) => block.type === "tool-call")
-        .map((block) => ({ callId: block.id, name: block.name, arguments: block.arguments }));
-      return { role: "assistant", text, ...(reasoningBlocks.length ? { reasoning } : {}), ...(toolCalls.length ? { toolCalls } : {}) };
-    }
-    if (message.source.kind === "tool") return {
-      role: "tool", callId: message.source.callId,
-      text: JSON.stringify(message.content.find((block) => block.type === "tool-result")?.content),
-    };
-    return { role: "user", text: message.content.filter((block) => block.type === "text").map((block) => block.text).join("") };
-  });
+  return projectModelMessages(session.deriveMessages());
 }
 
 function freezeTree(value: unknown): void {

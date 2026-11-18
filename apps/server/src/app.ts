@@ -31,6 +31,16 @@ import { registerApprovalRoutes } from "./approval/routes.ts";
 
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
 
+const deepseekModel = "deepseek-v4-pro";
+
+function configuredBudget(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) throw new TypeError(`${name} 必须是十进制正整数`);
+  return Number(value);
+}
+
 function configuredModel(): ModelConfig {
   const provider = process.env.MHARNESS_MODEL_PROVIDER ?? "mock";
   if (provider === "mock") return { provider, model: "test-model" };
@@ -42,7 +52,7 @@ function configuredModel(): ModelConfig {
   const maxOutputTokens = number("MHARNESS_MODEL_MAX_TOKENS");
   const temperature = number("MHARNESS_MODEL_TEMPERATURE");
   const reasoningEffort = process.env.MHARNESS_MODEL_REASONING_EFFORT;
-  return { provider, model: "deepseek-v4-pro", params: {
+  return { provider, model: deepseekModel, params: {
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
     ...(temperature === undefined ? {} : { temperature }),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
@@ -146,17 +156,21 @@ export async function createEventSessionApp(path: string, logger = false, runTur
   const approvalService = options.approvalService ?? new ApprovalService();
   const driver = runTurn ?? createModelTurnDriver({
     toolRegistry: options.toolRegistry, approvalService,
-    runtime: new LlmRuntime({ mock: createMockAdapter((request) => {
+    runtime: new LlmRuntime({ mock: { ...createMockAdapter((request) => {
       const text = request.messages.findLast((message) => message.role === "user")?.text ?? "";
       return [
         { delayMs: 100, chunk: { type: "text", delta: "模拟回答：" } },
         { delayMs: 150, chunk: { type: "text", delta: text } },
         { chunk: { type: "finish", reason: { kind: "stop" } } },
       ];
-    }), deepseek: () => {
+    }), modelBudgets: { "test-model": { contextWindow: 100_000, defaultOutputTokens: 2_000 } } }, deepseek: () => {
       const apiKey = process.env.DEEPSEEK_API_KEY;
       if (!apiKey?.trim()) throw new TypeError("DEEPSEEK_API_KEY 必须配置");
-      return createDeepSeekAdapter({ apiKey, ...(options.modelFetch ? { fetch: options.modelFetch } : {}) });
+      const contextWindow = configuredBudget("MHARNESS_MODEL_CONTEXT_WINDOW");
+      const defaultOutputTokens = configuredBudget("MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS");
+      return { ...createDeepSeekAdapter({ apiKey, ...(options.modelFetch ? { fetch: options.modelFetch } : {}) }),
+        modelBudgets: { [deepseekModel]: { ...(contextWindow === undefined ? {} : { contextWindow }),
+          ...(defaultOutputTokens === undefined ? {} : { defaultOutputTokens }) } } };
     } }),
     config: configuredModel,
     systemPrompt: () => "你是一个中文助手。",

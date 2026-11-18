@@ -142,3 +142,55 @@ test("Provider 错误正文中的凭据不进入历史或 follow 快照", async 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("正式 DeepSeek 配置非法容量时不发送请求", async () => {
+  for (const [name, value] of ["MHARNESS_MODEL_CONTEXT_WINDOW", "MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS"].flatMap((name) => ["0", "99999.9999999999999999", "1e3", "0x10", "9007199254740992"].map((value) => [name, value] as const))) {
+    const dir = await mkdtemp(join(tmpdir(), "mharness-budget-"));
+    const names = ["MHARNESS_MODEL_PROVIDER", "DEEPSEEK_API_KEY", "MHARNESS_MODEL_CONTEXT_WINDOW", "MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS", "MHARNESS_MODEL_MAX_TOKENS", "MHARNESS_MODEL_REASONING_EFFORT", "MHARNESS_MODEL_TEMPERATURE", "MHARNESS_MODEL_STOP"];
+    const old = Object.fromEntries(names.map((key) => [key, process.env[key]]));
+    process.env.MHARNESS_MODEL_PROVIDER = "deepseek"; process.env.DEEPSEEK_API_KEY = "key";
+    for (const key of names.slice(2)) delete process.env[key];
+    process.env[name] = value;
+    let calls = 0;
+    const app = await createEventSessionApp(join(dir, "events.sqlite"), false, undefined, { modelFetch: async () => { calls++; return new Response('data: {"choices":[{"delta":{"content":"wrong"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'); } });
+    try {
+      const { sessionId } = (await app.inject({ method: "POST", url: "/api/sessions" })).json() as { sessionId: string };
+      const response = await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "你好" }] } });
+      assert.equal(response.statusCode, 202);
+      let history = "";
+      for (let i = 0; i < 100; i++) { history = (await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` })).body; if (history.includes('"type":"turn/end"')) break; await setTimeout(10); }
+      assert.match(history, /"kind":"error"/); assert.doesNotMatch(history, /"type":"request\/header"/); assert.equal(calls, 0);
+    } finally {
+      await app.close();
+      for (const key of names) { const value = old[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("真实配置的容量声明不改变生成上限", async () => {
+  for (const [window, output, max] of [[undefined, undefined, undefined], ["100000", "2000", undefined], [" 00100000 ", " 002000 ", undefined], ["100000", "2000", "64"]] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "mharness-budget-success-"));
+    const names = ["MHARNESS_MODEL_PROVIDER", "DEEPSEEK_API_KEY", "MHARNESS_MODEL_CONTEXT_WINDOW", "MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS", "MHARNESS_MODEL_MAX_TOKENS", "MHARNESS_MODEL_REASONING_EFFORT", "MHARNESS_MODEL_TEMPERATURE", "MHARNESS_MODEL_STOP"];
+    const old = Object.fromEntries(names.map((key) => [key, process.env[key]]));
+    process.env.MHARNESS_MODEL_PROVIDER = "deepseek"; process.env.DEEPSEEK_API_KEY = "key";
+    for (const [key, value] of [[names[2]!, window], [names[3]!, output], [names[4]!, max], [names[5]!, undefined], [names[6]!, undefined], [names[7]!, undefined]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    const bodies: { model: string; max_tokens?: number; messages: unknown[] }[] = [];
+    const app = await createEventSessionApp(join(dir, "events.sqlite"), false, undefined, { modelFetch: async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'); } });
+    try {
+      const { sessionId } = (await app.inject({ method: "POST", url: "/api/sessions" })).json() as { sessionId: string };
+      const response = await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "你好" }] } });
+      assert.equal(response.statusCode, 202);
+      let history = "";
+      for (let i = 0; i < 100; i++) { history = (await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` })).body; if (history.includes('"type":"turn/end"')) break; await setTimeout(10); }
+      assert.match(history, /"kind":"completed"/); assert.equal(bodies.length, 1);
+      assert.equal(bodies[0]?.model, "deepseek-v4-pro"); assert.equal(bodies[0]?.max_tokens, max === undefined ? undefined : Number(max));
+      assert.deepEqual(bodies[0]?.messages, [{ role: "system", content: "你是一个中文助手。" }, { role: "user", content: "你好" }]);
+      if (max === undefined) assert.doesNotMatch(history, /"maxTokens"/); else assert.match(history, /"maxTokens":64/);
+    } finally {
+      await app.close();
+      for (const key of names) { const value = old[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});

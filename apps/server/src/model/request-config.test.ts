@@ -42,3 +42,45 @@ test("推理强度按显式值、模型信息和旧默认值依次选择并记�
   assert.throws(() => unsupported.prepare(base), /reasoningEffort/);
   assert.throws(() => unsupported.prepare(base, { recordable: true }), /reasoningEffort/);
 });
+
+test("模型预算按路由隔离并在准备时复制校验", () => {
+  const budgets = { a: { contextWindow: 100, defaultOutputTokens: 10 }, b: { contextWindow: 200 } };
+  const runtime = new LlmRuntime({ one: { ...createMockAdapter(() => { throw new Error("unexpected generation"); }), modelBudgets: budgets }, two: { ...createMockAdapter(() => []), modelBudgets: { a: { defaultOutputTokens: 20 } } } });
+  const a = runtime.prepare({ provider: "one", model: "a" });
+  assert.deepEqual(a.modelBudget, { contextWindow: 100, defaultOutputTokens: 10 });
+  assert.deepEqual(runtime.prepare({ provider: "one", model: "b" }).modelBudget, { contextWindow: 200 });
+  assert.deepEqual(runtime.prepare({ provider: "two", model: "a" }).modelBudget, { defaultOutputTokens: 20 });
+  assert.equal(runtime.prepare({ provider: "one", model: "missing" }).modelBudget, undefined);
+  budgets.a.contextWindow = 300;
+  assert.equal(a.modelBudget?.contextWindow, 100);
+  for (const value of [0, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const invalid = new LlmRuntime({ one: { ...createMockAdapter(() => []), modelBudgets: { a: { contextWindow: value } } } });
+    assert.throws(() => invalid.prepare({ provider: "one", model: "a" }), /budget/i);
+    const invalidOutput = new LlmRuntime({ one: { ...createMockAdapter(() => []), modelBudgets: { a: { defaultOutputTokens: value } } } });
+    assert.throws(() => invalidOutput.prepare({ provider: "one", model: "a" }), /budget/i);
+  }
+});
+
+test("模型预算只读取一次并保留原型 getter 的已校验值", () => {
+  let windowReads = 0; let outputReads = 0;
+  class Budget {
+    get contextWindow() { windowReads++; return windowReads === 1 ? 100000 : 0; }
+    get defaultOutputTokens() { outputReads++; return outputReads === 1 ? 2000 : 0; }
+  }
+  const runtime = new LlmRuntime({ mock: { ...createMockAdapter(() => []), modelBudgets: { m: new Budget() } } });
+  const prepared = runtime.prepare({ provider: "mock", model: "m" });
+  assert.deepEqual(prepared.modelBudget, { contextWindow: 100000, defaultOutputTokens: 2000 });
+  assert.equal(Object.isFrozen(prepared.modelBudget), true);
+  assert.equal(windowReads, 1); assert.equal(outputReads, 1);
+});
+
+test("准备模型时预算注册表 getter 只读取一次", () => {
+  let reads = 0;
+  const adapter = { ...createMockAdapter(() => []), get modelBudgets() {
+    reads++;
+    return reads === 1 ? { m: { contextWindow: 100000, defaultOutputTokens: 2000 } } : undefined;
+  } };
+  const prepared = new LlmRuntime({ mock: adapter }).prepare({ provider: "mock", model: "m" });
+  assert.deepEqual(prepared.modelBudget, { contextWindow: 100000, defaultOutputTokens: 2000 });
+  assert.equal(reads, 1);
+});
