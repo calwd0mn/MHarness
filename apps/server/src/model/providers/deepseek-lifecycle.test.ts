@@ -346,3 +346,82 @@ test("idle 阶段的注释和拆包累计同一预算", async (context) => {
   const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("idle 累计预算未终结")), 200))]);
   assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: "idle" } } }]);
 });
+
+test("transport 同步触发上游取消后返回的响应仍被回收", async () => {
+  const upstream = new AbortController();
+  let canceled = 0;
+  const body = new ReadableStream<Uint8Array>({ cancel() { canceled++; } });
+  const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: async () => { upstream.abort(); return new Response(body); } }) }).prepare({ provider: "deepseek", model: "test" });
+  const chunks: StreamChunk[] = [];
+  for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, upstream.signal)) chunks.push(chunk);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "aborted" } }]);
+  assert.equal(canceled, 1);
+});
+
+test("transport 同步触发取消后拒绝不会产生未处理拒绝", async () => {
+  const { execFile } = await import("node:child_process");
+  const script = `
+    import { LlmRuntime } from './src/model/runtime.ts';
+    import { createDeepSeekAdapter } from './src/model/providers/deepseek.ts';
+    let unhandled = false;
+    process.on('unhandledRejection', () => { unhandled = true; });
+    const upstream = new AbortController();
+    const adapter = createDeepSeekAdapter({ apiKey: 'secret', fetch: async () => { upstream.abort(); throw new Error('private'); } });
+    const prepared = new LlmRuntime({ deepseek: adapter }).prepare({ provider: 'deepseek', model: 'test' });
+    for await (const chunk of prepared.generate({ systemPrompt: '', messages: [], tools: [] }, upstream.signal)) {
+      if (chunk.type !== 'finish' || chunk.reason.kind !== 'aborted') process.exitCode = 2;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    if (unhandled) process.exitCode = 3;
+  `;
+  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    execFile(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { timeout: 3000 }, (error, _stdout, stderr) => resolve({ code: error && "code" in error && typeof error.code === "number" ? error.code : error ? -1 : 0, stderr }));
+  });
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test("空结构事件不能刷新首事件超时预算", async (context) => {
+  const realSetTimeout = setTimeout;
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  for (const payload of ["{}", '{"choices":[]}']) {
+    let notify!: () => void;
+    const barrier = new Promise<void>((resolve) => { notify = resolve; });
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({ pull(controller) { if (++pulls === 1) controller.enqueue(new TextEncoder().encode(`data: ${payload}\n\n`)); else notify(); } }, { highWaterMark: 0 });
+    const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: async () => new Response(body) }) }).prepare({ provider: "deepseek", model: "test", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } });
+    const result = (async () => { const chunks: StreamChunk[] = []; for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, new AbortController().signal)) chunks.push(chunk); return chunks; })();
+    await barrier;
+    context.mock.timers.tick(100);
+    const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("空结构超时未终结")), 200))]);
+    assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: "request" } } }]);
+  }
+});
+for (const mode of ["request", "idle", "error-body"] as const) {
+  test(`超时中止触发同步拒绝保留 TIMEOUT：${mode}`, async (context) => {
+    const realSetTimeout = setTimeout;
+    context.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    let started!: () => void;
+    const barrier = new Promise<void>((resolve) => { started = resolve; });
+    const transport: typeof fetch = (_url, init) => {
+      const actualSignal = init?.signal as AbortSignal;
+      if (mode === "request") return new Promise<Response>((_resolve, reject) => { actualSignal.addEventListener("abort", () => reject(new Error("private"))); started(); });
+      let pulls = 0;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { actualSignal.addEventListener("abort", () => controller.error(new Error("private"))); },
+        pull(controller) {
+          if (mode === "idle" && ++pulls === 1) controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{}}]}\n\n'));
+          else started();
+        },
+      }, { highWaterMark: 0 });
+      return Promise.resolve(new Response(body, { status: mode === "error-body" ? 400 : 200 }));
+    };
+    const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: transport }) }).prepare({ provider: "deepseek", model: "test", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } });
+    const result = (async () => { const chunks: StreamChunk[] = []; for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, new AbortController().signal)) chunks.push(chunk); return chunks; })();
+    await barrier;
+    context.mock.timers.tick(mode === "idle" ? 50 : 100);
+    const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("同步拒绝未终结")), 200))]);
+    assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: mode === "idle" ? "idle" : "request" } } }], mode);
+    assert.doesNotMatch(JSON.stringify(chunks), /private/);
+  });
+}

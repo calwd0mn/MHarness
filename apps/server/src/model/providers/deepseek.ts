@@ -82,7 +82,10 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
       if (signal.aborted) abort();
       else signal.addEventListener("abort", abort, { once: true });
       const wait = async <T>(promise: Promise<T>, late?: (value: T) => void): Promise<T> => {
-        check();
+        if (terminal) {
+          void promise.then(late ?? (() => {}), () => {});
+          throw terminal;
+        }
         const start = Date.now();
         let timer: ReturnType<typeof setTimeout> | undefined;
         let onAbort: (() => void) | undefined;
@@ -97,7 +100,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
           return value;
         } catch (error: unknown) {
           if (terminal && late) void promise.then(late, () => {});
-          throw error;
+          throw terminal ?? error;
         } finally {
           remaining = Math.max(0, remaining - (Date.now() - start));
           if (timer !== undefined) clearTimeout(timer);
@@ -181,11 +184,13 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
               if (line === "") {
                 if (!data.length) continue;
                 const payload = data.join("\n"); data = [];
-                phase = "idle"; remaining = request.timeouts.idleTimeoutMs;
                 if (payload === "[DONE]") { done = true; break; }
                 let parsed: z.infer<typeof eventSchema>;
                 try { parsed = eventSchema.parse(JSON.parse(payload)); } catch { throw new LlmError("PROTOCOL"); }
                 const choice = parsed.choices?.[0];
+                if (parsed.usage || choice?.delta !== undefined || choice?.finish_reason != null) {
+                  phase = "idle"; remaining = request.timeouts.idleTimeoutMs;
+                }
                 for (const [type, text] of [["reasoning", choice?.delta?.reasoning_content], ["text", choice?.delta?.content]] as const) {
                   if (!text) continue;
                   let block = blocks.find((item) => item.type === type);
