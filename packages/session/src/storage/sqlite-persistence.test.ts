@@ -282,3 +282,243 @@ test("未结束事务关闭时释放写锁且不暴露未提交记录", async (t
     await next.close(); await other.close(); await store.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("暂存批次在 SQLite 成功提交或确认回滚，不会重放回滚候选", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-"));
+  const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  const injection = new DatabaseSync(path);
+  t.after(async () => { injection.close(); await observer.close(); await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const session = new Session(header);
+  const handle = await store.create(header);
+  await handle.flush(); store.bindWriter(handle, session);
+  const reader = await observer.open("s", "read"); assert.ok(reader);
+  const committed = await session.commitStaged(() => [
+    { type: "turn/start", data: { turn: 1 } }, { type: "step/start", data: { turn: 1, step: 1 } },
+  ]);
+  assert.equal(committed.status, "committed");
+  assert.deepEqual(await reader.read(), session.snapshot().events);
+  injection.exec("CREATE TRIGGER fail_staged BEFORE INSERT ON mh_events WHEN NEW.seq=3 BEGIN SELECT RAISE(ABORT, 'staged failure'); END");
+  const rolledBack = await session.commitStaged(() => [
+    { type: "step/end", data: { turn: 1, step: 1 } }, { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } },
+  ]);
+  assert.equal(rolledBack.status, "rolled-back");
+  assert.equal(session.seq, 2); assert.equal((await reader.read()).length, 2);
+  injection.exec("DROP TRIGGER fail_staged");
+  await session.flush(); await store.flush();
+  assert.equal((await reader.read()).length, 2);
+  session.append({ type: "turn/start", data: { turn: 2 } }); await session.flush();
+  assert.deepEqual(await reader.read(), session.snapshot().events);
+  await observer.close(); await store.close();
+  const reopened = new SqliteSessionPersistence(path, { readOnly: true });
+  try {
+    const reopenedReader = await reopened.open("s", "read"); assert.ok(reopenedReader);
+    assert.deepEqual(await reopenedReader.read(), session.snapshot().events);
+    assert.equal((await reopened.stat("s"))?.eventCount, 3);
+  } finally { await reopened.close(); }
+});
+
+test("暂存事务未结束时保持旧视图和占用，显式核对后释放", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-pending-"));
+  const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  let fail = true; let reconciliationReads = 0;
+  const prepare = DatabaseSync.prototype.prepare;
+  const readMonitor = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.startsWith("SELECT header_json, inherited_count, event_count")) reconciliationReads++;
+    return prepare.call(this, sql);
+  });
+  t.after(async () => { fail = false; readMonitor.mock.restore(); await observer.close(); await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const session = new Session(header); const handle = await store.create(header);
+  await handle.flush(); const reports: unknown[] = []; store.bindWriter(handle, session, (error) => reports.push(error));
+  const reader = await observer.open("s", "read"); assert.ok(reader);
+  const fault = interceptWrite(t, (_db, sql, execute) => {
+    if (fail && (sql === "COMMIT" || sql === "ROLLBACK")) throw new Error("injected transaction failure");
+    execute();
+  });
+  const operation = session.commitStaged(() => [{ type: "turn/start", data: { turn: 1 } }]);
+  await assert.rejects(handle.append([event(0)]), /占用/); await assert.rejects(handle.flush(), /占用/);
+  const result = await operation;
+  assert.equal(result.status, "pending-reconciliation"); assert.equal(reports.length, 1);
+  assert.equal(session.seq, 0); assert.deepEqual(await reader.read(), []);
+  assert.throws(() => session.append({ type: "turn/start", data: { turn: 2 } }), /暂存/);
+  await assert.rejects(session.commitStaged(() => [{ type: "turn/start", data: { turn: 2 } }]), /占用/);
+  await assert.rejects(handle.flush(), /原事务尚未结束/); await assert.rejects(session.flush()); await assert.rejects(store.flush());
+  assert.equal(reconciliationReads, 0);
+  fail = false; await handle.flush(); assert.equal(session.seq, 0);
+  session.append({ type: "turn/start", data: { turn: 2 } }); await session.flush();
+  assert.deepEqual(await reader.read(), session.snapshot().events);
+  fault.mock.restore();
+});
+
+test("提交响应和首次核对读取丢失后补发布完整批次一次", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-lost-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  t.after(async () => { await observer.close(); await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const session = new Session(header); const handle = await store.create(header); await handle.flush();
+  const reports: unknown[] = []; store.bindWriter(handle, session, (error) => reports.push(error));
+  const reader = await observer.open("s", "read"); assert.ok(reader);
+  const seen: number[] = []; session.on("session/event", ({ seq }) => seen.push(seq));
+  let failRead = false; let loseCommit = true;
+  const prepare = DatabaseSync.prototype.prepare;
+  const readFault = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failRead && sql.startsWith("SELECT header_json, inherited_count, event_count")) { failRead = false; throw new Error("read lost"); }
+    return prepare.call(this, sql);
+  });
+  const writeFault = interceptWrite(t, (_db, sql, execute) => {
+    execute(); if (sql === "COMMIT" && loseCommit) { loseCommit = false; failRead = true; throw new Error("response lost"); }
+  });
+  const result = await session.commitStaged(() => [{ type: "turn/start", data: { turn: 1 } }, { type: "step/start", data: { turn: 1, step: 1 } }]);
+  assert.equal(result.status, "pending-reconciliation"); assert.equal(reports.length, 1);
+  assert.equal(session.seq, 0); assert.deepEqual(seen, []); assert.equal((await reader.read()).length, 2);
+  await Promise.all([handle.flush(), session.flush()]);
+  assert.equal(session.seq, 2); assert.deepEqual(seen, [0, 1]); assert.deepEqual(await reader.read(), session.snapshot().events);
+  await store.flush(); assert.deepEqual(seen, [0, 1]);
+  writeFault.mock.restore(); readFault.mock.restore();
+});
+
+test("额外持久尾行阻止暂存并报告存储故障", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-conflict-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const injection = new DatabaseSync(path);
+  t.after(async () => { injection.close(); await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const session = new Session(header); const handle = await store.create(header); await handle.flush();
+  const reports: unknown[] = []; store.bindWriter(handle, session, (error) => reports.push(error));
+  injection.prepare("INSERT INTO mh_events VALUES (?, ?, ?)").run("s", 0, JSON.stringify(event(0)));
+  injection.prepare("UPDATE mh_sessions SET event_count=1 WHERE session_id=?").run("s");
+  await assert.rejects(session.commitStaged(() => [{ type: "turn/start", data: { turn: 2 } }]), /前缀/);
+  assert.equal(reports.length, 1); assert.equal(session.seq, 0); assert.equal((await handle.read()).length, 1);
+});
+
+test("核对时出现额外尾行保持阻塞并在关闭失败后释放写入权", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-conflict-pending-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const injection = new DatabaseSync(path);
+  const session = new Session(header); const handle = await store.create(header); await handle.flush(); store.bindWriter(handle, session, () => {});
+  let failRead = false; let loseCommit = true; const prepare = DatabaseSync.prototype.prepare;
+  const readFault = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failRead && sql.startsWith("SELECT header_json, inherited_count, event_count")) { failRead = false; throw new Error("read failure"); }
+    return prepare.call(this, sql);
+  });
+  const writeFault = interceptWrite(t, (_db, sql, execute) => { execute(); if (sql === "COMMIT" && loseCommit) { loseCommit = false; failRead = true; throw new Error("lost response"); } });
+  try {
+    assert.equal((await session.commitStaged(() => [{ type: "turn/start", data: { turn: 1 } }])).status, "pending-reconciliation");
+    injection.prepare("INSERT INTO mh_events VALUES (?, ?, ?)").run("s", 1, JSON.stringify(event(1)));
+    injection.prepare("UPDATE mh_sessions SET event_count=2 WHERE session_id=?").run("s");
+    await assert.rejects(session.flush(), /冲突/); assert.equal(session.seq, 0);
+    assert.throws(() => session.append({ type: "turn/start", data: { turn: 3 } }), /暂存/);
+    await assert.rejects(handle.close());
+    const replacement = await store.open("s", "write"); assert.ok(replacement); await replacement.close();
+  } finally {
+    writeFault.mock.restore(); readFault.mock.restore(); injection.close(); await store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("核对拒绝部分批次、内容不符、旧前缀缺号和额外尾行", async (t) => {
+  for (const kind of ["partial", "different", "missing-prefix", "extra-tail"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "mh-staged-shape-")); const path = join(dir, "db.sqlite");
+    const store = new SqliteSessionPersistence(path); const injection = new DatabaseSync(path);
+    const session = new Session(header); session.append({ type: "turn/start", data: { turn: 10 } });
+    const handle = await store.create(header); await handle.append(session.snapshot().events); store.bindWriter(handle, session, () => {});
+    let failRead = false; let loseCommit = true; const prepare = DatabaseSync.prototype.prepare;
+    const readFault = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+      if (failRead && sql.startsWith("SELECT header_json, inherited_count, event_count")) { failRead = false; throw new Error("read failure"); }
+      return prepare.call(this, sql);
+    });
+    const writeFault = interceptWrite(t, (_db, sql, execute) => { execute(); if (sql === "COMMIT" && loseCommit) { loseCommit = false; failRead = true; throw new Error("lost response"); } });
+    try {
+      const seen: number[] = []; session.on("session/event", ({ seq }) => seen.push(seq));
+      const outcome = await session.commitStaged(() => [{ type: "turn/start", data: { turn: 11 } }, { type: "turn/start", data: { turn: 12 } }]);
+      assert.equal(outcome.status, "pending-reconciliation", kind);
+      if (kind === "partial") injection.prepare("DELETE FROM mh_events WHERE session_id=? AND seq=2").run("s");
+      if (kind === "different") injection.prepare("UPDATE mh_events SET event_json=? WHERE session_id=? AND seq=1").run(JSON.stringify(event(1)), "s");
+      if (kind === "missing-prefix") injection.prepare("DELETE FROM mh_events WHERE session_id=? AND seq=0").run("s");
+      if (kind === "missing-prefix" || kind === "extra-tail") injection.prepare("INSERT INTO mh_events VALUES (?, ?, ?)").run("s", 3, JSON.stringify(event(3)));
+      await assert.rejects(session.flush(), /冲突/, kind); assert.equal(session.seq, 1, kind); assert.deepEqual(seen, [], kind);
+      assert.throws(() => session.append({ type: "turn/start", data: { turn: 13 } }), /暂存/, kind);
+      await assert.rejects(handle.close());
+      const replacement = await store.open("s", "write"); assert.ok(replacement); await replacement.close();
+    } finally {
+      writeFault.mock.restore(); readFault.mock.restore(); injection.close(); await store.close(); await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("提交成功但响应丢失时同步核对成功并重开保留完整批次", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-staged-commit-lost-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const session = new Session(header);
+  const handle = await store.create(header); await handle.flush(); store.bindWriter(handle, session);
+  let loseCommit = true; const fault = interceptWrite(t, (_db, sql, execute) => {
+    execute(); if (sql === "COMMIT" && loseCommit) { loseCommit = false; throw new Error("response lost"); }
+  });
+  try {
+    const notifications: number[] = []; session.on("session/event", ({ seq }) => notifications.push(seq));
+    const result = await session.commitStaged(() => [{ type: "turn/start", data: { turn: 1 } }, { type: "step/start", data: { turn: 1, step: 1 } }]);
+    assert.equal(result.status, "committed"); assert.deepEqual(notifications, [0, 1]);
+    await session.flush(); assert.deepEqual(notifications, [0, 1]);
+    fault.mock.restore(); await store.close();
+    const reopened = new SqliteSessionPersistence(path, { readOnly: true });
+    try { const reader = await reopened.open("s", "read"); assert.ok(reader); assert.deepEqual(await reader.read(), session.snapshot().events); assert.equal((await reopened.stat("s"))?.eventCount, 2); }
+    finally { await reopened.close(); }
+  } finally { fault.mock.restore(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("预检失败且回滚延迟时，外部相同尾行不能冒充暂存提交", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-preflight-identical-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const injection = new DatabaseSync(path);
+  const session = new Session(header); const handle = await store.create(header); await handle.flush(); store.bindWriter(handle, session, () => {});
+  const identical = event(0);
+  injection.prepare("INSERT INTO mh_events VALUES (?, ?, ?)").run("s", 0, JSON.stringify(identical));
+  injection.prepare("UPDATE mh_sessions SET event_count=1 WHERE session_id=?").run("s");
+  let failRollback = true;
+  const fault = interceptWrite(t, (_db, sql, execute) => {
+    if (sql === "ROLLBACK" && failRollback) { failRollback = false; throw new Error("rollback lost"); }
+    execute();
+  });
+  try {
+    const notices: number[] = []; session.on("session/event", ({ seq }) => notices.push(seq));
+    const result = await session.commitStaged(() => [{ type: "turn/start", time: 2, data: { turn: 1 } }]);
+    assert.equal(result.status, "pending-reconciliation");
+    await assert.rejects(session.flush()); assert.equal(session.seq, 0); assert.deepEqual(notices, []);
+    await assert.rejects(handle.close());
+  } finally { fault.mock.restore(); injection.close(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("核对读取 BEGIN 已生效后抛错会清理事务并允许重试发布", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-reconcile-begin-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const session = new Session(header);
+  const handle = await store.create(header); await handle.flush(); store.bindWriter(handle, session, () => {});
+  let writer: DatabaseSync | undefined; let failBegin = false; let loseCommit = true;
+  const original = DatabaseSync.prototype.exec;
+  const fault = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") writer = this;
+    if (sql === "BEGIN" && failBegin) { failBegin = false; original.call(this, sql); throw new Error("begin response lost"); }
+    original.call(this, sql);
+    if (this === writer && sql === "COMMIT" && loseCommit) { loseCommit = false; failBegin = true; throw new Error("commit response lost"); }
+  });
+  try {
+    const seen: number[] = []; session.on("session/event", ({ seq }) => seen.push(seq));
+    const result = await session.commitStaged(() => [{ type: "turn/start", data: { turn: 1 } }, { type: "step/start", data: { turn: 1, step: 1 } }]);
+    assert.equal(result.status, "pending-reconciliation"); assert.equal(session.seq, 0); assert.deepEqual(seen, []);
+    await handle.flush(); assert.equal(session.seq, 2); assert.deepEqual(seen, [0, 1]);
+    await session.flush(); assert.deepEqual(seen, [0, 1]); assert.deepEqual(await handle.read(), session.snapshot().events);
+  } finally {
+    fault.mock.restore();
+    try { await store.close(); } finally { await rm(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("范围读取 BEGIN 已生效后抛错不会污染后续读取", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-read-begin-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const handle = await store.create(header);
+  await handle.append([event(0)]);
+  let fail = true; const original = DatabaseSync.prototype.exec;
+  const fault = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    original.call(this, sql);
+    if (sql === "BEGIN" && fail) { fail = false; throw new Error("begin response lost"); }
+  });
+  try {
+    await assert.rejects(handle.read(), /begin response lost/);
+    assert.deepEqual(await handle.read(), [event(0)]);
+  } finally { fault.mock.restore(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});

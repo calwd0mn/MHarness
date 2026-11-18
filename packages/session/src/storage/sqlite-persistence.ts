@@ -5,12 +5,13 @@ import { isDeepStrictEqual } from "node:util";
 import { snapshotSessionEvent, type SessionEvent } from "../events.ts";
 import { SessionPersistence, type SessionAccess, type SessionHandle, type SessionPersistenceCreateOptions, type SessionPersistenceSnapshot } from "../persistence.ts";
 import { isValidSessionId } from "../session-id.ts";
-import type { Session, SessionHeader } from "../session.ts";
+import type { Session, SessionHeader, StagedPersistenceResult } from "../session.ts";
 import { SessionWriter } from "../writer.ts";
 import { acquireSessionOwnership, type Ownership } from "./ownership.ts";
 
 type Row = Record<string, unknown>;
-type Pending = { events: readonly SessionEvent[]; start: number; first: boolean };
+type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; staged?: boolean; preflightFailed?: boolean };
+class StagedPrefixError extends Error {}
 
 interface HandleStorage {
   readonly db: DatabaseSync;
@@ -256,6 +257,7 @@ class SqliteHandle implements SessionHandle {
   #closing?: Promise<void>;
   #pending?: Pending;
   #writer?: SessionWriter;
+  #session?: Session;
   constructor(private readonly store: HandleStorage, readonly header: SessionHeader, readonly access: SessionAccess,
     readonly inheritedEventCount: number, private readonly ownership: Ownership | undefined, public published: boolean) { this.id = header.sessionId; }
   get writer(): SessionWriter | undefined { return this.#closing ? undefined : this.#writer; }
@@ -270,7 +272,10 @@ class SqliteHandle implements SessionHandle {
       append: async (events) => this.#append(events),
       flush: async () => this.#flush(),
       read: async (offset, length) => this.#read(offset, length),
+      commitStaged: async (events) => this.#commitStaged(events),
+      reconcileStaged: async () => this.#reconcileStaged(),
     }, reportError);
+    this.#session = session;
   }
 
   #check(write = false): void { if (this.#closing) throw new Error("句柄已关闭"); if (write && this.access !== "write") throw new Error("句柄为只读"); }
@@ -282,12 +287,19 @@ class SqliteHandle implements SessionHandle {
 
   #read(offset = 0, length?: number): readonly SessionEvent[] {
     const db = this.store.reader;
-    db.exec("BEGIN");
     try {
+      db.exec("BEGIN");
       const row = db.prepare("SELECT COUNT(*) AS count, MIN(seq) AS first, MAX(seq) AS last FROM mh_events WHERE session_id=?").get(this.id);
       const count = row?.count;
-      const meta = db.prepare("SELECT event_count FROM mh_sessions WHERE session_id=?").get(this.id);
-      if (this.published && meta?.event_count !== count) throw new Error("持久事件数量不一致");
+      const meta = db.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(this.id);
+      if (this.published) {
+        if (!meta) throw new Error("持久会话元数据缺失");
+        const info = metadata(meta);
+        if (!isDeepStrictEqual(info.header, this.header) || info.inheritedEventCount !== this.inheritedEventCount) {
+          throw new Error("持久会话元数据不一致");
+        }
+        if (info.eventCount !== count) throw new Error("持久事件数量不一致");
+      }
       if (!position(count) || (count > 0 && (row?.first !== 0 || row?.last !== count - 1))) throw new Error("持久事件前缀不连续");
       const size = length ?? (count - offset);
       if (!position(offset) || !position(size) || offset > count || size > count - offset) throw new RangeError("会话事件范围未提交");
@@ -303,6 +315,7 @@ class SqliteHandle implements SessionHandle {
   }
   async append(events: readonly SessionEvent[]): Promise<void> {
     this.#check(true);
+    if (this.#session?.stagedOccupied) throw new Error("会话暂存写入占用中");
     this.#append(events);
   }
 
@@ -327,11 +340,17 @@ class SqliteHandle implements SessionHandle {
   }
   async flush(): Promise<void> {
     this.#check(true);
+    if (this.#session?.stagedOccupied) {
+      if (!this.#writer?.stagedReconciliationPending) throw new Error("会话暂存写入占用中");
+      await this.#writer.flush();
+      return;
+    }
     this.#flush();
   }
 
   #flush(): void {
     if (this.#pending) {
+      if (this.#pending.staged) throw new Error("暂存批次须先核对");
       const pending = this.#pending;
       if (!this.#reconcile()) this.#commit(pending);
     }
@@ -339,6 +358,25 @@ class SqliteHandle implements SessionHandle {
       if (this.header.isSeeded === true) throw new Error("分支需要原子提交初始前缀和继承标记");
       this.#commit({ events: [], start: 0, first: true });
     }
+  }
+  #commitStaged(events: readonly SessionEvent[]): StagedPersistenceResult {
+    const start = events[0]?.seq;
+    if (start === undefined || this.#pending) throw new Error("暂存批次或写入状态无效");
+    if (this.store.db.isTransaction) throw new Error("其他事务尚未结束");
+    try {
+      this.#commit({ events, start, first: false, staged: true, preflightFailed: true });
+      return { status: "committed" };
+    } catch (error) {
+      if (this.#pending) return { status: "pending-reconciliation", error };
+      if (error instanceof StagedPrefixError) throw error;
+      return { status: "rolled-back", error };
+    }
+  }
+  #reconcileStaged(): StagedPersistenceResult {
+    if (!this.#pending?.staged) throw new Error("没有待核对的暂存批次");
+    try {
+      return this.#reconcile() ? { status: "committed" } : { status: "rolled-back", error: new Error("暂存事务已回滚") };
+    } catch (error) { return { status: "pending-reconciliation", error }; }
   }
   close(): Promise<void> {
     this.#closing ??= this.#finishClose();
@@ -360,6 +398,18 @@ class SqliteHandle implements SessionHandle {
     this.#pending = batch;
     try {
       this.store.beginWrite(this);
+      if (batch.staged) {
+        const meta = db.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(this.id);
+        const rows = db.prepare("SELECT COUNT(*) AS count, MIN(seq) AS first, MAX(seq) AS last FROM mh_events WHERE session_id=?").get(this.id);
+        let headerMatches = false;
+        try { headerMatches = !!meta && isDeepStrictEqual(metadata(meta).header, this.header); } catch { /* 损坏元数据属于前缀故障。 */ }
+        if (!meta || !headerMatches || meta.inherited_count !== this.inheritedEventCount ||
+          meta.event_count !== batch.start || rows?.count !== batch.start ||
+          (batch.start > 0 && (rows.first !== 0 || rows.last !== batch.start - 1))) {
+          throw new StagedPrefixError("暂存前持久前缀不一致");
+        }
+        batch.preflightFailed = false;
+      }
       if (batch.first) db.prepare("INSERT INTO mh_sessions VALUES (?, ?, ?, 0)").run(this.id, JSON.stringify(this.header), this.inheritedEventCount);
       const insert = db.prepare("INSERT INTO mh_events VALUES (?, ?, ?)");
       for (const event of batch.events) insert.run(this.id, event.seq, JSON.stringify(event));
@@ -370,6 +420,7 @@ class SqliteHandle implements SessionHandle {
       this.#pending = undefined;
     } catch (error) {
       try { this.store.rollbackWrite(this); } catch { throw error; }
+      if (error instanceof StagedPrefixError) { this.#pending = undefined; throw error; }
       try { if (this.#reconcile()) return; } catch { /* 保留待核对批次供后续显式操作处理。 */ }
       throw error;
     }
@@ -381,19 +432,26 @@ class SqliteHandle implements SessionHandle {
       throw new Error("原事务尚未结束", { cause });
     }
     const reader = this.store.reader;
+    try {
+    reader.exec("BEGIN");
     const row = reader.prepare("SELECT header_json, inherited_count, event_count FROM mh_sessions WHERE session_id=?").get(this.id);
+    const shape = reader.prepare("SELECT COUNT(*) AS count, MIN(seq) AS first, MAX(seq) AS last FROM mh_events WHERE session_id=?").get(this.id);
     const rows = reader.prepare("SELECT seq, event_json FROM mh_events WHERE session_id=? AND seq>=? AND seq<? ORDER BY seq").all(this.id, pending.start, pending.start + pending.events.length);
+    const contiguous = (count: number) => shape?.count === count && (count === 0 || (shape.first === 0 && shape.last === count - 1));
     const headerMatches = row && typeof row.header_json === "string" && isDeepStrictEqual(parseHeader(row.header_json), this.header) && row.inherited_count === this.inheritedEventCount;
-    if ((pending.first ? !row : !!row && headerMatches && row.event_count === pending.start) && rows.length === 0 && (pending.events.length > 0 || !row)) {
+    if ((pending.first ? !row : !!row && headerMatches && row.event_count === pending.start) && contiguous(pending.start) && rows.length === 0 && (pending.events.length > 0 || !row)) {
+      reader.exec("COMMIT");
       this.#pending = undefined;
       return false;
     }
-    if (headerMatches && row.event_count === pending.start + pending.events.length && rows.length === pending.events.length && rows.every((entry, index) =>
+    if (!pending.preflightFailed && headerMatches && row.event_count === pending.start + pending.events.length && contiguous(pending.start + pending.events.length) && rows.length === pending.events.length && rows.every((entry, index) =>
       entry.seq === pending.start + index && typeof entry.event_json === "string" && isDeepStrictEqual(JSON.parse(entry.event_json), pending.events[index]))) {
+      reader.exec("COMMIT");
       this.published = true;
       this.#pending = undefined;
       return true;
     }
     throw new Error("事务结果冲突或不完整，写入保持阻塞");
+    } catch (error) { if (reader.isTransaction) reader.exec("ROLLBACK"); throw error; }
   }
 }

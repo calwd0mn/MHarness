@@ -43,6 +43,18 @@ function messageOf(event: SurfaceEvent): SessionMessage {
 
 type ReportListenerError = (error: unknown) => void;
 
+/** 暂存批次的持久化结论；待核对时调用方须先恢复存储准入。 */
+export type StagedCommitResult =
+  | { readonly status: "committed"; readonly events: readonly SessionEvent[] }
+  | { readonly status: "rolled-back"; readonly error: unknown }
+  | { readonly status: "pending-reconciliation"; readonly error: unknown };
+
+/** 写入器对暂存批次的持久化结论。 */
+export type StagedPersistenceResult =
+  | { readonly status: "committed" }
+  | { readonly status: "rolled-back"; readonly error: unknown }
+  | { readonly status: "pending-reconciliation"; readonly error: unknown };
+
 type UnionKeys<T> = T extends unknown ? keyof T : never;
 type AppendedEvent<Input extends SessionAppendInput> = Extract<SessionEvent, { type: Input["type"] }>;
 
@@ -92,10 +104,12 @@ function reportListenerError(error: unknown): void {
 /** 在内存中接受和读取会话事件。事件接受可同步观察。 */
 export class Session {
   readonly #events: SessionEvent[] = [];
-  readonly #toolCalls = new SessionToolCalls();
+  #toolCalls = new SessionToolCalls();
   readonly #notifications: { "session/event": Notifications<SessionEvent> };
-  #checkpoint?: { readonly flush: (eventCount: number) => Promise<void> };
+  #checkpoint?: { readonly flush: (eventCount: number) => Promise<void>; readonly staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void) => Promise<StagedPersistenceResult> };
   #appending = false;
+  #staged = false;
+  #publishingStaged = false;
   #surface: SurfaceEvent[] = [];
   #messages: SessionMessage[] | undefined = [];
   #replaceGeneration = 0;
@@ -159,7 +173,7 @@ export class Session {
   append<const Input extends SessionAppendInput>(
     candidate: Input & ([UnexpectedAppendFields<NoInfer<Input>>] extends [never] ? unknown : never),
   ): AppendedEvent<Input> {
-    if (this.#appending) throw new Error("会话事件追加不允许重入");
+    if (this.#appending || this.#staged) throw new Error("会话事件追加不允许重入或与暂存竞争");
     this.#appending = true;
     try {
       const event = snapshotSessionEvent(candidate, this.seq, "append");
@@ -170,6 +184,60 @@ export class Session {
       return event as AppendedEvent<Input>;
     } finally {
       this.#appending = false;
+    }
+  }
+
+  /** 当前是否由暂存批次占用写入位置。 */
+  get stagedOccupied(): boolean { return this.#staged; }
+
+  /** 写入器用此标记识别已持久化的通知，避免再次入队。 */
+  get publishingStaged(): boolean { return this.#publishingStaged; }
+
+  /**
+   * 同步构建并校验完整候选，再等待持久化结论；待核对时保留占用直到检查点处理。
+   * @param build - 接收批次首序号并返回候选；不得在其中执行异步工作。
+   * @returns 已提交事件、确认回滚的原因或待核对原因。
+   * @throws 未绑定暂存写入器、写入竞争、构建或校验失败时拒绝。
+   */
+  async commitStaged(build: (firstSeq: number) => readonly SessionAppendInput[]): Promise<StagedCommitResult> {
+    if (this.#appending || this.#staged) throw new Error("会话写入已被占用");
+    const staged = this.#checkpoint?.staged;
+    if (!staged) throw new Error("会话未绑定暂存写入器");
+    this.#staged = true;
+    try {
+      const draft = new Session({ sessionId: this.header.sessionId, createdAt: this.header.createdAt });
+      for (const event of this.#events) draft.#events.push(event);
+      draft.#toolCalls = this.#toolCalls.clone();
+      draft.#surface = this.#surface.slice();
+      draft.#messages = this.#messages?.slice();
+      draft.#replaceGeneration = this.#replaceGeneration;
+      const candidates = build(this.seq);
+      if (!Array.isArray(candidates as unknown) || candidates.length === 0) throw new Error("暂存批次不能为空");
+      for (const candidate of candidates) {
+        const event = snapshotSessionEvent(candidate, draft.seq, "append");
+        if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
+        draft.#accept(event);
+      }
+      const events = Object.freeze(draft.#events.slice(this.seq));
+      const finish = (result: StagedPersistenceResult) => {
+        if (result.status === "pending-reconciliation") return;
+        if (result.status === "committed") {
+          for (const event of events) this.#events.push(event);
+          this.#toolCalls = draft.#toolCalls;
+          this.#surface = draft.#surface;
+          this.#messages = draft.#messages;
+          this.#replaceGeneration = draft.#replaceGeneration;
+          this.#publishingStaged = true;
+          try { for (const event of events) this.#notifications["session/event"].emit(event); }
+          finally { this.#publishingStaged = false; }
+        }
+        this.#staged = false;
+      };
+      const result = await staged(events, finish);
+      return result.status === "committed" ? { status: "committed", events } : result;
+    } catch (error) {
+      this.#staged = false;
+      throw error;
     }
   }
 
@@ -269,12 +337,13 @@ export class Session {
   /**
    * 绑定此 Session 的持久化检查点，调用方须在接收新事件前完成绑定。
    * @param checkpoint - 负责确认调用时传入的事件数已提交。
+   * @param staged - 可选的暂存提交能力；结果确认或后续核对后须同步调用 finish，待核对时保留该回调。
    * @returns 解除本次绑定的函数。
    * @throws 已有绑定时抛出。
    */
-  bindCheckpoint(checkpoint: (eventCount: number) => Promise<void>): () => void {
+  bindCheckpoint(checkpoint: (eventCount: number) => Promise<void>, staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void) => Promise<StagedPersistenceResult>): () => void {
     if (this.#checkpoint) throw new Error("会话已绑定持久化检查点");
-    const binding = { flush: checkpoint };
+    const binding = { flush: checkpoint, staged };
     this.#checkpoint = binding;
     return () => {
       if (this.#checkpoint === binding) this.#checkpoint = undefined;

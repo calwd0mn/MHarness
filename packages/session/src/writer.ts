@@ -1,10 +1,14 @@
 import type { SessionEvent } from "./events.ts";
 import type { SessionHandle } from "./persistence.ts";
-import type { Session } from "./session.ts";
+import type { Session, StagedPersistenceResult } from "./session.ts";
 
 const writeWindowMs = 200;
 
-type WriterPort = Pick<SessionHandle, "append" | "flush" | "read">;
+/** 暂存端口仅提交一次；待核对时保留批次，显式核对返回可靠结论或继续等待。 */
+type WriterPort = Pick<SessionHandle, "append" | "flush" | "read"> & {
+  commitStaged?: (events: readonly SessionEvent[]) => Promise<StagedPersistenceResult>;
+  reconcileStaged?: () => Promise<StagedPersistenceResult>;
+};
 
 /** 把会话新接受的事件按固定窗口串行提交。绑定前的初始前缀由调用方提交。 */
 export class SessionWriter {
@@ -17,6 +21,10 @@ export class SessionWriter {
   #closing?: Promise<void>;
   #backgroundQueued = false;
   #paused = false;
+  #stagedFinish?: (result: StagedPersistenceResult) => void;
+
+  /** 暂存事务结果待核对时，句柄可经此写入器的检查点处理。 */
+  get stagedReconciliationPending(): boolean { return this.#stagedFinish !== undefined; }
 
   /**
    * 订阅一个会话并绑定其检查点，已有前缀不进入缓冲。
@@ -30,11 +38,38 @@ export class SessionWriter {
     private readonly port: WriterPort,
     private readonly reportError: (error: unknown) => void = (error) => console.error("会话后台写入失败", error),
   ) {
-    this.#unbind = session.bindCheckpoint((eventCount) => this.flush(eventCount));
+    this.#unbind = session.bindCheckpoint((eventCount) => this.flush(eventCount), port.commitStaged && port.reconcileStaged
+      ? (events, finish) => this.#commitStaged(events, finish) : undefined);
     this.#unsubscribe = session.on("session/event", (event) => {
+      if (session.publishingStaged) return;
       this.#pending.push(event);
       this.#startWindow();
     });
+  }
+
+  async #commitStaged(events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void): Promise<StagedPersistenceResult> {
+    if (this.#closing || !this.port.commitStaged) throw new Error("会话写入器已关闭或不支持暂存");
+    this.#sealWindow();
+    let result: StagedPersistenceResult | undefined;
+    await this.#serialize(async () => {
+      try {
+        await this.#checkpoint(events[0]!.seq);
+        result = await this.port.commitStaged!(events);
+        if (result.status === "pending-reconciliation") {
+          this.#stagedFinish = finish;
+          this.#pause();
+          this.#report(result.error);
+        } else finish(result);
+      } catch (error) {
+        this.#report(error);
+        throw error;
+      }
+    });
+    return result!;
+  }
+
+  #report(error: unknown): void {
+    try { this.reportError(error); } catch (reportingError) { console.error("会话后台写入告警失败", reportingError); }
   }
 
   /**
@@ -93,11 +128,7 @@ export class SessionWriter {
         await this.#drainLive();
       } catch (error) {
         this.#pause();
-        try {
-          this.reportError(error);
-        } catch (reportingError) {
-          console.error("会话后台写入告警失败", reportingError);
-        }
+        this.#report(error);
       }
     });
   }
@@ -117,6 +148,13 @@ export class SessionWriter {
 
   async #checkpoint(eventCount: number): Promise<void> {
     try {
+      if (this.#stagedFinish) {
+        const result = await this.port.reconcileStaged!();
+        if (result.status === "pending-reconciliation") throw result.error;
+        const finish = this.#stagedFinish;
+        this.#stagedFinish = undefined;
+        finish(result);
+      }
       await this.#drainLive();
       await this.port.flush();
       // 空范围也要求起点已提交，检测未入队或绑定前漏写的前缀。
