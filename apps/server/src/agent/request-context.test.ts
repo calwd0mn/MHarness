@@ -87,3 +87,18 @@ test("Turn 未覆盖旧采样默认值时拒绝且不追加头", () => {
   assert.throws(() => prepare(s), /默认/);
   assert.equal(s.seq, 0);
 });
+
+test("没有请求头的闭合 seed 在分支首次生成仍写 resume", () => {
+  const parent = session();
+  parent.append({ type: "turn/start", data: { turn: 1 } });
+  user(parent, "inherited");
+  parent.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  const child = new Session({ sessionId: "child", parentSession: parent.header.sessionId, isSeeded: true, createdAt: 2 },
+    { seed: { kind: "fork", events: parent.snapshot().events } });
+  const prepare = createRequestPreparer({ runtime: new LlmRuntime({ mock: createMockAdapter(() => []) }),
+    config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "sys" });
+  assert.deepEqual(prepare(child).input.messages, [{ role: "user", text: "inherited" }]);
+  const header = child.snapshot().events.at(-1);
+  assert.ok(header?.type === "request/header");
+  assert.equal(header.data.reason, "resume");
+});

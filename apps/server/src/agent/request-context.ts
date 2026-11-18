@@ -102,13 +102,14 @@ export function createRequestPreparer(options: RequestContextOptions):
     modelTools(header as Header);
     const previous = seen.get(session);
     const priorHeader = foldRequestHeader(session.snapshot().events);
+    const resumes = priorHeader !== undefined || session.header.isSeeded === true;
     const changed = previous && !isDeepStrictEqual(priorHeader, header);
     const series = startsSeries || (previous !== undefined && previous.generation !== session.replaceGeneration);
     let actualHeader: Header;
     if (!previous || changed || series) {
       const event = session.append({ type: "request/header", data: {
         header: header as Header,
-        reason: !previous ? priorHeader ? "resume" : "initial" : changed ? "change" : "series",
+        reason: !previous ? resumes ? "resume" : "initial" : changed ? "change" : "series",
         ...(previous && changed && series ? { startsSeries: true as const } : {}),
       } });
       actualHeader = event.data.header;

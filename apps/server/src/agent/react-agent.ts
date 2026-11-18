@@ -24,7 +24,7 @@ export type RunTurn = (context: {
 
 /** 可由 HTTP 层映射的命令失败代码。 */
 export class AgentError extends Error {
-  constructor(readonly code: "agent_busy" | "session/not-found" | "storage_blocked" | "agent_closed", options?: ErrorOptions) { super(code, options); }
+  constructor(readonly code: "agent_busy" | "session/not-found" | "session/fork-unavailable" | "storage_blocked" | "agent_closed", options?: ErrorOptions) { super(code, options); }
 }
 
 /** 会话级执行占用、存储准入和实时观察；运行对象跨 Turn 存活。 */
@@ -207,10 +207,14 @@ export class ReActAgent {
   cancel(): void { this.#controller?.abort(); }
   /** 等待当前活动退出，不取消活动。 */
   async waitForIdle(): Promise<void> { await this.#running; }
-  /** 停止接收新输入，取消并等待当前活动，再解绑观察。 */
-  async stop(): Promise<void> {
+  /** 同步停止接收新输入并请求取消当前活动；活动退出和观察解绑仍须等待 stop。 */
+  beginStop(): void {
     this.#closing = true;
     this.cancel();
+  }
+  /** 停止接收新输入，取消并等待当前活动，再解绑观察。 */
+  async stop(): Promise<void> {
+    this.beginStop();
     try {
       await this.#running;
       await this.#recovering;

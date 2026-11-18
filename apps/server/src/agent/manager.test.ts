@@ -134,6 +134,7 @@ test("加载失败不发布实例，释放写入权后可再次加载", async ()
   const handle = await store.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
   let fail = true;
   const manager = new AgentManager({
+    create: (header, options) => store.create(header, options),
     open: (id, access) => store.open(id, access),
     bindWriter: (writer, session, report) => {
       if (fail) throw new Error("bind failed");
@@ -236,6 +237,7 @@ test("关闭等待加载期间汇总句柄释放失败", async () => {
   let opened: (() => void) | undefined;
   const entered = new Promise<void>((resolve) => { opened = resolve; });
   const manager = new AgentManager({
+    create: (header, options) => store.create(header, options),
     open: async (id, access) => {
       const handle = await store.open(id, access);
       assert.ok(handle);
@@ -281,6 +283,7 @@ test("等待加载时立即观察停止失败，避免未处理拒绝", async ()
   let loadingEntered: (() => void) | undefined;
   const entered = new Promise<void>((resolve) => { loadingEntered = resolve; });
   const manager = new AgentManager({
+    create: (header, options) => store.create(header, options),
     open: async (id, access) => {
       const handle = await store.open(id, access);
       if (id === "b") {

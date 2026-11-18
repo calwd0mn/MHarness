@@ -333,6 +333,15 @@ export class SessionStore {
   }
 
   /**
+   * 释放已退出生命周期的发布实例，原有订阅继续接收之后的发布。
+   * @param session - 实际退出的实例；同 ID 的其他实例不受影响。
+   */
+  release(session: Session): void {
+    const { sessionId } = session.header;
+    if (this.#sessions.get(sessionId) === session) this.#sessions.delete(sessionId);
+  }
+
+  /**
    * 查询已发布的会话。
    * @param sessionId - 会话标识。
    * @returns 对应的内存实例，未发布时返回 undefined。

@@ -381,3 +381,117 @@ for (const failSettlement of [false, true]) {
     }
   });
 }
+
+async function followReader(origin: string, url: string, signal: AbortSignal) {
+  const { followFrameSchema } = await import("@mharness/session/contracts");
+  const response = await fetch(`${origin}${url}/follow`, { signal });
+  assert.equal(response.status, 200);
+  assert.ok(response.body);
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  return { reader, async next() {
+    for (;;) {
+      const boundary = buffer.indexOf("\n\n");
+      if (boundary >= 0) {
+        const item = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (item.startsWith("data: ")) return followFrameSchema.parse(JSON.parse(item.slice(6)) as unknown);
+        continue;
+      }
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("SSE 提前关闭");
+      buffer += chunk.value;
+    }
+  } };
+}
+
+test("真实启动应用的 fork 历史和 follow 保留原事件，继承编号可在子会话新受理", { timeout: 8000 }, async () => {
+  const { rawSessionHistorySchema } = await import("@mharness/session/contracts");
+  const { Session } = await import("@mharness/session/server");
+  const { createEventSessionApp } = await import("../app.ts");
+  const { createModelTurnDriver } = await import("../agent/model-turn.ts");
+  const { createMockAdapter } = await import("../model/providers/mock.ts");
+  const { LlmRuntime } = await import("../model/runtime.ts");
+  const dir = await mkdtemp(join(tmpdir(), "mharness-fork-http-"));
+  const path = join(dir, "events.sqlite");
+  const seedStorage = new SqliteSessionPersistence(path);
+  const parent = new Session({ sessionId: "parent", createdAt: 1 });
+  parent.append({ type: "turn/start", data: { turn: 1 } });
+  parent.append({ type: "step/start", data: { turn: 1, step: 1 } });
+  parent.append({ type: "user/message", surfaceOp: "append", data: {
+    turn: 1, role: "user", source: { kind: "user" }, id: "parent-user", requestId: "shared", content: [{ type: "text", text: "父消息" }],
+  } });
+  parent.append({ type: "request/header", data: { reason: "initial", header: { config: { provider: "mock", model: "test" }, system: "sys", tools: [] } } });
+  parent.append({ type: "assistant/message", surfaceOp: "append", data: {
+    turn: 1, step: 1, message: { id: "parent-assistant", role: "assistant", source: { provider: "mock", model: "test" }, content: [{ type: "text", text: "父回答" }] },
+    finishReason: { kind: "stop" }, stream: [], includeInModelContext: true,
+  } });
+  parent.append({ type: "step/end", data: { turn: 1, step: 1 } });
+  parent.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  const seed = parent.snapshot().events;
+  const calls: Array<{ role: string; text: string }[]> = [];
+  const driver = createModelTurnDriver({
+    runtime: new LlmRuntime({ mock: createMockAdapter((request) => {
+      calls.push(request.messages.map(({ role, text }) => ({ role, text })));
+      return [{ chunk: { type: "text", delta: "子回答" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
+    }) }),
+    config: () => ({ provider: "mock", model: "test" }), systemPrompt: () => "sys",
+  });
+  const controller = new AbortController();
+  let app: Awaited<ReturnType<typeof createEventSessionApp>> | undefined;
+  try {
+    const handle = await seedStorage.create(parent.header);
+    await handle.append(seed);
+    await handle.close();
+    await seedStorage.close();
+    app = await createEventSessionApp(path, false, driver);
+    assert.throws(() => app!.getDecorator("sessionCommands"), /会话恢复尚未完成/);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const commands = app.getDecorator<SessionCommandController>("sessionCommands");
+    const { sessionId } = await commands.fork({ sessionId: "parent", atSeq: 2 });
+    assert.equal(calls.length, 0);
+    const url = `/api/sessions/${sessionId}`;
+    const get = await app.inject({ method: "GET", url });
+    assert.equal(get.statusCode, 200);
+    const initial = rawSessionHistorySchema.parse(get.json());
+    assert.equal(initial.inheritedEventCount, seed.length);
+    assert.deepEqual(initial.records.slice(0, seed.length).map(({ event }) => event), seed);
+    assert.equal(initial.records.at(-1)?.event.type, "session/end-seed");
+    assert.equal(initial.cursor, seed.length);
+    const { reader, next } = await followReader(origin, url, controller.signal);
+    const snapshot = await next();
+    assert.ok(snapshot.type === "snapshot");
+    assert.deepEqual(snapshot.records, initial.records);
+    assert.equal(snapshot.inheritedEventCount, initial.inheritedEventCount);
+    assert.equal(snapshot.cursor, initial.cursor);
+    const submit = (text: string) => app!.inject({ method: "POST", url: `${url}/messages`, payload: {
+      requestId: "shared", content: [{ type: "text", text }],
+    } });
+    assert.deepEqual((await submit("子消息")).json(), { accepted: true });
+    assert.deepEqual((await submit("重发内容")).json(), { accepted: true });
+    const own = [];
+    for (;;) {
+      const frame = await next();
+      assert.notEqual(frame.type, "error");
+      if (frame.type !== "event") continue;
+      assert.equal(frame.event.seq, initial.cursor + own.length + 1);
+      own.push(frame);
+      if (frame.event.type === "turn/end") break;
+    }
+    assert.deepEqual(own[0].event.data, { turn: 2 });
+    assert.deepEqual(own.flatMap(({ event }) => event.type === "request/header" ? [event.data.reason] : []), ["resume"]);
+    assert.deepEqual(calls, [[{ role: "user", text: "父消息" }, { role: "assistant", text: "父回答" }, { role: "user", text: "子消息" }]]);
+    await reader.cancel();
+    await app.close();
+    app = await createEventSessionApp(path, false, driver);
+    const restored = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url })).json());
+    assert.deepEqual(restored.records, [...initial.records, ...own]);
+    assert.deepEqual((await submit("重开后重发")).json(), { accepted: true });
+    assert.equal(calls.length, 1);
+  } finally {
+    controller.abort();
+    await app?.close();
+    await seedStorage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -130,7 +130,7 @@ export function createApp(store: SessionStore, logger = false) {
  * @param logger - 是否启用 HTTP 日志，默认关闭。
  * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
  * @param options - 可注入工具注册表、共享审批服务和模型 HTTP 传输；默认提供 HTTP 审批渠道。
- * @returns 尚未开始监听的应用；调用方须关闭应用以释放存储及实例锁。
+ * @returns 尚未开始监听的应用；完成 ready 或 listen 后，可通过 getDecorator("sessionCommands") 获取进程内命令；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
  */
 export async function createEventSessionApp(path: string, logger = false, runTurn?: RunTurn, options: { approvalService?: ApprovalService; toolRegistry?: ToolRegistry; modelFetch?: typeof fetch } = {}) {
@@ -163,6 +163,11 @@ export async function createEventSessionApp(path: string, logger = false, runTur
   });
   const agents = new AgentManager(persistence, driver);
   const commands = new SessionCommandController(agents);
+  let recovered = false;
+  app.decorate("sessionCommands", { getter: () => {
+    if (!recovered) throw new Error("会话恢复尚未完成");
+    return commands;
+  } });
   app.addHook("onReady", async () => {
     for (const { header } of await persistence.list()) {
       const handle = await persistence.open(header.sessionId, "write");
@@ -173,6 +178,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
         await handle.close();
       }
     }
+    recovered = true;
   });
   app.addHook("onClose", async () => {
     try {

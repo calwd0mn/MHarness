@@ -621,3 +621,39 @@ test("没有工具结果的轮次终态关闭待审批操作", async () => {
   expect(container.textContent).toContain("审批已失效");
   expect(container.textContent).toContain("准备查询");
 });
+
+test("嵌套 fork 中只有子会话自有事件接管同编号发送占位", async () => {
+  const connection = connections[0];
+  expect(connection.url).toBe("/api/sessions/a/follow");
+  fetch.mockImplementation(() => new Promise(() => {}));
+  await enter("子消息");
+  await submit();
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch.mock.calls[0][0]).toBe("/api/sessions/a/messages");
+  const { requestId } = JSON.parse(fetch.mock.calls[0][1].body);
+  const user = (seq, turn, id, text) => record(seq, "user/message", {
+    id, turn, requestId, role: "user", source: { kind: "user" }, content: [{ type: "text", text }],
+  }, { surfaceOp: "append" });
+  const users = () => [...container.querySelectorAll("article.user")].map((item) => item.textContent);
+  expect(users()).toEqual(["你子消息正在发送"]);
+
+  await sendFrame(connection, { ...snapshot("a", [
+    record(0, "turn/start", { turn: 1 }),
+    record(1, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+    record(2, "session/end-seed", { inherited: true }),
+    record(3, "turn/start", { turn: 2 }),
+    record(4, "step/start", { turn: 2, step: 1 }),
+    user(5, 2, "parent-user", "父消息"),
+    record(6, "step/end", { turn: 2, step: 1 }),
+    record(7, "turn/end", { turn: 2, reason: { kind: "completed" } }),
+    record(8, "session/end-seed", { inherited: true }),
+  ]), inheritedEventCount: 8 });
+  expect(users()).toEqual(["你父消息", "你子消息正在发送"]);
+
+  await sendFrame(connection, record(9, "turn/start", { turn: 3 }));
+  await sendFrame(connection, record(10, "step/start", { turn: 3, step: 1 }));
+  expect(users()).toEqual(["你父消息", "你子消息正在发送"]);
+  await sendFrame(connection, user(11, 3, "child-user", "子消息"));
+  expect(users()).toEqual(["你父消息", "你子消息"]);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
