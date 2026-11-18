@@ -132,6 +132,43 @@ test("切走后切回恢复增长的草稿并结算为唯一回答", async () =>
 });
 
 
+for (const eventFirst of [false, true]) test(`工具续答交接：${eventFirst ? "结算事件" : "结束帧"}先到时保留草稿节点`, async () => {
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 })];
+  const stream = { revision: 1, activeAttempt: { attemptId: "draft", turn: 1, step: 1, chunks: [{ type: "text", delta: "交接正文" }], nextIndex: 1 } };
+  await sendFrame(connections[0], snapshot("a", records, stream));
+  const node = container.querySelector("article.assistant");
+  const assertDraft = () => {
+    expect(container.querySelectorAll("article.assistant")).toHaveLength(1);
+    expect(container.querySelector("article.assistant")).toBe(node);
+    expect(node.textContent.split("交接正文")).toHaveLength(2);
+    expect(node.textContent).toContain("正在生成");
+  };
+  assertDraft();
+  const end = { type: "assistant-stream", frame: { type: "end", attemptId: "draft", revision: 2, turn: 1, step: 1, index: 1, outcome: { kind: "committed", eventType: "assistant/message", seq: 2 } } };
+  const message = record(2, "assistant/message", { turn: 1, step: 1, message: { id: "m", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "text", text: "交接正文" }, { type: "tool-call", id: "x", name: "mock_read", arguments: '{}' }] }, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true }, { surfaceOp: "append" });
+  const frames = eventFirst ? [message, end] : [end, message];
+  await sendFrame(connections[0], frames[0]);
+  assertDraft();
+  await sendFrame(connections[0], frames[1]);
+  expect(container.querySelectorAll("article.assistant")).toHaveLength(1);
+  expect(container.querySelector("article.assistant")).toBe(node);
+  expect(node.textContent.split("交接正文")).toHaveLength(2);
+  expect(node.textContent).not.toContain("正在生成");
+  await sendFrame(connections[0], record(3, "tool/call", { turn: 1, step: 1, callId: "x", name: "mock_read", arguments: '{}' }));
+  await sendFrame(connections[0], record(4, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op", toolName: "mock_read", toolVersion: "1", validatedArgs: {} }));
+  await sendFrame(connections[0], record(5, "tool/result", { turn: 1, step: 1, operationId: "op", message: { id: "r", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "读取结果" }] }] } }, { surfaceOp: "append", sourceEventSeqs: [3] }));
+  await sendFrame(connections[0], record(6, "step/end", { turn: 1, step: 1 }));
+  await sendFrame(connections[0], record(7, "step/start", { turn: 1, step: 2 }));
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "start", attemptId: "next", revision: 3, turn: 1, step: 2 } });
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "chunk", attemptId: "next", revision: 4, index: 0, chunk: { type: "text", delta: "后续正文" } } });
+  expect(container.textContent).toContain("后续正文");
+  expect(container.querySelector("article.assistant")).toBe(node);
+  expect(container.textContent.split("交接正文")).toHaveLength(2);
+  expect(connections).toHaveLength(1);
+  expect(connections[0].closed).toBe(false);
+});
+
+
 test("断线等待期间保留画面，重连只安装新 follow 快照", async () => {
   await sendFrame(connections[0], snapshot("a", [userRecord("old")]));
   await act(async () => { connections[0].onerror(); });
@@ -266,20 +303,37 @@ test("阅读位置按会话保存，主动上滚后可返回最新", async () =>
   expect(button("返回最新")).toBeFalsy();
 });
 
-test("工具投影按 Step 区分复用的调用编号并保留结果和参数", async () => {
+test("工具投影按 Step 区分复用的调用、审批和结果", async () => {
   const { projectTools } = await import("./session/tools.ts");
+  const result = (seq, step, operationId, text, callSeq) => record(seq, "tool/result", { turn: 1, step, operationId, message: { id: `r${step}`, role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text }] }] } }, { surfaceOp: "append", sourceEventSeqs: [callSeq] });
   const events = [
-    record(0, "tool/call", { turn: 1, step: 1, callId: "x", name: "one", arguments: '{"raw":1}' }),
-    record(1, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op1", toolName: "one", toolVersion: "1", validatedArgs: { value: 1 } }),
-    record(2, "tool/call", { turn: 1, step: 2, callId: "x", name: "two", arguments: "{}" }),
-    record(3, "tool/result", { turn: 1, step: 1, operationId: "op1", message: { id: "r", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "完成" }] }] }, meta: { extra: "保留" } }, { surfaceOp: "append", sourceEventSeqs: [0] }),
+    record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 }),
+    record(2, "tool/call", { turn: 1, step: 1, callId: "x", name: "one", arguments: '{"raw":1}' }),
+    record(3, "tool/operation", { turn: 1, step: 1, callId: "x", operationId: "op1", toolName: "one", toolVersion: "1", validatedArgs: { value: 1 } }),
+    record(4, "approval/asked", { id: "p1", operationId: "op1", toolName: "one", reason: "原因一" }),
+    record(5, "approval/decided", { id: "p1", outcome: "allowed-once" }), result(6, 1, "op1", "结果一", 2),
+    record(7, "step/end", { turn: 1, step: 1 }), record(8, "step/start", { turn: 1, step: 2 }),
+    record(9, "tool/call", { turn: 1, step: 2, callId: "x", name: "two", arguments: '{"raw":2}' }),
+    record(10, "tool/operation", { turn: 1, step: 2, callId: "x", operationId: "op2", toolName: "two", toolVersion: "2", validatedArgs: { value: 2 } }),
+    record(11, "approval/asked", { id: "p2", operationId: "op2", toolName: "two", reason: "原因二" }),
+    record(12, "approval/decided", { id: "p2", outcome: "allowed-once" }), result(13, 2, "op2", "结果二", 9),
   ];
+  events[6].event.data.meta = { extra: "保留" };
+  const initial = projectTools(events.slice(0, 10));
+  expect(initial[1]).toMatchObject({ status: "准备调用", rawArguments: '{"raw":2}' });
+  const pending = projectTools(events.slice(0, 12));
+  expect(pending).toHaveLength(2);
+  expect(pending[0]).toMatchObject({ step: 1, rawArguments: '{"raw":1}', operationId: "op1", version: "1", validatedArgs: { value: 1 }, approval: { id: "p1", operationId: "op1" }, decision: "allowed-once", status: "成功", result: { operationId: "op1" } });
+  expect(JSON.stringify(pending[0].result)).toContain("结果一");
+  expect(pending[0].result.meta).toEqual({ extra: "保留" });
+  expect(pending[1]).toMatchObject({ step: 2, rawArguments: '{"raw":2}', operationId: "op2", version: "2", validatedArgs: { value: 2 }, approval: { id: "p2", operationId: "op2" }, status: "等待审批" });
+  expect(pending[1].decision).toBeUndefined(); expect(pending[1].result).toBeUndefined();
   const tools = projectTools(events);
-  expect(tools).toHaveLength(2);
-  expect(tools[0]).toMatchObject({ name: "one", status: "成功", rawArguments: '{"raw":1}', operationId: "op1", version: "1", validatedArgs: { value: 1 } });
-  expect(tools[1]).toMatchObject({ name: "two", status: "准备调用" });
-  expect(JSON.stringify(tools[0])).toContain("保留");
-  expect(projectTools(events.slice(0, 3))[1].status).toBe("准备调用");
+  expect(tools[0]).toEqual(pending[0]);
+  expect(tools[1]).toMatchObject({ step: 2, rawArguments: '{"raw":2}', operationId: "op2", version: "2", validatedArgs: { value: 2 }, approval: { id: "p2", operationId: "op2" }, decision: "allowed-once", status: "成功", result: { operationId: "op2" } });
+  expect(JSON.stringify(tools[1].result)).toContain("结果二");
+  expect(events[6].event.sourceEventSeqs).toEqual([events[2].event.seq]);
+  expect(events[13].event.sourceEventSeqs).toEqual([events[9].event.seq]);
 });
 
 test("切回会话时等快照内容安装后恢复被空画面夹取的位置", async () => {

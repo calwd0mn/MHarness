@@ -37,6 +37,7 @@ async function safePort(start) {
 }
 const scenarios = [
   { name: "正常问答", calls: [], reason: "completed", models: 1, codes: [] },
+  { name: "正常工具续答", continuation: true, calls: [["r", "mock_read", "读取续答"]], reason: "completed", models: 2, codes: [null] },
   { name: "仅后台写入失败", backgroundFailure: true, calls: [], reason: "completed" },
   { name: "首次模型检查点失败", checkpoint: "initial", calls: [], reason: "error" },
   { name: "工具前检查点失败", checkpoint: "dispatch", calls: [["w", "mock_write", "写入"]], reason: "error" },
@@ -118,7 +119,7 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     const scriptedAdapter = createMockAdapter(request => {
       modelRequests.push(structuredClone(request));
       if (modelRequests.length === 1 && scenario.calls.length) return [
-        ...(scenario.checkpoint ? [{ chunk: { type: "text", delta: "已结算答案" } }] : []),
+        ...(scenario.checkpoint || scenario.continuation ? [{ chunk: { type: "text", delta: "已结算答案" } }] : []),
         ...scenario.calls.map(([id, name, text], index) => ({ chunk: { type: "tool_call", index, callId: id, name, argumentsDelta: JSON.stringify({ text }) } })),
         { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
       ];
@@ -205,7 +206,10 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     const path = `/api/sessions/${sessionId}`;
     localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId], selected: sessionId }));
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-    await act(async () => root.render(<App />)); await waitFor(() => sources.length === 1); expect((await sources[0].next()).type).toBe("snapshot");
+    await act(async () => root.render(<App />)); await waitFor(() => sources.length === 1); const initial = await sources[0].next();
+    expect(initial.type).toBe("snapshot");
+    if (scenario.continuation) expect(initial).toMatchObject({ sessionId, records: [], cursor: -1, assistantStream: { revision: 0 } });
+    if (scenario.continuation) expect(initial.assistantStream.activeAttempt).toBeUndefined();
     const textarea = container.querySelector("textarea");
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, "开始验收"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
     await act(async () => container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
@@ -361,6 +365,82 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
         expect(held[0].envelope.result.structuredContent).toEqual({ text: "写入", operationId: requests[0].arguments.operationId });
       }
       if (scenario.drop) await held[0].release();
+    }
+    if (scenario.continuation) {
+      let frame;
+      do { frame = await sources[0].next(); } while (frame.type !== "assistant-stream" || frame.frame.type !== "chunk" || frame.frame.chunk.type !== "text");
+      const node = container.querySelector("article.assistant");
+      const assertA = generating => {
+        expect(container.querySelector("article.assistant")).toBe(node);
+        expect(container.textContent.split("已结算答案")).toHaveLength(2);
+        expect(node.textContent.includes("正在生成")).toBe(generating);
+      };
+      assertA(true);
+      do { frame = await sources[0].next(); } while (frame.event?.type !== "assistant/message" && !(frame.type === "assistant-stream" && frame.frame.type === "end"));
+      expect(frame.event?.type).toBe("assistant/message");
+      const eventA = frame.event;
+      assertA(true);
+      do { frame = await sources[0].next(); } while (frame.type !== "assistant-stream" || frame.frame.type !== "end");
+      const endA = frame.frame;
+      assertA(false);
+      do { frame = await sources[0].next(); } while (frame.type !== "assistant-stream" || frame.frame.type !== "start");
+      const startB = frame.frame;
+      assertA(false);
+      do { frame = await sources[0].next(); } while (frame.event?.type !== "turn/end");
+      assertA(false);
+      expect(container.textContent.split("验收回答")).toHaveLength(2);
+      const frames = sources[0].delivered;
+      const index = predicate => frames.findIndex(predicate);
+      const eventIndex = (type, step) => index(item => item.event?.type === type && (step === undefined || item.event.data.step === step));
+      const startAIndex = index(item => item.type === "assistant-stream" && item.frame.type === "start");
+      const startA = frames[startAIndex].frame;
+      const chunkAIndex = index(item => item.type === "assistant-stream" && item.frame.type === "chunk" && item.frame.attemptId === startA.attemptId && item.frame.chunk.type === "text");
+      const endAIndex = index(item => item.type === "assistant-stream" && item.frame.type === "end" && item.frame.attemptId === startA.attemptId);
+      const ordered = [eventIndex("turn/start"), eventIndex("step/start", 1), startAIndex, chunkAIndex, eventIndex("assistant/message", 1), endAIndex, eventIndex("tool/call", 1), eventIndex("tool/result", 1), eventIndex("step/end", 1), eventIndex("step/start", 2), index(item => item.type === "assistant-stream" && item.frame.type === "start" && item.frame.attemptId === startB.attemptId)];
+      expect(ordered.every(position => position >= 0)).toBe(true);
+      expect(ordered).toEqual([...ordered].sort((a, b) => a - b));
+      expect(endA).toMatchObject({ attemptId: startA.attemptId, turn: 1, step: 1, outcome: { kind: "committed", eventType: "assistant/message", seq: eventA.seq } });
+      expect(startA).toMatchObject({ turn: 1, step: 1 });
+      expect(startB).toMatchObject({ turn: 1, step: 2 });
+      expect(startB.attemptId).not.toBe(startA.attemptId);
+      const stream = frames.filter(item => item.type === "assistant-stream").map(item => item.frame);
+      const starts = stream.filter(item => item.type === "start");
+      const ends = stream.filter(item => item.type === "end");
+      const settlements = frames.filter(item => item.event?.type === "assistant/message").map(item => item.event);
+      expect(starts).toEqual([startA, startB]);
+      expect(ends).toHaveLength(2);
+      expect(settlements).toHaveLength(2);
+      for (const [position, start] of starts.entries()) {
+        const chunks = stream.filter(item => item.type === "chunk" && item.attemptId === start.attemptId);
+        const end = ends[position];
+        const settlement = settlements[position];
+        expect(chunks.map(item => item.index)).toEqual(chunks.map((_, index) => index));
+        expect(end).toMatchObject({ attemptId: start.attemptId, turn: 1, step: position + 1, index: chunks.length, outcome: { kind: "committed", eventType: "assistant/message", seq: settlement.seq } });
+        expect(settlement.data).toMatchObject({ turn: 1, step: position + 1, finishReason: { kind: position === 0 ? "tool_calls" : "stop" } });
+      }
+      expect(settlements[1].data.message.content).toEqual([{ type: "text", text: "验收回答" }]);
+      expect(eventA.data).toMatchObject({ turn: 1, step: 1, finishReason: { kind: "tool_calls" } });
+      expect(eventA.data.message.content).toEqual(expect.arrayContaining([{ type: "text", text: "已结算答案" }, expect.objectContaining({ type: "tool-call", id: "r", name: "mock_read", arguments: JSON.stringify({ text: "读取续答" }) })]));
+      expect(frames.filter(item => item.event?.type === "turn/end")).toHaveLength(1);
+      expect(frame.event.data.reason.kind).toBe("completed");
+      const history = await waitFor(async () => { const value = await (await nativeFetch(origin + path)).json(); return value.records.length === frames.filter(item => item.type === "event").length && value; });
+      expect(frames.filter(item => item.type === "event")).toEqual(history.records);
+      const events = history.records.map(item => item.event);
+      const call = events.find(event => event.type === "tool/call");
+      const operation = events.find(event => event.type === "tool/operation");
+      const result = events.find(event => event.type === "tool/result");
+      expect(call.data).toMatchObject({ turn: 1, step: 1, callId: "r" });
+      expect(result.data).toMatchObject({ turn: 1, step: 1, operationId: operation.data.operationId, message: { source: { callId: "r" } } });
+      expect(result.sourceEventSeqs).toEqual([call.seq]);
+      expect(JSON.stringify(result.data)).toContain("读取续答");
+      expect(modelRequests).toHaveLength(2);
+      const messages = modelRequests[1].messages;
+      expect(messages.filter(message => message.role === "assistant")).toEqual([expect.objectContaining({ text: "已结算答案", toolCalls: [{ callId: "r", name: "mock_read", arguments: JSON.stringify({ text: "读取续答" }) }] })]);
+      expect(messages.filter(message => message.role === "tool")).toEqual([expect.objectContaining({ callId: "r", text: expect.stringContaining("读取续答") })]);
+      expect(messages.findIndex(message => message.role === "assistant")).toBeLessThan(messages.findIndex(message => message.role === "tool"));
+      expect(requests).toEqual([{ name: "mock_read", arguments: { text: "读取续答", operationId: operation.data.operationId } }]);
+      expect(upstream.effects()).toEqual([]);
+      return;
     }
     const activeSource = sources[scenario.refreshApproval || scenario.reconnectStream ? 1 : 0];
     let frame; do { frame = await activeSource.next(); } while (frame.event?.type !== "turn/end");
