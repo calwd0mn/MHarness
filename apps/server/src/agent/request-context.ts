@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import type { Session } from "@mharness/session/server";
+import { snapshotSessionJson, type Session } from "@mharness/session/server";
 import type { ModelInput, ModelMessage, ModelTool } from "../model/adapter.ts";
 import type { LlmRuntime, ModelConfig, PreparedModel } from "../model/runtime.ts";
 
@@ -72,23 +72,26 @@ export function rebuildRequestContext(session: Session): { header: Header; input
   return { header, input: { systemPrompt: header.system ?? "", messages: messages(session), tools: modelTools(header) } };
 }
 
+/** 本 Step 固定的生成入口与可记录配置；header 不包含凭据。 */
+export type StepSnapshot = { prepared: PreparedModel; header: Header };
+
 /**
- * 创建每次独立准备模型配置和上下文的入口，按需向会话追加请求头。
- * @param options - Runtime 及每次请求读取一次的配置、系统提示和工具供应者。
- * @returns 同步准备函数；调用方须在启动生成前 flush 会话。startsSeries 显式开启新消息系列。
- * @throws 准备时无法记录路由或参数、模型配置无效或工具不可记录时抛出。
+ * 创建两阶段请求准备器：固定 Step 配置后，可用最新会话消息准备多次请求并按需记录请求头。
+ * @param options - Runtime 及每步读取的配置、系统提示和工具供应者。
+ * @returns 准备函数及其 snapshot 方法；调用方须在每次生成前 flush 会话。startsSeries 显式开启新消息系列。
+ * @throws 固定配置时无法记录路由或参数、模型配置无效或工具不可记录时抛出。
  */
 export function createRequestPreparer(options: RequestContextOptions):
-  (session: Session, startsSeries?: boolean) => { prepared: PreparedModel; input: ModelInput } {
+  ((session: Session, startsSeries?: boolean, snapshot?: StepSnapshot) => { prepared: PreparedModel; input: ModelInput }) & { snapshot(): StepSnapshot } {
   const seen = new WeakMap<Session, { header: Header; generation: number }>();
-  return (session, startsSeries = false) => {
+  const snapshot = (): StepSnapshot => {
     const config = options.config();
     if (config.endpointId !== undefined || config.params?.topP !== undefined) throw new Error("当前日志不能记录该模型配置");
     const prepared = options.runtime.prepare(config, { recordable: true });
     if (prepared.effectiveParams.topP !== undefined) throw new Error("当前日志不能记录该模型配置");
     const params = prepared.effectiveParams;
-    const tools = structuredClone(options.tools?.() ?? []);
-    const header = {
+    const tools = options.tools?.() ?? [];
+    const header = snapshotSessionJson({
       config: {
         provider: prepared.route.provider, model: prepared.route.model,
         ...(params.reasoningEffort === undefined ? {} : { reasoningEffort: params.reasoningEffort }),
@@ -98,8 +101,13 @@ export function createRequestPreparer(options: RequestContextOptions):
       },
       ...(prepared.adapterDefaults ? { adapterDefaults: prepared.adapterDefaults } : {}),
       system: options.systemPrompt(), tools,
-    };
-    modelTools(header as Header);
+    }) as Header;
+    modelTools(header);
+    freezeTree(header);
+    return { prepared, header };
+  };
+  const prepare = (session: Session, startsSeries = false, fixed = snapshot()) => {
+    const { prepared, header } = fixed;
     const previous = seen.get(session);
     const priorHeader = foldRequestHeader(session.snapshot().events);
     const changed = previous && !isDeepStrictEqual(priorHeader, header);
@@ -118,4 +126,5 @@ export function createRequestPreparer(options: RequestContextOptions):
     freezeTree(input);
     return { prepared, input };
   };
+  return Object.assign(prepare, { snapshot });
 }

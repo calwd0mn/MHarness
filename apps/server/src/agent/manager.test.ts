@@ -24,6 +24,7 @@ test("继承的用户编号不占用子会话的受理编号", async () => {
   await handle.close();
   let calls = 0;
   const manager = new AgentManager(store, async ({ session, turn, step }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     calls++;
     session.append({ type: "step/end", data: { turn, step } });
     session.append({ type: "turn/end", data: { turn, reason: { kind: "completed" } } });
@@ -53,6 +54,7 @@ test("并发受理去重、忙碌拒绝、取消和重启查重", async () => {
   let calls = 0;
   let release: (() => void) | undefined;
   const manager = new AgentManager(store, async ({ session, turn, step }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     calls++;
     await new Promise<void>((resolve) => { release = resolve; });
     session.append({ type: "step/end", data: { turn, step } });
@@ -80,6 +82,7 @@ test("存储故障在运行结束后仍拒绝新任务，恢复检查点后才�
   const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
   const handle = await store.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
   const manager = new AgentManager(store, async ({ session, turn, step, blockStorage }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     blockStorage(new Error("checkpoint"));
     session.append({ type: "step/end", data: { turn, step } });
     session.append({ type: "turn/end", data: { turn, reason: { kind: "completed" } } });
@@ -104,6 +107,7 @@ test("加载通知同步连接观察，取消等待驱动退出并关闭释放�
   const handle = await store.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
   let stopped = false;
   const manager = new AgentManager(store, async ({ session, turn, step, signal, publish }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     publish({ type: "assistant/start", attemptId: "a", turn, step });
     publish({ type: "assistant/chunk", attemptId: "a", index: 0, chunk: { type: "text-delta", index: 0, text: "x" } });
     await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -191,7 +195,8 @@ test("驱动异常后仅在修复并提交遗留范围后开放新 Turn", async 
   await handle.flush();
   await handle.close();
   let release: (() => void) | undefined;
-  const manager = new AgentManager(store, async () => {
+  const manager = new AgentManager(store, async ({ session, turn, step }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     await new Promise<void>((resolve) => { release = resolve; });
     throw new Error("driver failed");
   });

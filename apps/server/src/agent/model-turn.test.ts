@@ -62,6 +62,7 @@ test("检查点成功后流式结算并记录可重放请求", async () => {
     session.snapshot().events.map((e) => e.type),
     [
       "user/message",
+      "step/start",
       "request/header",
       "assistant/message",
       "step/end",
@@ -686,7 +687,7 @@ test("模型步数达到上限时保留工具配对并停止调度", async () =>
   assert.equal(batches, 1);
   assert.ok(checkpoints >= 3);
   const events = session.snapshot().events;
-  assert.equal(events.filter((e) => e.type === "step/start").length, 1);
+  assert.equal(events.filter((e) => e.type === "step/start").length, 2);
   assert.equal(events.filter((e) => e.type === "step/end").length, 2);
   assert.equal(events.filter((e) => e.type === "turn/end").length, 1);
   assert.equal(events.filter((e) => e.type === "tool/result").length, 2);
@@ -846,7 +847,7 @@ test("工具结果检查点失败后不打开下一步", async () => {
   })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
   const events = session.snapshot().events;
   assert.equal(calls, 1);
-  assert.equal(events.some((e) => e.type === "step/start"), false);
+  assert.deepEqual(events.filter((e) => e.type === "step/start").map((e) => e.data.step), [1]);
   assert.equal(events.filter((e) => e.type === "tool/result").length, 1);
   const end = events.at(-1);
   assert.equal(end?.type === "turn/end" && end.data.reason.kind === "error" && end.data.reason.error.code, "SQLITE_BUSY");
@@ -1050,5 +1051,289 @@ test("同步取消时迭代器清理抛错仍唯一结算取消", async () => {
   assert.equal(turnEnds.length, 1);
   assert.equal(turnEnds[0]?.data.reason.kind, "aborted");
   assert.equal(events.filter((event) => event.type === "step/end").length, 1);
-  assert.equal(events.filter((event) => event.type === "step/start").length, 0);
+  assert.equal(events.filter((event) => event.type === "step/start").length, 1);
+});
+
+test("pre-step 完成前不打开 Step，取消后仅结束 Turn", async () => {
+  const session = new Session({ sessionId: "gate", createdAt: 0 });
+  session.bindCheckpoint(async () => {});
+  const controller = new AbortController();
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  let calls = 0;
+  const run = createModelTurnDriver({
+    runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return []; }) }),
+    config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+    preStep: async () => { entered(); await gate; },
+  })({ session, turn: 1, step: 1, signal: controller.signal, publish: () => {}, blockStorage: () => {} });
+  await started;
+  assert.deepEqual(session.snapshot().events, []);
+  controller.abort(); release(); await run;
+  assert.equal(calls, 0);
+  assert.deepEqual(session.snapshot().events.map((event) => event.type), ["turn/end"]);
+  const end = session.snapshot().events.at(-1);
+  assert.equal(end?.type === "turn/end" && end.data.reason.kind, "aborted");
+});
+
+test("同一步超限结算后重建消息并沿用配置", async () => {
+  const session = new Session({ sessionId: "retry", createdAt: 0 });
+  session.append({ type: "user/message", surfaceOp: "append", data: { turn: 1, requestId: "r", id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "原文" }] } });
+  session.bindCheckpoint(async () => {});
+  let model = "old";
+  let hooks = 0;
+  const requests: ModelRequest[] = [];
+  const notices: ExecutionNotice[] = [];
+  const runtime = new LlmRuntime({ mock: createMockAdapter((request) => {
+    requests.push(request);
+    if (requests.length === 1) throw new LlmError("CONTEXT_WINDOW_EXCEEDED");
+    return [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
+  }) });
+  await createModelTurnDriver({ runtime, config: () => ({ provider: "mock", model }), systemPrompt: () => "system", maxSteps: 1,
+    preStep: async () => { hooks++; },
+    recoverOverflow: async () => {
+      const failed = session.snapshot().events.find((e) => e.type === "assistant/attempt");
+      const end = notices.at(-1);
+      assert.ok(failed && end?.type === "assistant/end" && end.outcome.kind === "committed" && end.outcome.seq === failed.seq);
+      session.append({ type: "user/message", surfaceOp: { op: "replace", start: 0, end: 0 }, sourceEventSeqs: [0], data: { id: "summary", role: "user", source: { kind: "compact", compactionId: "c" }, content: [{ type: "text", text: "摘要" }] } });
+      model = "new";
+      return true;
+    },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: (n) => notices.push(n), blockStorage: () => assert.fail() });
+  assert.equal(hooks, 1);
+  assert.deepEqual(requests.map((r) => r.route.model), ["old", "old"]);
+  assert.deepEqual(requests.map((r) => r.messages[0]?.text), ["原文", "摘要"]);
+  const events = session.snapshot().events;
+  assert.deepEqual(events.filter((e) => e.type === "request/header").map((e) => e.data.reason), ["initial", "series"]);
+  assert.equal(events.filter((e) => e.type === "step/start").length, 1);
+  assert.equal(events.filter((e) => e.type === "assistant/attempt").length, 1);
+  assert.equal(events.filter((e) => e.type === "assistant/message").length, 1);
+  const starts = notices.filter((n) => n.type === "assistant/start");
+  assert.equal(starts.length, 2);
+  assert.notEqual(starts[0]?.attemptId, starts[1]?.attemptId);
+});
+
+test("不可记录的嵌套工具在 hook 与开步前拒绝", async () => {
+  for (const value of [new Map(), NaN]) {
+    const session = new Session({ sessionId: "invalid", createdAt: 0 });
+    let hooks = 0; let calls = 0;
+    await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return []; }) }),
+      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", tools: () => [{ name: "x", inputSchema: { value } }],
+      preStep: async () => { hooks++; },
+    })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
+    assert.equal(hooks, 0); assert.equal(calls, 0);
+    assert.deepEqual(session.snapshot().events.map((e) => e.type), ["turn/end"]);
+  }
+});
+
+test("真实 Agent 的存储门在等待点及检查点后阻止模型", async () => {
+  for (const boundary of ["pre-step", "flush"] as const) {
+    const session = new Session({ sessionId: boundary, createdAt: 0 });
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    session.bindCheckpoint(async () => { if (boundary === "flush") { entered(); await gate; } });
+    let calls = 0;
+    const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return []; }) }),
+      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+      preStep: async () => { if (boundary === "pre-step") { entered(); await gate; } },
+    });
+    const handle = { id: boundary, header: session.header, access: "write" as const, inheritedEventCount: 0,
+      read: async () => [], append: async () => {}, flush: async () => {}, close: async () => {} };
+    const agent = new ReActAgent(session, driver, handle);
+    agent.prompt({ requestId: "r", content: [{ type: "text", text: "输入" }] });
+    await waiting; agent.blockStorage(new Error("blocked")); release(); await agent.waitForIdle();
+    assert.equal(calls, 0); assert.equal(agent.storageOpen, false);
+    const events = session.snapshot().events;
+    assert.equal(events.some((e) => e.type === "step/start"), boundary === "flush");
+    assert.equal(events.some((e) => e.type === "request/header"), boundary === "flush");
+    await agent.stop();
+  }
+});
+
+test("恢复等待后及重试检查点后关闭存储门均不发起第二次请求", async () => {
+  for (const boundary of ["recover", "flush"] as const) {
+    const session = new Session({ sessionId: boundary, createdAt: 0 });
+    let release!: () => void; let entered!: () => void; let checkpoints = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    session.bindCheckpoint(async () => { if (++checkpoints === 2 && boundary === "flush") { entered(); await gate; } });
+    let calls = 0;
+    const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }),
+      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", maxSteps: 1,
+      recoverOverflow: async () => {
+        const original = session.snapshot().events.find((e) => e.type === "user/message"); assert.ok(original);
+        session.append({ type: "user/message", surfaceOp: { op: "replace", start: original.seq, end: original.seq }, sourceEventSeqs: [original.seq], data: { id: "summary", role: "user", source: { kind: "compact", compactionId: "c" }, content: [{ type: "text", text: "摘要" }] } });
+        if (boundary === "recover") { entered(); await gate; }
+        return true;
+      },
+    });
+    const handle = { id: boundary, header: session.header, access: "write" as const, inheritedEventCount: 0,
+      read: async () => [], append: async () => {}, flush: async () => {}, close: async () => {} };
+    const agent = new ReActAgent(session, driver, handle);
+    agent.prompt({ requestId: "r", content: [{ type: "text", text: "原文" }] });
+    await waiting; agent.blockStorage(new Error("blocked")); release(); await agent.waitForIdle();
+    assert.equal(calls, 1); assert.equal(agent.storageOpen, false);
+    const events = session.snapshot().events;
+    assert.equal(events.filter((e) => e.type === "assistant/attempt").length, 1);
+    assert.deepEqual(events.filter((e) => e.type === "request/header").map((e) => e.data.reason), boundary === "flush" ? ["initial", "series"] : ["initial"]);
+    assert.equal(checkpoints, boundary === "flush" ? 2 : 1);
+    await agent.stop();
+  }
+});
+
+test("恢复等待取消或拒绝 AbortError 保留首次结算并以 aborted 结束", async () => {
+  for (const mode of ["signal", "reject"] as const) {
+    const session = new Session({ sessionId: mode, createdAt: 0 }); session.bindCheckpoint(async () => {});
+    const controller = new AbortController(); let calls = 0; const notices: ExecutionNotice[] = [];
+    await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }),
+      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+      recoverOverflow: async () => { if (mode === "signal") { controller.abort(); return true; } throw Object.assign(new Error("cancel"), { name: "AbortError" }); },
+    })({ session, turn: 1, step: 1, signal: controller.signal, publish: (notice) => notices.push(notice), blockStorage: () => {} });
+    const events = session.snapshot().events; const attempt = events.find((e) => e.type === "assistant/attempt");
+    assert.equal(calls, 1); assert.ok(attempt);
+    const end = notices.find((n) => n.type === "assistant/end"); assert.ok(end?.type === "assistant/end" && end.outcome.kind === "committed" && end.outcome.seq === attempt.seq);
+    const last = events.at(-1); assert.equal(last?.type === "turn/end" && last.data.reason.kind, "aborted");
+  }
+});
+
+test("pre-step 固定配置但请求使用等待期间替换后的消息", async () => {
+  const session = new Session({ sessionId: "snapshot", createdAt: 0 });
+  session.append({ type: "user/message", surfaceOp: "append", data: { turn: 1, requestId: "r", id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "原文" }] } });
+  session.bindCheckpoint(async () => {});
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; }); const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  let model = "old"; let system = "旧系统"; const schema = { properties: { x: { type: "string" } } }; const requests: ModelRequest[] = [];
+  const running = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter((request) => { requests.push(request); return [{ chunk: { type: "text", delta: "ok" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]; }) }),
+    config: () => ({ provider: "mock", model, params: { maxOutputTokens: 10 } }), systemPrompt: () => system, tools: () => [{ name: "t", inputSchema: schema }],
+    preStep: async ({ header }) => { assert.equal(header.config.model, "old"); assert.equal(Object.isFrozen(header.tools?.[0]), true); entered(); await gate; },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
+  await waiting;
+  session.append({ type: "user/message", surfaceOp: { op: "replace", start: 0, end: 0 }, sourceEventSeqs: [0], data: { id: "summary", role: "user", source: { kind: "compact", compactionId: "c" }, content: [{ type: "text", text: "摘要" }] } });
+  model = "new"; system = "新系统"; schema.properties.x.type = "number"; release(); await running;
+  assert.equal(requests[0]?.route.model, "old"); assert.equal(requests[0]?.systemPrompt, "旧系统");
+  assert.deepEqual(requests[0]?.tools[0]?.inputSchema, { properties: { x: { type: "string" } } });
+  assert.deepEqual(requests[0]?.messages, [{ role: "user", text: "摘要" }]);
+});
+
+test("后续 pre-step 期间取消不会打开下一步", async () => {
+  for (const mode of ["return", "reject"] as const) {
+    const session = new Session({ sessionId: mode, createdAt: 0 }); let checkpoints = 0; let checkpointEvents: string[] = [];
+    session.bindCheckpoint(async () => { checkpoints++; checkpointEvents = session.snapshot().events.map((e) => e.type); });
+    const controller = new AbortController(); let calls = 0; let entered!: () => void; let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; }); const gate = new Promise<void>((resolve) => { release = resolve; });
+    const running = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return [{ chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{}" } }, { chunk: { type: "finish", reason: { kind: "tool_calls" } } }]; }) }),
+      config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: testRegistry(() => "结果"),
+      preStep: async ({ step }) => { if (step === 2) { assert.ok(checkpointEvents.includes("tool/result") && checkpointEvents.includes("step/end")); entered(); await gate; if (mode === "reject") throw Object.assign(new Error("cancel"), { name: "AbortError" }); } },
+    })({ session, turn: 1, step: 1, signal: controller.signal, publish: () => {}, blockStorage: () => assert.fail() });
+    await waiting; controller.abort(); release(); await running;
+    assert.equal(calls, 1); assert.ok(checkpoints > 0);
+    const events = session.snapshot().events; assert.deepEqual(events.filter((e) => e.type === "step/start").map((e) => e.data.step), [1]);
+    assert.deepEqual(events.filter((e) => e.type === "step/end").map((e) => e.data.step), [1]);
+    const last = events.at(-1); assert.equal(last?.type === "turn/end" && last.data.reason.kind, "aborted");
+  }
+});
+
+test("每个工具续答 Step 各有一次超限恢复机会", async () => {
+  const session = new Session({ sessionId: "two", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  let calls = 0; const hooks: number[] = []; const recoveries: number[] = [];
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => {
+    calls++; if (calls === 1 || calls === 3) throw new LlmError("CONTEXT_WINDOW_EXCEEDED");
+    return calls === 2 ? [{ chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{}" } }, { chunk: { type: "finish", reason: { kind: "tool_calls" } } }] : [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }];
+  }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: testRegistry(() => "结果"), maxSteps: 2,
+    preStep: async ({ step }) => { hooks.push(step); }, recoverOverflow: async ({ step }) => { recoveries.push(step); return true; },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
+  assert.equal(calls, 4); assert.deepEqual(hooks, [1, 2]); assert.deepEqual(recoveries, [1, 2]);
+  const events = session.snapshot().events; assert.deepEqual(events.filter((e) => e.type === "assistant/attempt").map((e) => e.data.step), [1, 2]);
+  assert.deepEqual(events.filter((e) => e.type === "step/start").map((e) => e.data.step), [1, 2]);
+});
+
+test("检查点等待取消后失败仍以存储故障结算", async () => {
+  for (const [error, code] of [[Object.assign(new Error("secret"), { code: "SQLITE_BUSY" }), "SQLITE_BUSY"], [new Error("secret"), "UNKNOWN"]] as const) {
+    const session = new Session({ sessionId: code, createdAt: 0 }); const controller = new AbortController();
+    let entered!: () => void; let reject!: (error: Error) => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    session.bindCheckpoint(() => { entered(); return new Promise<void>((_resolve, fail) => { reject = fail; }); });
+    let calls = 0; let blocked = false; const notices: ExecutionNotice[] = [];
+    const running = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return []; }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "" })({ session, turn: 1, step: 1, signal: controller.signal, publish: (notice) => notices.push(notice), blockStorage: () => { blocked = true; } });
+    await waiting; controller.abort(); reject(error); await running;
+    assert.equal(calls, 0); assert.equal(blocked, true);
+    assert.deepEqual(notices, [{ type: "agent/error", turn: 1, message: "本轮执行失败" }]);
+    const last = session.snapshot().events.at(-1);
+    assert.equal(last?.type === "turn/end" && last.data.reason.kind === "error" && last.data.reason.error.code, code);
+  }
+});
+
+test("驱动入口信号已取消不调用 pre-step 或准备配置", async () => {
+  const session = new Session({ sessionId: "cancelled", createdAt: 0 }); const controller = new AbortController(); controller.abort();
+  let hooks = 0; let configs = 0;
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => []) }), config: () => { configs++; return { provider: "mock", model: "m" }; }, systemPrompt: () => "", preStep: async () => { hooks++; } })({ session, turn: 1, step: 1, signal: controller.signal, publish: () => {}, blockStorage: () => {} });
+  assert.equal(hooks, 0); assert.equal(configs, 0);
+  assert.deepEqual(session.snapshot().events.map((event) => event.type), ["turn/end"]);
+  const last = session.snapshot().events.at(-1); assert.equal(last?.type === "turn/end" && last.data.reason.kind, "aborted");
+});
+
+test("pre-step 无法污染恢复回调的步上下文", async () => {
+  const session = new Session({ sessionId: "hook", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  const other = new Session({ sessionId: "other", createdAt: 0 }); let observed: { session: Session; turn: number; step: number; model: string | undefined } | undefined;
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+    preStep: async (context) => { Reflect.set(context, "session", other); Reflect.set(context, "turn", 42); Reflect.set(context, "step", 99); Reflect.set(context, "header", {}); },
+    recoverOverflow: async (context) => { observed = { session: context.session, turn: context.turn, step: context.step, model: context.header.config?.model }; return false; },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
+  assert.deepEqual(observed, { session, turn: 1, step: 1, model: "m" });
+});
+
+test("恢复回调不能修改原始业务失败终态", async () => {
+  const session = new Session({ sessionId: "failure", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+    recoverOverflow: async ({ failure }) => { Reflect.set(failure, "code", "AUTH"); Reflect.set(failure, "message", "篡改"); return false; },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
+  const last = session.snapshot().events.at(-1);
+  assert.equal(last?.type === "turn/end" && last.data.reason.kind === "error" && last.data.reason.error.code, "CONTEXT_WINDOW_EXCEEDED");
+  assert.equal(last?.type === "turn/end" && last.data.reason.kind === "error" && last.data.reason.error.message, "Provider input context window exceeded");
+});
+
+test("恢复回调异常时保留已结算超限错误", async () => {
+  const session = new Session({ sessionId: "recover-error", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  let calls = 0; const notices: ExecutionNotice[] = [];
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", recoverOverflow: async () => { throw new Error("private"); } })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: (notice) => notices.push(notice), blockStorage: () => assert.fail() });
+  const events = session.snapshot().events; const attempt = events.find((event) => event.type === "assistant/attempt"); const end = events.at(-1);
+  assert.equal(calls, 1); assert.ok(attempt); assert.equal(end?.type === "turn/end" && end.data.reason.kind === "error" && end.data.reason.error.code, "CONTEXT_WINDOW_EXCEEDED");
+  assert.equal(notices.some((notice) => notice.type === "agent/error"), false);
+  assert.doesNotMatch(JSON.stringify([events, notices]), /private/);
+});
+
+test("审批渠道独立 AbortError 不冒充用户取消", async () => {
+  const { ApprovalService } = await import("../approval/service.ts");
+  const session = new Session({ sessionId: "approval-abort", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  const registry = new ToolRegistry(); let executed = 0;
+  registry.register(defineLocalTool({ name: "lookup", version: "1", description: "lookup", input: z.strictObject({}), timeoutMs: 100, sideEffect: "read-only", approvalPolicy: "ask", output: defineLocalToolOutput({ schema: z.string(), render: (_args, value) => [{ type: "text", text: value }] }), handler: () => { executed++; return "ok"; } }));
+  const notices: ExecutionNotice[] = [];
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => [{ chunk: { type: "tool_call", index: 0, callId: "c", name: "lookup", argumentsDelta: "{}" } }, { chunk: { type: "finish", reason: { kind: "tool_calls" } } }]) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", toolRegistry: registry, approvalService: new ApprovalService(async () => { throw Object.assign(new Error("private"), { name: "AbortError" }); }) })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: (notice) => notices.push(notice), blockStorage: () => assert.fail() });
+  const end = session.snapshot().events.at(-1);
+  assert.equal(end?.type === "turn/end" && end.data.reason.kind, "error"); assert.equal(executed, 0);
+  assert.ok(notices.some((notice) => notice.type === "agent/error"));
+});
+
+test("读取配置期间同步取消不会调用 pre-step", async () => {
+  const session = new Session({ sessionId: "config-abort", createdAt: 0 }); const controller = new AbortController(); let hooks = 0;
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => []) }), config: () => { controller.abort(); return { provider: "mock", model: "m" }; }, systemPrompt: () => "", preStep: async () => { hooks++; } })({ session, turn: 1, step: 1, signal: controller.signal, publish: () => {}, blockStorage: () => {} });
+  assert.equal(hooks, 0); assert.deepEqual(session.snapshot().events.map((event) => event.type), ["turn/end"]);
+  const end = session.snapshot().events.at(-1); assert.equal(end?.type === "turn/end" && end.data.reason.kind, "aborted");
+});
+
+test("hook 明确 AbortError 即使信号未触发也视为取消", async () => {
+  const session = new Session({ sessionId: "hook-abort", createdAt: 0 }); let calls = 0;
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return []; }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", preStep: async () => { throw Object.assign(new Error("cancel"), { name: "AbortError" }); } })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => {} });
+  assert.equal(calls, 0); assert.deepEqual(session.snapshot().events.map((event) => event.type), ["turn/end"]);
+  const end = session.snapshot().events.at(-1); assert.equal(end?.type === "turn/end" && end.data.reason.kind, "aborted");
+});
+
+test("恢复异常时存储门已关闭仍安全失败并阻止重试", async () => {
+  const session = new Session({ sessionId: "recovery-blocked", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  let open = true; let calls = 0; const notices: ExecutionNotice[] = [];
+  await createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }), config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", recoverOverflow: async () => { open = false; throw new Error("private"); } })({ session, turn: 1, step: 1, signal: new AbortController().signal, storageOpen: () => open, publish: (notice) => notices.push(notice), blockStorage: () => {} });
+  assert.equal(calls, 1); assert.equal(open, false); assert.ok(notices.some((notice) => notice.type === "agent/error"));
+  const end = session.snapshot().events.at(-1); assert.equal(end?.type === "turn/end" && end.data.reason.kind === "error" && end.data.reason.error.code, "UNKNOWN");
 });

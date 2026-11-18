@@ -377,3 +377,54 @@ test("取消与截断后保留正式工具配对，重放流不重复派生消�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("同一步超限重试的两个 SQLite 前缀分别重建实际请求", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "model-overflow-replay-")); const path = join(dir, "sessions.sqlite");
+  const requests: ModelRequest[] = [];
+  const adapter = { ...createMockAdapter((request) => { requests.push(structuredClone(request)); if (requests.length === 1) throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); return [{ chunk: { type: "text", delta: "完成" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]; }), modelInfo: { defaultMaxTokens: 128 } };
+  let store = new SqliteSessionPersistence(path);
+  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: adapter }), config: () => ({ provider: "mock", model: "m", params: { temperature: 0.4 } }), systemPrompt: () => "系统", tools: () => [{ name: "t", inputSchema: { type: "object" } }],
+    recoverOverflow: async ({ session }) => {
+      const user = session.snapshot().events.find((event) => event.type === "user/message"); assert.ok(user);
+      session.append({ type: "user/message", surfaceOp: { op: "replace", start: user.seq, end: user.seq }, sourceEventSeqs: [user.seq], data: { id: "summary", role: "user", source: { kind: "compact", compactionId: "c" }, content: [{ type: "text", text: "摘要" }] } });
+      return true;
+    },
+  });
+  try {
+    const handle = await store.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
+    const manager = new AgentManager(store, driver); const commands = new SessionCommandController(manager);
+    await commands.prompt({ sessionId: "s", requestId: "r", content: [{ type: "text", text: "原文" }] });
+    const agent = manager.get("s"); assert.ok(agent); await agent.waitForIdle(); await agent.session.flush(); await manager.close(); await store.close();
+    store = new SqliteSessionPersistence(path); const read = await store.open("s", "read"); assert.ok(read); const events = await read.read();
+    const settlements = events.filter((event) => event.type === "assistant/attempt" || event.type === "assistant/message"); assert.equal(settlements.length, 2);
+    for (const [index, settlement] of settlements.entries()) {
+      const replay = new Session(read.header, { seed: { kind: "restore", events: events.slice(0, settlement.seq), inheritedEventCount: 0 } });
+      const { header, input } = rebuildRequestContext(replay); const request = requests[index]; assert.ok(request);
+      assert.deepEqual(input, { messages: request.messages, systemPrompt: request.systemPrompt, tools: request.tools });
+      assert.deepEqual(header.config, { provider: request.route.provider, model: request.route.model, temperature: 0.4, maxTokens: request.effectiveParams.maxOutputTokens });
+      assert.deepEqual(header.adapterDefaults, { maxTokens: 128 });
+    }
+    assert.deepEqual(requests.map((request) => request.messages), [[{ role: "user", text: "原文" }], [{ role: "user", text: "摘要" }]]);
+    assert.deepEqual(events.filter((event) => event.type === "request/header").map((event) => event.data.reason), ["initial", "series"]);
+    await read.close();
+  } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("旧首步前缀、新受理前缀和步间前缀按实际范围修复", async () => {
+  for (const kind of ["old", "new", "between"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "model-prefix-")); const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+    try {
+      const handle = await store.create({ sessionId: "s", createdAt: 1 }); const session = new Session(handle.header);
+      session.append({ type: "turn/start", data: { turn: 1 } });
+      if (kind === "old") session.append({ type: "step/start", data: { turn: 1, step: 1 } });
+      session.append({ type: "user/message", surfaceOp: "append", data: { turn: 1, requestId: "r", id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "输入" }] } });
+      if (kind === "between") { session.append({ type: "step/start", data: { turn: 1, step: 1 } }); session.append({ type: "step/end", data: { turn: 1, step: 1 } }); }
+      const prefix = session.snapshot().events; await handle.append(prefix); await handle.close();
+      let calls = 0; const manager = new AgentManager(store, async () => { calls++; }); const agent = await manager.load("s");
+      const events = agent.session.snapshot().events; assert.deepEqual(events.slice(0, prefix.length), prefix);
+      assert.deepEqual(events.slice(prefix.length).map((event) => event.type), kind === "old" ? ["step/end", "turn/end"] : ["turn/end"]);
+      const end = events.at(-1); assert.equal(end?.type === "turn/end" && end.data.reason.kind, "interrupted"); assert.equal(calls, 0);
+      await manager.close();
+    } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+  }
+});

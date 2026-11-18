@@ -30,9 +30,8 @@ export function messages(state: FollowState): Message[] {
     if (
       (event.type === "assistant/message" ||
         event.type === "assistant/attempt") &&
-      state.draft &&
-      event.data.turn === state.draft.turn &&
-      event.data.step === state.draft.step
+      state.draft?.pendingSeq !== undefined &&
+      event.seq === state.draft.pendingSeq
     )
       continue;
     if (event.type === "assistant/message") {

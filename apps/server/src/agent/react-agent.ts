@@ -16,10 +16,10 @@ type StreamFrame =
 export type AgentObservation = { type: "event"; event: Event } | { type: "assistant-stream"; frame: StreamFrame }
   | Extract<ExecutionNotice, { type: "agent/error" }>;
 type ActiveAttempt = { attemptId: string; turn: number; step: number; chunks: Chunk[]; nextIndex: number };
-/** 驱动一次已受理 Turn；驱动负责结算 Step 和 Turn。 */
+/** 驱动一次已受理 Turn；驱动负责开启并结算实际执行的 Step 和 Turn，并在等待后读取存储准入。 */
 export type RunTurn = (context: {
   session: Session; turn: number; step: number; signal: AbortSignal;
-  publish: (notice: ExecutionNotice) => void; blockStorage: (error: unknown) => void;
+  publish: (notice: ExecutionNotice) => void; blockStorage: (error: unknown) => void; storageOpen: () => boolean;
 }) => Promise<void>;
 
 /** 可由 HTTP 层映射的命令失败代码。 */
@@ -172,13 +172,12 @@ export class ReActAgent {
     this.#controller = new AbortController();
     try {
       this.session.append({ type: "turn/start", data: { turn } });
-      this.session.append({ type: "step/start", data: { turn, step: 1 } });
       this.session.append({ type: "user/message", surfaceOp: "append", data: { turn, requestId: request.requestId,
         id: randomUUID(), role: "user", source: { kind: "user" }, content: request.content } });
     } catch (error) { this.blockStorage(error); this.#state = "idle"; this.#controller = undefined; throw error; }
     const signal = this.#controller.signal;
     this.#running = Promise.resolve().then(() => this.runTurn({ session: this.session, turn, step: 1, signal,
-      publish: (notice) => this.#publish(notice), blockStorage: (error) => this.blockStorage(error) }))
+      publish: (notice) => this.#publish(notice), blockStorage: (error) => this.blockStorage(error), storageOpen: () => this.storageOpen }))
       .catch((error: unknown) => { this.blockStorage(error); console.error("Turn 驱动失败", error); })
       .finally(() => { this.#state = "idle"; this.#controller = undefined; });
     return { accepted: true };
