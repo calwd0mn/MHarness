@@ -8,6 +8,8 @@
 
 **Tech Stack:** Node.js 24、TypeScript 5.9、原生 fetch/Web Streams、node:test、Zod、pnpm 10。
 
+状态：已完成实施、验证与两路复核。以下保留获批计划作为执行依据；最终交付证据见文末。
+
 ---
 
 ## 授权、基线与正式依据
@@ -103,3 +105,17 @@ test("HTTP 401 归 AUTH 且每次生成只发送一次", async () => {
 - [ ] `openspec validate agent-harness-prototype --strict`、`git diff --check`、核对基线 `git diff 9bcf677 --stat`。无真实 Provider 调用，无用户数据库访问。没有 JSDoc 专用静态脚本时人工核对并如实记录，不声称已自动检查文档。
 - [ ] 主 agent 复跑关键定向测试和 typecheck；全新上下文的项目审查子 agent 只读使用 `.agents/skills/mharness-code-review/SKILL.md` 核对任务/实现/调用链。第二个独立新上下文子 agent 执行 `codex review --base 9bcf677`，原生 CLI 在终态前必须跑完；不拿通用自审冒充原生 review。两路检查都包含未跟踪源码，固定相同交付差异。按用户要求两路可并行。
 - [ ] 如有范围内发现，开发 agent 先复现 RED 再修复，两路复核及必要复验；通过后仅勾选 2.7，并写验证记录。任务分支提交采用 `feat(model): 中文说明`，正文中文分点；不把主工作区无关变更带入。保持工作树可审阅、OpenSpec 不归档，最终报告 commit、检查结果、两路审查结论及未验真实 Provider 的限制。
+
+## 最终交付记录（2026-11-18）
+
+计划由 GPT-6.1 Sol / high 独立评审为 Approved；同一 GPT-6.1 Terra / high 完成 TDD 开发及审查修复。基线为 main 的 9bcf677，最终生产代码快照为 c91cf84，保留在 codex/deepseek-request-lifecycle-local；未合并本任务到 main。OpenSpec 保持活跃。
+
+实现错误映射、明确输入超限代码、事件级请求/idle 预算、取消与本地清理。每次生成最多调用一次 transport，预取消为零次；无 SDK、重试或压缩恢复入口。输出 length 仍按 max-tokens 结算。
+
+两路审查共修复四项可复现问题：同步取消跳过已启动 Promise 的拒绝处理及迟到 Response 回收、空结构 SSE 不当重置预算、底层 abort 拒绝覆盖 TIMEOUT、计时器回调延迟时接受超期缓冲结果。每项均先建立有界失败测试再最小修复。父 agent 另用独立脚本复现并复验同步取消与实际事件循环延迟边界。
+
+最终新鲜验证：定向 50/50、server/session 264/264、Web 108/108（node 41 + Vitest 67）、pnpm typecheck、OpenSpec 严格校验及 git diff --check 均通过。父 agent 独立复跑定向 50 项，项目审查 agent 最终也独立复跑定向 50 项。中文 JSDoc 已人工核对，未发现专用静态检查器，不声称自动文档覆盖。
+
+项目级 mharness-code-review 最终复核无新增阻断；Codex 原生 `codex review --base 9bcf677588e246ca59734c85ba62cf22cb63ff4e` 最终进程退出码 0，未发现可操作正确性缺陷。原生结论仅来自静态检查，未独立跑测试。首次沙箱 TLS UnknownIssuer 已通过主会话提升执行解决，未关闭证书校验。
+
+验证全部使用受控传输，未调用真实 DeepSeek 或用户数据库。输入超限识别不承诺覆盖所有未公开厂商文案；本地取消和资源释放不表示不合作的远端或 cancel Promise 已完成。执行与原生日志保留在该工作树的 .scratch/deepseek-request-lifecycle/。
