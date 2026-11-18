@@ -17,9 +17,9 @@ export type GenerationParams = Readonly<{
 
 /** 独立于 Turn 总预算的请求级等待上限，单位为毫秒。 */
 export type RequestTimeouts = Readonly<{
-  /** 从启动请求到首个流事件。 */
+  /** 仅累计请求至首个有效流事件期间的网络等待时间。 */
   requestTimeoutMs: number;
-  /** 消费方等待下一个流事件的时限。 */
+  /** 首事件后等待下一个有效事件的网络时间，不包含下游暂停。 */
   idleTimeoutMs: number;
 }>;
 
@@ -54,6 +54,7 @@ export type ModelRequest = ModelInput & Readonly<{
 }>;
 
 const failureMessages = {
+  CONTEXT_WINDOW_EXCEEDED: "Provider input context window exceeded",
   AUTH: "Provider authentication failed",
   RATE_LIMIT: "Provider rate limit exceeded",
   TRANSPORT: "Provider transport failed",
@@ -153,7 +154,7 @@ export interface ModelAdapter {
 
   /**
    * 发起一次模型请求并交付统一流。正常结束时交付 finish，失败或取消时抛出 LlmError。
-   * 迭代关闭时释放底层流及其资源。
+   * 迭代关闭时请求取消底层操作并释放本地资源；不等待不合作的远端或取消回调完成。
    * @param request - 准备阶段确定的输入和配置快照。
    * @param signal - 取消当前请求和流读取的信号，Turn 的预算由调用方管理。
    * @returns 模型增量和正常结束事件组成的异步流。

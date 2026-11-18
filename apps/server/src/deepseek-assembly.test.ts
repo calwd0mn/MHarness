@@ -127,7 +127,7 @@ test("Provider 错误正文中的凭据不进入历史或 follow 快照", async 
       if (history.includes('"type":"turn/end"')) break;
       await setTimeout(10);
     }
-    assert.match(history, /TRANSPORT/);
+    assert.match(history, /AUTH/);
     assert.doesNotMatch(history, /fake-error-secret/);
     const response = await fetch(`${origin}/api/sessions/${sessionId}/follow`);
     assert.ok(response.body);

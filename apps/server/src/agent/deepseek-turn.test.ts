@@ -47,3 +47,63 @@ test("DeepSeek 异常结束或截断均不派发工具", async () => {
     assert.equal(events.some((event) => event.type === "assistant/message" || event.type === "tool/call" || event.type === "approval/asked"), false, scenario.name);
   }
 });
+
+test("DeepSeek 请求失败在 Turn 持久结算且不重发或派发工具", async () => {
+  const cases: { name: string; transport: typeof fetch; code: string }[] = [
+    { name: "输入超限", transport: async () => new Response(JSON.stringify({ error: { code: "context_length_exceeded" } }), { status: 400 }), code: "CONTEXT_WINDOW_EXCEEDED" },
+    { name: "鉴权", transport: async () => new Response(null, { status: 401 }), code: "AUTH" },
+    { name: "限流", transport: async () => new Response(null, { status: 429 }), code: "RATE_LIMIT" },
+    { name: "读流断网", transport: async () => new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(wire({ content: "部分", tool_calls: [tool] }, "tool_calls", false))); }, pull(controller) { controller.error(new Error("private")); } }, { highWaterMark: 0 })), code: "TRANSPORT" },
+  ];
+  for (const scenario of cases) {
+    const session = new Session({ sessionId: scenario.name, createdAt: 0 });
+    session.bindCheckpoint(async () => {});
+    let calls = 0;
+    let executions = 0;
+    const registry = new ToolRegistry();
+    registry.register(defineLocalTool({ name: "read", version: "1", description: "read", input: z.strictObject({}), timeoutMs: 1000,
+      sideEffect: "read-only", output: defineLocalToolOutput({ schema: z.string(), render: (_args, value) => [{ type: "text", text: value }] }),
+      handler: () => { executions++; return "ok"; } }));
+    const transport: typeof fetch = (...args) => { calls++; return scenario.transport(...args); };
+    const driver = createModelTurnDriver({ runtime: new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "private", fetch: transport }) }),
+      config: () => ({ provider: "deepseek", model: "deepseek-v4-pro" }), systemPrompt: () => "", toolRegistry: registry });
+    await driver({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
+    const events = session.snapshot().events;
+    const attempt = events.find((event) => event.type === "assistant/attempt");
+    assert.equal(attempt?.data.outcome, "failed", scenario.name);
+    assert.equal(typeof attempt?.data.reason === "object" && attempt.data.reason !== null && "code" in attempt.data.reason && attempt.data.reason.code, scenario.code, scenario.name);
+    const end = events.findLast((event) => event.type === "turn/end");
+    assert.equal(end?.data.reason.kind === "error" && end.data.reason.error.code, scenario.code, scenario.name);
+    assert.equal(events.some((event) => event.type === "assistant/message" || event.type === "tool/call" || event.type === "approval/asked"), false, scenario.name);
+    assert.equal(executions, 0, scenario.name);
+    assert.equal(calls, 1, scenario.name);
+    assert.doesNotMatch(JSON.stringify(events), /private/);
+  }
+});
+
+test("DeepSeek 请求超时或取消在 Turn 保留不同结算", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  for (const mode of ["timeout", "abort"] as const) {
+    const session = new Session({ sessionId: mode, createdAt: 0 });
+    session.bindCheckpoint(async () => {});
+    const upstream = new AbortController();
+    let calls = 0;
+    let started!: () => void;
+    const barrier = new Promise<void>((resolve) => { started = resolve; });
+    const transport: typeof fetch = async () => { calls++; started(); return new Promise<Response>(() => {}); };
+    const driver = createModelTurnDriver({ runtime: new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "private", fetch: transport }) }),
+      config: () => ({ provider: "deepseek", model: "deepseek-v4-pro", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } }), systemPrompt: () => "" });
+    const running = driver({ session, turn: 1, step: 1, signal: upstream.signal, publish: () => {}, blockStorage: () => assert.fail() });
+    await barrier;
+    if (mode === "timeout") context.mock.timers.tick(100); else upstream.abort();
+    await running;
+    const events = session.snapshot().events;
+    const attempt = events.find((event) => event.type === "assistant/attempt");
+    assert.equal(attempt?.data.outcome, mode === "timeout" ? "failed" : "cancelled");
+    const end = events.findLast((event) => event.type === "turn/end");
+    assert.equal(end?.data.reason.kind, mode === "timeout" ? "error" : "aborted");
+    if (mode === "timeout") assert.equal(end?.data.reason.kind === "error" && end.data.reason.error.code, "TIMEOUT");
+    assert.equal(events.some((event) => event.type === "assistant/message" || event.type === "tool/call" || event.type === "approval/asked"), false);
+    assert.equal(calls, 1);
+  }
+});
