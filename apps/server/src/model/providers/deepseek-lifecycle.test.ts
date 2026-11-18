@@ -425,3 +425,58 @@ for (const mode of ["request", "idle", "error-body"] as const) {
     assert.doesNotMatch(JSON.stringify(chunks), /private/);
   });
 }
+
+test("请求结果在计时器回调前到达但预算已耗尽仍超时", async (context) => {
+  const realSetTimeout = setTimeout;
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let deliver!: (response: Response) => void;
+  let started!: () => void;
+  const barrier = new Promise<void>((resolve) => { started = resolve; });
+  let canceled = 0;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: [DONE]\n\n')); }, cancel() { canceled++; } });
+  const transport: typeof fetch = () => new Promise<Response>((resolve) => { deliver = resolve; started(); });
+  const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: transport }) }).prepare({ provider: "deepseek", model: "test", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } });
+  const result = (async () => { const chunks: StreamChunk[] = []; for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, new AbortController().signal)) chunks.push(chunk); return chunks; })();
+  await barrier;
+  context.mock.timers.setTime(100);
+  deliver(new Response(body));
+  const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("请求预算未终结")), 200))]);
+  assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: "request" } } }]);
+  assert.equal(canceled, 1);
+});
+
+test("idle 结果在计时器回调前到达但预算已耗尽仍超时", async (context) => {
+  const realSetTimeout = setTimeout;
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  let notify!: () => void;
+  const barrier = new Promise<void>((resolve) => { notify = resolve; });
+  let pulls = 0;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; }, pull(controller) { if (++pulls === 1) controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{}}]}\n\n')); else notify(); } }, { highWaterMark: 0 });
+  const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: async () => new Response(body) }) }).prepare({ provider: "deepseek", model: "test", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } });
+  const result = (async () => { const chunks: StreamChunk[] = []; for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, new AbortController().signal)) chunks.push(chunk); return chunks; })();
+  await barrier;
+  context.mock.timers.setTime(50);
+  streamController.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+  const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("idle 预算未终结")), 200))]);
+  assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: "idle" } } }]);
+  assert.equal(body.locked, false);
+});
+
+test("零剩余预算不能接受后续缓冲事件", async (context) => {
+  const realSetTimeout = setTimeout;
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let notify!: () => void;
+  const barrier = new Promise<void>((resolve) => { notify = resolve; });
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  let pulls = 0;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; }, pull() { if (++pulls === 1) notify(); } }, { highWaterMark: 0 });
+  const prepared = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "secret", fetch: async () => new Response(body) }) }).prepare({ provider: "deepseek", model: "test", timeouts: { requestTimeoutMs: 100, idleTimeoutMs: 50 } });
+  const result = (async () => { const chunks: StreamChunk[] = []; for await (const chunk of prepared.generate({ systemPrompt: "", messages: [], tools: [] }, new AbortController().signal)) chunks.push(chunk); return chunks; })();
+  await barrier;
+  context.mock.timers.setTime(100);
+  streamController.enqueue(new TextEncoder().encode(': keepalive\n\n'));
+  streamController.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+  const chunks = await Promise.race([result, new Promise<never>((_resolve, reject) => realSetTimeout(() => reject(new Error("零预算未终结")), 200))]);
+  assert.deepEqual(chunks, [{ type: "finish", reason: { kind: "error", failure: { code: "TIMEOUT", message: "Provider request timed out", timeoutPhase: "request" } } }]);
+});

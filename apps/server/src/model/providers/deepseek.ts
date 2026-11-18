@@ -79,9 +79,12 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
       let remaining = request.timeouts.requestTimeoutMs;
       const check = () => { if (terminal) throw terminal; };
       const abort = () => { terminal ??= new LlmError("ABORTED"); controller.abort(); };
+      const timeout = () => { terminal ??= new LlmError("TIMEOUT", { timeoutPhase: phase }); controller.abort(); };
+      const checkBudget = () => { check(); if (remaining <= 0) timeout(); check(); };
       if (signal.aborted) abort();
       else signal.addEventListener("abort", abort, { once: true });
       const wait = async <T>(promise: Promise<T>, late?: (value: T) => void): Promise<T> => {
+        if (!terminal && remaining <= 0) timeout();
         if (terminal) {
           void promise.then(late ?? (() => {}), () => {});
           throw terminal;
@@ -92,10 +95,12 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
         const stopped = new Promise<never>((_resolve, reject) => {
           onAbort = () => reject(terminal ?? new LlmError("ABORTED"));
           controller.signal.addEventListener("abort", onAbort, { once: true });
-          timer = setTimeout(() => { terminal ??= new LlmError("TIMEOUT", { timeoutPhase: phase }); controller.abort(); }, remaining);
+          timer = setTimeout(timeout, remaining);
         });
         try {
           const value = await Promise.race([promise, stopped]);
+          check();
+          if (Date.now() - start >= remaining) timeout();
           check();
           return value;
         } catch (error: unknown) {
@@ -108,7 +113,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
         }
       };
       try {
-        check();
+        checkBudget();
         let response: Response;
         try {
           response = await wait(transport("https://api.deepseek.com/chat/completions", {
@@ -146,6 +151,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
             let errorBody = "";
             try {
               while (errorBody.length <= 65536) {
+                checkBudget();
                 const part = await wait(errorReader.read());
                 errorBody += errorDecoder.decode(part.value, { stream: !part.done });
                 if (part.done) break;
@@ -173,6 +179,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
         let done = false;
         try {
           while (!done) {
+            checkBudget();
             let read: Awaited<ReturnType<typeof reader.read>>;
             try { read = await wait(reader.read()); } catch (error: unknown) { if (error instanceof LlmError) throw error; throw new LlmError("TRANSPORT", {}, { cause: error }); }
             check();
