@@ -21,6 +21,16 @@ export class SessionToolCalls {
   readonly #calls = new Map<string, ToolCall>();
 
   /**
+   * 复制当前关联状态，供独立草稿校验而不修改原索引。
+   * @returns 拥有独立可变关联项的新索引。
+   */
+  clone(): SessionToolCalls {
+    const copy = new SessionToolCalls();
+    for (const [key, call] of this.#calls) copy.#calls.set(key, { ...call });
+    return copy;
+  }
+
+  /**
    * 依据已接受前缀校验候选工具关联，暂不更新索引。
    * @param event - 已通过事件 Schema 校验的候选记录。
    * @returns 整条事件被接受后须立即调用的更新函数；与工具关联无关时为 undefined。

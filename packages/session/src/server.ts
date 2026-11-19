@@ -8,7 +8,7 @@ export { projectInterruptedSession, recoverInterruptedSession } from "./recovery
 export { Session, SessionStore as MemorySessionStore } from "./session.ts";
 export { selectForkCut } from "./fork.ts";
 export { snapshotSessionJson } from "./events.ts";
-export type { SessionHeader } from "./session.ts";
+export type { SessionHeader, StagedCommitResult } from "./session.ts";
 export { acquireInstanceOwnership, OwnershipConflictError } from "./storage/ownership.ts";
 export { SqliteSessionPersistence } from "./storage/sqlite-persistence.ts";
 export type { SqliteSessionPersistenceOptions } from "./storage/sqlite-persistence.ts";
