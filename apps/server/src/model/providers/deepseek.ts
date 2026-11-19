@@ -42,6 +42,10 @@ function retryAfter(value: string | null): number | undefined {
   const result = Number.isNaN(seconds) ? date - Date.now() : seconds;
   return Number.isSafeInteger(result) && result >= 0 ? result : undefined;
 }
+function includesReasoning(params: import("../adapter.ts").GenerationParams, tools: readonly import("../adapter.ts").ModelTool[]): boolean {
+  return params.reasoningEffort !== "none" && tools.length > 0;
+}
+
 function messageBody(message: ModelMessage, includeReasoning: boolean) {
   if (message.role === "user") return { role: "user", content: message.text };
   if (message.role === "tool") return { role: "tool", tool_call_id: message.callId, content: message.text };
@@ -66,6 +70,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
   const apiKey = options.apiKey;
   const transport = options.fetch ?? globalThis.fetch;
   return {
+    includesAssistantReasoning: includesReasoning,
     modelInfo: { defaultReasoningEffort: "none", supportedReasoningEfforts: ["none", "low", "high", "max"] },
     validateParams(params) {
       if (params.reasoningEffort !== "none" && (params.temperature !== undefined || params.topP !== undefined)) throw new RangeError("推理模式不支持采样参数");
@@ -120,7 +125,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
             method: "POST", redirect: "error", signal: controller.signal,
             headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
             body: JSON.stringify({ model: request.route.model, stream: true,
-              messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.map((message) => messageBody(message, request.effectiveParams.reasoningEffort !== "none" && request.tools.length > 0))],
+              messages: [{ role: "system", content: request.systemPrompt }, ...request.messages.map((message) => messageBody(message, includesReasoning(request.effectiveParams, request.tools)))],
               thinking: { type: request.effectiveParams.reasoningEffort === "none" ? "disabled" : "enabled" },
               ...(request.tools.length ? { tools: request.tools.map((tool) => ({ type: "function", function: {
                 name: tool.name, ...(tool.description === undefined ? {} : { description: tool.description }), parameters: tool.inputSchema,

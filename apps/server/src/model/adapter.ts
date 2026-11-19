@@ -138,8 +138,24 @@ export type ModelInfo = Readonly<{
   defaultReasoningEffort?: string;
 }>;
 
+/** 本地声明的模型容量；字段独立可缺省，单位均为 token。 */
+export type ModelBudget = Readonly<{
+  /** 上下文窗口，未声明时不能判断压力；必须为正安全整数。 */
+  contextWindow?: number;
+  /** 没有生效的生成上限时使用的输出预留；必须为正安全整数。 */
+  defaultOutputTokens?: number;
+}>;
+
 /** 模型接入边界。Adapter 持有厂商连接、鉴权和取消所需资源。 */
 export interface ModelAdapter {
+  /** 按模型 ID 精确登记的本地容量，不影响生成参数。 */
+  readonly modelBudgets?: Readonly<Record<string, ModelBudget>>;
+  /** 判断助手历史推理块是否被此 Adapter 发送，缺省时计量全部推理块。
+   * @param params - 已固定的有效生成参数。
+   * @param tools - 本次请求使用的工具定义。
+   * @returns 是否发送助手历史中的推理块。
+   */
+  includesAssistantReasoning?(params: GenerationParams, tools: readonly ModelTool[]): boolean;
   /** 请求省略字段时使用的 Adapter 生成参数默认值。 */
   readonly defaultParams?: GenerationParams;
   /** 当前 Adapter 模型的能力和可记录默认值。 */

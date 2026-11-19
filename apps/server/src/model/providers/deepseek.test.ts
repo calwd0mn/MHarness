@@ -205,3 +205,70 @@ test("不支持的显式结束原因等待 DONE 后安全失败，缺少 DONE �
     }
   }
 });
+
+test("真实请求与计量共享推理可见性和结构化工具结果", async () => {
+  const { Session } = await import("@mharness/session/server");
+  const { createRequestPreparer, rebuildRequestContext } = await import("../../agent/request-context.ts");
+  const { estimateSurfaceMessageTokens } = await import("../token-meter.ts");
+  for (const [effort, withTools, expected, reasoning] of [["high", true, 30, true], ["none", true, 20, false], ["high", false, 20, false]] as const) {
+    let body = "";
+    const transport: typeof fetch = async (_url, init) => { body = String(init?.body); return new Response('data: [DONE]\n\n'); };
+    const runtime = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "fake", fetch: transport }) });
+    const session = new Session({ sessionId: "projection", createdAt: 1 });
+    session.append({ type: "assistant/message", surfaceOp: "append", data: { turn: 1, step: 1, message: { id: "a", role: "assistant", source: { provider: "deepseek", model: "m" }, content: [{ type: "text", text: "A" }, { type: "text", text: "B" }, { type: "reasoning", text: "想😀" }, { type: "reasoning", text: "继续🤖" }, { type: "tool-call", id: "c", name: "read", arguments: "{}" }] }, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true } });
+    session.append({ type: "tool/result", surfaceOp: "append", sourceEventSeqs: [0], data: { turn: 1, step: 1, message: { id: "r", role: "user", source: { kind: "tool", callId: "c" }, content: [{ type: "tool-result", toolCallId: "c", isError: false, content: [{ type: "future", value: 1 }, { type: "text", text: "ok" }] }] } } });
+    const tools = withTools ? [{ name: "read", inputSchema: {} }] : [];
+    const { prepared, input } = createRequestPreparer({ runtime, config: () => ({ provider: "deepseek", model: "m", params: { reasoningEffort: effort } }), systemPrompt: () => "sys", tools: () => tools })(session);
+    const first = session.deriveMessages()[0]; assert.ok(first);
+    assert.equal(estimateSurfaceMessageTokens(prepared, first, tools), expected);
+    assert.deepEqual(rebuildRequestContext(session).input, input);
+    await collect(prepared.generate(input, new AbortController().signal));
+    const wire = JSON.parse(body) as { messages: { reasoning_content?: string; content: string }[] };
+    assert.equal(wire.messages[1]?.reasoning_content, reasoning ? "想😀继续🤖" : undefined);
+    assert.equal(wire.messages[2]?.content, JSON.stringify([{ type: "future", value: 1 }, { type: "text", text: "ok" }]));
+  }
+});
+
+test("生成默认上限优先于计量预留且与 wire、请求头一致", async () => {
+  const { Session } = await import("@mharness/session/server");
+  const { createRequestPreparer, foldRequestHeader } = await import("../../agent/request-context.ts");
+  const { measureRequestPressure } = await import("../token-meter.ts");
+  for (const defaultMaxTokens of [512, undefined]) {
+    let body = "";
+    const adapter = createDeepSeekAdapter({ apiKey: "fake", fetch: async (_url, init) => { body = String(init?.body); return new Response('data: [DONE]\n\n'); } });
+    const runtime = new LlmRuntime({ deepseek: { ...adapter, modelInfo: { ...adapter.modelInfo, ...(defaultMaxTokens === undefined ? {} : { defaultMaxTokens }) }, modelBudgets: { m: { contextWindow: 100000, defaultOutputTokens: 2000 } } } });
+    const session = new Session({ sessionId: "defaults", createdAt: 1 });
+    session.append({ type: "user/message", surfaceOp: "append", data: { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [{ type: "text", text: "abcd" }] } });
+    const { prepared, input } = createRequestPreparer({ runtime, config: () => ({ provider: "deepseek", model: "m" }), systemPrompt: () => "sys" })(session);
+    const measured = measureRequestPressure(prepared, { systemPrompt: "sys", tools: [], messages: session.deriveMessages() });
+    assert.equal(measured.status === "measured" && measured.inputTokens, 14);
+    assert.equal(measured.status === "measured" && measured.pressure, defaultMaxTokens === undefined ? 2014 : 526);
+    await collect(prepared.generate(input, new AbortController().signal));
+    const wire = JSON.parse(body) as { max_tokens?: number };
+    const header = foldRequestHeader(session.snapshot().events); assert.ok(header);
+    assert.equal(wire.max_tokens, defaultMaxTokens); assert.equal(header.config.maxTokens, defaultMaxTokens);
+    assert.equal(header.adapterDefaults?.maxTokens, defaultMaxTokens);
+  }
+});
+
+test("真实空推理块与缺省推理均发送空串但只为空块计费", async () => {
+  const { Session } = await import("@mharness/session/server");
+  const { createRequestPreparer } = await import("../../agent/request-context.ts");
+  const { estimateSurfaceMessageTokens } = await import("../token-meter.ts");
+  const wireMessages: unknown[] = [];
+  const runtime = new LlmRuntime({ deepseek: createDeepSeekAdapter({ apiKey: "fake", fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { messages: unknown[] }; wireMessages.push(body.messages[1]);
+    return new Response('data: [DONE]\n\n');
+  } }) });
+  const tools = [{ name: "read", inputSchema: {} }];
+  const costs: number[] = [];
+  for (const hasEmptyReasoning of [false, true]) {
+    const session = new Session({ sessionId: "empty-reasoning", createdAt: 1 });
+    session.append({ type: "assistant/message", surfaceOp: "append", data: { turn: 1, step: 1, message: { id: "a", role: "assistant", source: { provider: "deepseek", model: "m" }, content: hasEmptyReasoning ? [{ type: "reasoning", text: "" }] : [] }, finishReason: { kind: "stop" }, stream: [], includeInModelContext: true } });
+    const { prepared, input } = createRequestPreparer({ runtime, config: () => ({ provider: "deepseek", model: "m", params: { reasoningEffort: "high" } }), systemPrompt: () => "sys", tools: () => tools })(session);
+    costs.push(estimateSurfaceMessageTokens(prepared, session.deriveMessages()[0]!, tools));
+    await collect(prepared.generate(input, new AbortController().signal));
+  }
+  assert.deepEqual(wireMessages, [{ role: "assistant", content: "", reasoning_content: "" }, { role: "assistant", content: "", reasoning_content: "" }]);
+  assert.deepEqual(costs, [4, 8]);
+});

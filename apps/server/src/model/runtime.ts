@@ -5,7 +5,9 @@ import type {
   StreamChunk,
   LlmFinishReason,
   ModelAdapter,
+  ModelBudget,
   ModelInput,
+  ModelTool,
   ModelRequest,
   ModelRoute,
   RequestTimeouts,
@@ -19,6 +21,10 @@ export type ModelConfig = ModelRoute & Readonly<{
 
 /** 已选定 Adapter 的配置快照，可在会话检查点完成后用于生成。 */
 export interface PreparedModel {
+  /** 当前模型的本地容量快照，缺省表示没有声明。 */
+  readonly modelBudget?: ModelBudget;
+  /** 按本次固定参数判断工具列表下是否发送助手推理；缺省表示发送。 */
+  includesAssistantReasoning?(tools: readonly ModelTool[]): boolean;
   /** 可记录的实际路由。 */
   readonly route: ModelRoute;
   /** 合并 Adapter 默认值后的可记录参数。 */
@@ -106,6 +112,18 @@ export class LlmRuntime {
       model: requiredId(config.model, "model"),
       ...(config.endpointId === undefined ? {} : { endpointId: requiredId(config.endpointId, "endpointId") }),
     });
+    const modelBudgets = adapter.modelBudgets;
+    const declaration = modelBudgets && Object.hasOwn(modelBudgets, route.model)
+      ? modelBudgets[route.model] : undefined;
+    const contextWindow = declaration?.contextWindow;
+    const defaultOutputTokens = declaration?.defaultOutputTokens;
+    for (const value of [contextWindow, defaultOutputTokens]) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new RangeError("Invalid model budget");
+    }
+    const modelBudget = declaration ? Object.freeze({
+      ...(contextWindow === undefined ? {} : { contextWindow }),
+      ...(defaultOutputTokens === undefined ? {} : { defaultOutputTokens }),
+    }) : undefined;
     if (options.recordable &&
         ((config.params?.temperature === undefined && adapter.defaultParams?.temperature !== undefined) ||
          (config.params?.stop === undefined && adapter.defaultParams?.stop !== undefined))) {
@@ -136,9 +154,12 @@ export class LlmRuntime {
       idleTimeoutMs: timeoutMs(config.timeouts?.idleTimeoutMs ?? localConfig.model.idleTimeoutMs),
     });
 
+    const includesAssistantReasoning = adapter.includesAssistantReasoning?.bind(adapter);
     return Object.freeze({
       route,
       effectiveParams,
+      ...(modelBudget ? { modelBudget } : {}),
+      ...(includesAssistantReasoning ? { includesAssistantReasoning: (tools: readonly ModelTool[]) => includesAssistantReasoning(effectiveParams, tools) } : {}),
       ...(adapterDefaults ? { adapterDefaults } : {}),
       generate: (input: ModelInput, signal: AbortSignal) =>
         generate(adapter, { ...input, route, effectiveParams, timeouts }, signal),
