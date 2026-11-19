@@ -15,6 +15,7 @@ test("真实 HTTP 答复、忙碌、重发与重启后的已保存决定", async
   const approvals = new ApprovalService((asked) => { report(asked.data.id); return new Promise(() => {}); });
   const path = join(dir, "events.sqlite");
   const app = await createEventSessionApp(path, false, async ({ session, turn, step, signal }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     session.append({ type: "assistant/message", surfaceOp: "append", data: { turn, step, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true, message: { id: "a", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "tool-call", id: "c", name: "t", arguments: "{}" }] } } });
     session.append({ type: "tool/call", data: { turn, step, callId: "c", name: "t", arguments: "{}" } });
     const operation = session.append({ type: "tool/operation", data: { turn, step, callId: "c", operationId: "o", toolName: "t", toolVersion: "1", validatedArgs: {} } });
@@ -88,6 +89,7 @@ test("无渠道结局可由批次保存配对错误且正文不执行", async (t
   const finished = new Promise<void>((resolve) => { finish = resolve; });
   let bodies = 0;
   const app = await createEventSessionApp(join(dir, "events.sqlite"), false, async ({ session, turn, step, signal }) => {
+    session.append({ type: "step/start", data: { turn, step } });
     session.append({ type: "assistant/message", surfaceOp: "append", data: { turn, step, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true, message: { id: "a", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "tool-call", id: "c", name: "t", arguments: "{}" }] } } });
     session.append({ type: "tool/call", data: { turn, step, callId: "c", name: "t", arguments: "{}" } });
     const operation = session.append({ type: "tool/operation", data: { turn, step, callId: "c", operationId: "o", toolName: "t", toolVersion: "1", validatedArgs: {} } });

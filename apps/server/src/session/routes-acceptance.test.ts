@@ -495,3 +495,68 @@ test("真实启动应用的 fork 历史和 follow 保留原事件，继承编号
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("HTTP 受理不等待首步，重发去重且新请求保持忙碌", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-prestep-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const manager = new AgentManager(persistence, async ({ session, turn, step }) => {
+    entered(); await gate;
+    session.append({ type: "step/start", data: { turn, step } });
+    session.append({ type: "step/end", data: { turn, step } });
+    session.append({ type: "turn/end", data: { turn, reason: { kind: "completed" } } });
+  });
+  const app = Fastify();
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  try {
+    const handle = await persistence.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
+    const post = (requestId: string, text: string) => app.inject({ method: "POST", url: "/api/sessions/s/messages", payload: { requestId, content: [{ type: "text", text }] } });
+    const response = await post("r", "原文"); assert.equal(response.statusCode, 202); assert.deepEqual(response.json(), { accepted: true });
+    await waiting;
+    const agent = manager.get("s"); assert.ok(agent);
+    assert.deepEqual(agent.session.snapshot().events.map((event) => event.type), ["turn/start", "user/message"]);
+    assert.equal((await post("r", "重发")).statusCode, 202);
+    const busy = await post("next", "新文"); assert.equal(busy.statusCode, 409); assert.deepEqual(busy.json(), { code: "agent_busy" });
+    assert.equal(agent.session.snapshot().events.filter((event) => event.type === "user/message").length, 1);
+    release(); await agent.waitForIdle();
+  } finally { release(); await app.close(); await manager.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("真实 SSE 在 pre-step 等待时交付受理前缀并在开步后发布业务流", { timeout: 8000 }, async () => {
+  const { followFrameSchema } = await import("@mharness/session/contracts");
+  const { createModelTurnDriver } = await import("../agent/model-turn.ts");
+  const { createMockAdapter } = await import("../model/providers/mock.ts");
+  const { LlmRuntime } = await import("../model/runtime.ts");
+  const dir = await mkdtemp(join(tmpdir(), "mharness-sse-gate-")); const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  let release!: () => void; let entered!: () => void; let calls = 0;
+  const gate = new Promise<void>((resolve) => { release = resolve; }); const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return [{ chunk: { type: "text", delta: "答" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]; }) }),
+    config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", preStep: async () => { entered(); await gate; } });
+  const manager = new AgentManager(persistence, driver); const app = Fastify();
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  const controller = new AbortController();
+  try {
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const created = await app.inject({ method: "POST", url: "/api/sessions" }); const { sessionId } = created.json() as { sessionId: string };
+    const connect = async () => {
+      const response = await fetch(`${origin}/api/sessions/${sessionId}/follow`, { signal: controller.signal }); assert.ok(response.body);
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader(); let buffer = "";
+      return { reader, next: async () => { for (;;) { const boundary = buffer.indexOf("\n\n"); if (boundary >= 0) { const item = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2); if (item.startsWith("data: ")) return followFrameSchema.parse(JSON.parse(item.slice(6)) as unknown); continue; } const chunk = await reader.read(); if (chunk.done) throw new Error("SSE 提前关闭"); buffer += chunk.value; } } };
+    };
+    const first = await connect(); assert.equal((await first.next()).type, "snapshot");
+    assert.equal((await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "你好" }] } })).statusCode, 202);
+    await waiting;
+    const one = await first.next(); const two = await first.next();
+    assert.ok(one.type === "event" && one.event.type === "turn/start" && one.event.seq === 0);
+    assert.ok(two.type === "event" && two.event.type === "user/message" && two.event.seq === 1); assert.equal(calls, 0);
+    const second = await connect(); const snapshot = await second.next();
+    assert.ok(snapshot.type === "snapshot" && snapshot.cursor === 1 && !snapshot.assistantStream.activeAttempt);
+    assert.deepEqual(snapshot.records.map((record) => record.event.type), ["turn/start", "user/message"]);
+    release(); const frames = []; for (;;) { const frame = await first.next(); frames.push(frame); if (frame.type === "assistant-stream" && frame.frame.type === "start") break; }
+    assert.deepEqual(frames.map((frame) => frame.type === "event" ? frame.event.type : frame.type), ["step/start", "request/header", "assistant-stream"]);
+    assert.equal(calls, 1); await first.reader.cancel(); await second.reader.cancel();
+    const agent = manager.get(sessionId); assert.ok(agent); await agent.waitForIdle();
+  } finally { release(); controller.abort(); await app.close(); await manager.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
+});

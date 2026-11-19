@@ -657,3 +657,42 @@ test("嵌套 fork 中只有子会话自有事件接管同编号发送占位", as
   expect(users()).toEqual(["你父消息", "你子消息"]);
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+
+test("同一步重连草稿保留此前失败记录", async () => {
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 }),
+    record(2, "assistant/attempt", { turn: 1, step: 1, outcome: "failed", reason: { code: "CONTEXT_WINDOW_EXCEEDED", message: "超限" }, stream: [], includeInModelContext: false })];
+  const stream = { revision: 1, activeAttempt: { attemptId: "retry", turn: 1, step: 1, chunks: [{ type: "text", delta: "重试正文" }], nextIndex: 1 } };
+  await sendFrame(connections[0], snapshot("a", records, stream));
+  expect(container.textContent).toContain("助手尝试失败");
+  expect(container.textContent).toContain("重试正文");
+});
+
+test("同一步失败后实时重试保留失败并交接新草稿", async () => {
+  const records = [record(0, "turn/start", { turn: 1 }), record(1, "step/start", { turn: 1, step: 1 })];
+  const stream = { revision: 1, activeAttempt: { attemptId: "first", turn: 1, step: 1, chunks: [], nextIndex: 0 } };
+  await sendFrame(connections[0], snapshot("a", records, stream));
+  const failed = record(2, "assistant/attempt", { turn: 1, step: 1, outcome: "failed", reason: { code: "CONTEXT_WINDOW_EXCEEDED", message: "超限" }, stream: [], includeInModelContext: false });
+  await sendFrame(connections[0], failed);
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "end", attemptId: "first", revision: 2, turn: 1, step: 1, index: 0, outcome: { kind: "committed", eventType: "assistant/attempt", seq: 2 } } });
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "start", attemptId: "second", revision: 3, turn: 1, step: 1 } });
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "chunk", attemptId: "second", revision: 4, index: 0, chunk: { type: "text", delta: "新正文" } } });
+  expect(container.textContent.split("助手尝试失败")).toHaveLength(2);
+  const node = container.querySelector("article.assistant");
+  const message = record(3, "assistant/message", { turn: 1, step: 1, message: { id: "m", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "text", text: "新正文" }] }, finishReason: { kind: "stop" }, stream: [], includeInModelContext: true }, { surfaceOp: "append" });
+  await sendFrame(connections[0], message);
+  expect(container.textContent.split("新正文")).toHaveLength(2);
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "end", attemptId: "second", revision: 5, turn: 1, step: 1, index: 1, outcome: { kind: "committed", eventType: "assistant/message", seq: 3 } } });
+  expect(container.querySelector("article.assistant")).toBe(node);
+  expect(container.textContent.split("助手尝试失败")).toHaveLength(2);
+  expect(container.textContent.split("新正文")).toHaveLength(2);
+});
+
+test("只有受理事件的活动 Turn 快照保持忙碌并接收首步", async () => {
+  const user = record(1, "user/message", { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [{ type: "text", text: "等待" }] }, { surfaceOp: "append" });
+  await sendFrame(connections[0], snapshot("a", [record(0, "turn/start", { turn: 1 }), user]));
+  expect(container.textContent).toContain("正在处理"); expect(button("取消任务")).toBeTruthy();
+  await sendFrame(connections[0], record(2, "step/start", { turn: 1, step: 1 }));
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "start", attemptId: "a1", revision: 1, turn: 1, step: 1 } });
+  await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "chunk", attemptId: "a1", revision: 2, index: 0, chunk: { type: "text", delta: "开始" } } });
+  expect(container.textContent.split("等待")).toHaveLength(2); expect(container.textContent).toContain("开始"); expect(connections).toHaveLength(1);
+});

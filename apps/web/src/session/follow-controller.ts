@@ -15,6 +15,8 @@ type Draft = {
   chunks: AssistantChunk[];
   nextIndex: number;
   nodeId: string;
+  /** 当前草稿已收到但尚未完成交接的结算事件序号。 */
+  pendingSeq?: number;
 };
 type Settlement = {
   draft: Draft;
@@ -358,6 +360,7 @@ export class FollowController {
           throw new Error("结算范围或数量无效");
         this.pending ??= { draft: this.state.draft };
         this.pending.event = frame;
+        this.state = { ...this.state, draft: { ...this.state.draft, pendingSeq: event.seq } };
         this.settle();
       }
       this.emit();

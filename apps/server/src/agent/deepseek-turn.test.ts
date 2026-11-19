@@ -107,3 +107,28 @@ test("DeepSeek 请求超时或取消在 Turn 保留不同结算", async (context
     assert.equal(calls, 1);
   }
 });
+
+test("DeepSeek 每步固定凭据与路由并保留推理和工具配对", async () => {
+  const session = new Session({ sessionId: "credentials", createdAt: 0 }); session.bindCheckpoint(async () => {});
+  let key = "fake-old-key"; let model = "deepseek-v4-pro"; let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; }); const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const auth: string[] = []; const bodies: { model: string; messages: { role: string; reasoning_content?: string; tool_call_id?: string }[] }[] = [];
+  const transport: typeof fetch = async (_url, init) => {
+    auth.push(new Headers(init?.headers).get("authorization") ?? "");
+    bodies.push(JSON.parse(String(init?.body)) as typeof bodies[number]);
+    return new Response(bodies.length === 1 ? wire({ reasoning_content: "思考", tool_calls: [tool] }, "tool_calls") : wire({ content: "完成" }, "stop"));
+  };
+  const registry = new ToolRegistry();
+  registry.register(defineLocalTool({ name: "read", version: "1", description: "read", input: z.strictObject({}), timeoutMs: 1000, sideEffect: "read-only", output: defineLocalToolOutput({ schema: z.string(), render: (_args, value) => [{ type: "text", text: value }] }), handler: () => "结果" }));
+  const notices: unknown[] = [];
+  const running = createModelTurnDriver({ runtime: new LlmRuntime({ deepseek: () => createDeepSeekAdapter({ apiKey: key, fetch: transport }) }),
+    config: () => ({ provider: "deepseek", model, params: { reasoningEffort: "high" } }), systemPrompt: () => "系统", toolRegistry: registry,
+    preStep: async ({ step }) => { if (step === 1) { entered(); await gate; } },
+  })({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: (notice) => notices.push(notice), blockStorage: () => assert.fail() });
+  await waiting; key = "fake-new-key"; model = "deepseek-v4-flash"; release(); await running;
+  assert.deepEqual(auth, ["Bearer fake-old-key", "Bearer fake-new-key"]);
+  assert.deepEqual(bodies.map((body) => body.model), ["deepseek-v4-pro", "deepseek-v4-flash"]);
+  assert.ok(bodies[1]?.messages.some((message) => message.role === "assistant" && message.reasoning_content === "思考"));
+  assert.ok(bodies[1]?.messages.some((message) => message.role === "tool" && message.tool_call_id === "c"));
+  assert.doesNotMatch(JSON.stringify([session.snapshot(), notices]), /fake-(old|new)-key/);
+});
