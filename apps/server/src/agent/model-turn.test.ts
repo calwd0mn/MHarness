@@ -1077,6 +1077,45 @@ test("pre-step 完成前不打开 Step，取消后仅结束 Turn", async () => {
   assert.equal(end?.type === "turn/end" && end.data.reason.kind, "aborted");
 });
 
+test("pre-step 普通拒绝仍结算 Turn，压缩阻断保留首次报告的空值", async () => {
+  for (const blocked of [false, true]) {
+    const session = new Session({ sessionId: "s", createdAt: 0 });
+    session.bindCheckpoint(async () => {});
+    session.append({ type: "turn/start", data: { turn: 1 } });
+    const controller = new AbortController();
+    const reports: unknown[] = [];
+    let modelCalls = 0;
+    const task = createModelTurnDriver({
+      runtime: new LlmRuntime({ mock: createMockAdapter(() => { modelCalls++; return []; }) }),
+      config: () => ({ provider: "mock", model: "m" }),
+      systemPrompt: () => "",
+      preStep: async ({ blockStorage }) => {
+        if (blocked) {
+          blockStorage(undefined);
+          blockStorage(new Error("later storage error"));
+          controller.abort();
+        }
+        throw new Error("hook rejected");
+      },
+    })({
+      session, turn: 1, step: 1, signal: controller.signal,
+      publish: () => {}, blockStorage: (error) => reports.push(error),
+    });
+    if (blocked) {
+      await task.then(() => assert.fail("驱动应拒绝"), (error) => assert.equal(error, undefined));
+      assert.deepEqual(reports, [undefined]);
+      assert.deepEqual(session.snapshot().events.map(({ type }) => type), ["turn/start"]);
+    } else {
+      await task;
+      assert.deepEqual(reports, []);
+      assert.deepEqual(session.snapshot().events.map(({ type }) => type), ["turn/start", "turn/end"]);
+      const end = session.snapshot().events.at(-1);
+      assert.equal(end?.type === "turn/end" && end.data.reason.kind, "error");
+    }
+    assert.equal(modelCalls, 0);
+  }
+});
+
 test("同一步超限结算后重建消息并沿用配置", async () => {
   const session = new Session({ sessionId: "retry", createdAt: 0 });
   session.append({ type: "user/message", surfaceOp: "append", data: { turn: 1, requestId: "r", id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "原文" }] } });

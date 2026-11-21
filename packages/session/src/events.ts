@@ -82,7 +82,7 @@ export const sessionEventSchema = z.discriminatedUnion("type", [
         turn: turnNumber, requestId: z.string().min(1),
       }),
       z.strictObject({
-        ...userMessage, source: z.strictObject({ kind: z.literal("compact"), compactionId: z.string() }),
+        ...userMessage, source: z.strictObject({ kind: z.literal("compact"), compactionId: z.string() }), sourceCommandId: z.string().min(1).optional(),
       }),
     ])),
     surfaceOp: z.union([z.literal("append"), replacement]),
@@ -139,17 +139,23 @@ export const sessionEventSchema = z.discriminatedUnion("type", [
     id: z.string(), outcome: z.enum(["allowed-once", "rejected", "cancelled", "unavailable"]),
     reason: z.string().optional(),
   })),
+  event("command/run", z.strictObject({ commandId: z.string().min(1), name: z.string().min(1).regex(/^[^/]+$/), args: z.string().optional(), source: z.strictObject({ kind: z.literal("user") }) })),
+  event("command/done", z.discriminatedUnion("kind", [
+    z.strictObject({ commandId: z.string().min(1), kind: z.literal("success"), text: z.string().optional(), sourceEventSeq: sessionPositionSchema.optional() }),
+    z.strictObject({ commandId: z.string().min(1), kind: z.literal("error"), text: z.string().optional() }),
+  ])),
   event("compaction/start", z.strictObject({
-    compactionId: z.string(), turn: turnNumber.nullable(),
+    compactionId: z.string(), turn: turnNumber.nullable(), sourceCommandId: z.string().min(1).optional(),
   })),
+  event("compaction/prune", z.strictObject({ shadowedSeq: sessionPositionSchema, beforeTokens: sessionPositionSchema })),
   event("compaction/summary", z.strictObject({
-    compactionId: z.string(), summary: z.string(), shadowedRange: range,
+    compactionId: z.string(), sourceCommandId: z.string().min(1).optional(), summary: z.string(), shadowedRange: range,
     shadowedSeqs: z.array(sessionPositionSchema), route: recordedModelRouteSchema, usage: tokenUsage.optional(),
   })),
   event("compaction/end", z.discriminatedUnion("status", [
-    z.strictObject({ compactionId: z.string(), turn: turnNumber.nullable(), status: z.literal("succeeded") }),
+    z.strictObject({ compactionId: z.string(), sourceCommandId: z.string().min(1).optional(), turn: turnNumber.nullable(), status: z.literal("succeeded") }),
     z.strictObject({
-      compactionId: z.string(), turn: turnNumber.nullable(),
+      compactionId: z.string(), sourceCommandId: z.string().min(1).optional(), turn: turnNumber.nullable(),
       status: z.enum(["failed", "cancelled", "interrupted"]), reason: z.json(),
     }),
   ])),

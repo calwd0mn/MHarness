@@ -5,6 +5,7 @@ import {
   type SessionAppendInput,
   type SessionEvent,
 } from "./events.ts";
+import { indexSurfaceToolGroups, isCompleteSurfaceToolRange } from "./surface-tool-pairs.ts";
 import { SessionToolCalls } from "./tool-calls.ts";
 
 /** 独立于事件日志的元数据。分支记录直接父会话，创建时间使用 Unix 毫秒。 */
@@ -32,12 +33,13 @@ export interface SessionSnapshot {
   readonly events: readonly SessionEvent[];
 }
 
-type SurfaceEvent = Extract<SessionEvent, { surfaceOp: unknown }>;
+/** 当前 surface 中的事件节点；顺序由读取结果决定，而非事件序号。 */
+export type SurfaceNode = Extract<SessionEvent, { surfaceOp: unknown }>;
 /** 从当前 surface 提取的不可变模型消息。 */
-export type SessionMessage = Extract<SurfaceEvent, { type: "user/message" }>["data"]
-  | Extract<SurfaceEvent, { type: "assistant/message" | "tool/result" }>["data"]["message"];
+export type SessionMessage = Extract<SurfaceNode, { type: "user/message" }>["data"]
+  | Extract<SurfaceNode, { type: "assistant/message" | "tool/result" }>["data"]["message"];
 
-function messageOf(event: SurfaceEvent): SessionMessage {
+function messageOf(event: SurfaceNode): SessionMessage {
   return event.type === "user/message" ? event.data : event.data.message;
 }
 
@@ -110,7 +112,7 @@ export class Session {
   #appending = false;
   #staged = false;
   #publishingStaged = false;
-  #surface: SurfaceEvent[] = [];
+  #surface: SurfaceNode[] = [];
   #messages: SessionMessage[] | undefined = [];
   #replaceGeneration = 0;
 
@@ -124,7 +126,7 @@ export class Session {
    * 创建空 Session，或在发布前验证并安装一个日志前缀。
    * @param header - 独立于日志的会话身份和创建时间。
    * @param options - 可提供分支或恢复前缀，以及监听失败报告入口。缺省报告入口输出诊断。
-   * @throws 元数据、重放事件或分支继承边界无效时抛出。
+   * @throws 元数据、重放事件、孤立修剪标记或分支继承边界无效时抛出。
    */
   constructor(header: SessionHeader, options: { seed?: SessionSeed; reportError?: ReportListenerError } = {}) {
     const { sessionId, createdAt } = header;
@@ -147,6 +149,7 @@ export class Session {
     for (const raw of seed?.events ?? []) {
       this.#accept(snapshotSessionEvent(raw, this.seq, "replay"));
     }
+    this.#assertPruneComplete();
     if (seed?.kind === "fork") {
       this.#accept(snapshotSessionEvent({
         type: "session/end-seed", time: createdAt, data: { inherited: true },
@@ -168,7 +171,7 @@ export class Session {
    * 接受一条记录并向当前监听器同步发布。
    * @param candidate - 载荷的字段须符合事件类别。调用方不得传入序号，省略时间时使用当前 Unix 毫秒。
    * @returns 已接受的不可变事件，与日志和通知共享同一快照。单一事件类别可直接读取该类别的载荷，联合输入返回对应类别的联合。
-   * @throws 事件载荷或日志关联无效、尝试自行写入分支标记，或在当前追加中重入时抛出。
+   * @throws 事件载荷或日志关联无效、尝试普通追加修剪标记或自行写入分支标记，或在当前追加中重入时抛出。
    */
   append<const Input extends SessionAppendInput>(
     candidate: Input & ([UnexpectedAppendFields<NoInfer<Input>>] extends [never] ? unknown : never),
@@ -178,6 +181,7 @@ export class Session {
     try {
       const event = snapshotSessionEvent(candidate, this.seq, "append");
       if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
+      if (event.type === "compaction/prune") throw new Error("修剪标记必须在暂存批次中提交");
       this.#accept(event);
       this.#notifications["session/event"].emit(event);
       // 快照沿用输入的事件类别，经过共享 Schema 校验后可以按该类别收窄。
@@ -218,6 +222,7 @@ export class Session {
         if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
         draft.#accept(event);
       }
+      draft.#assertPruneComplete();
       const events = Object.freeze(draft.#events.slice(this.seq));
       const finish = (result: StagedPersistenceResult) => {
         if (result.status === "pending-reconciliation") return;
@@ -242,13 +247,40 @@ export class Session {
   }
 
   #accept(event: SessionEvent): void {
+    const previous = this.#events.at(-1);
+    if (previous?.type === "compaction/prune" && (event.type !== "tool/result" || event.surfaceOp === "append"
+      || event.surfaceOp.start !== previous.data.shadowedSeq || event.surfaceOp.end !== previous.data.shadowedSeq
+      || !event.sourceEventSeqs.includes(previous.data.shadowedSeq))) throw new Error("修剪标记必须紧邻对应工具替换");
+    if (event.type === "compaction/prune" && !this.#surface.some((node) => node.type === "tool/result" && node.seq === event.data.shadowedSeq)) {
+      throw new Error("修剪目标不是当前工具结果");
+    }
+    if (event.type === "command/run") {
+      if (this.#events.some((entry) => entry.type === "command/run" && entry.data.commandId === event.data.commandId)) {
+        throw new Error("命令标识已存在");
+      }
+    } else if (event.type === "command/done") {
+      const run = this.#events.find((entry) => entry.type === "command/run" && entry.data.commandId === event.data.commandId);
+      if (!run || this.#events.some((entry) => entry.type === "command/done" && entry.data.commandId === event.data.commandId)) {
+        throw new Error("命令运行记录缺失或已结算");
+      }
+      if (event.data.kind === "success" && event.data.sourceEventSeq !== undefined) {
+        const source = this.#events[event.data.sourceEventSeq];
+        if (!source || source.type !== "compaction/summary" || source.data.sourceCommandId !== event.data.commandId || source.seq <= run.seq || source.seq >= event.seq) {
+          throw new Error("命令结果来源无效");
+        }
+      }
+    }
     const recordToolCall = this.#toolCalls.prepare(event);
     if ("surfaceOp" in event) this.#acceptSurface(event);
     recordToolCall?.();
     this.#events.push(event);
   }
 
-  #acceptSurface(event: SurfaceEvent): void {
+  #assertPruneComplete(): void {
+    if (this.#events.at(-1)?.type === "compaction/prune") throw new Error("修剪标记缺少对应工具替换");
+  }
+
+  #acceptSurface(event: SurfaceNode): void {
     const sources = "sourceEventSeqs" in event ? event.sourceEventSeqs : undefined;
     if (sources && (new Set(sources).size !== sources.length || sources.some((seq) => seq >= event.seq))) {
       throw new Error("surface 来源无效");
@@ -273,24 +305,8 @@ export class Session {
       if (!isDeepStrictEqual(normalize(event.data), normalize(original.data))) {
         throw new Error("工具结果替换只能改变模型内容");
       }
-    } else {
-      const selectedSet = new Set(selected.map((entry) => entry.seq));
-      for (const entry of this.#surface) {
-        if (entry.type !== "tool/result") continue;
-        const assistant = this.#surface.find((candidate) => candidate.type === "assistant/message"
-          && candidate.data.turn === entry.data.turn && candidate.data.step === entry.data.step
-          && candidate.data.message.content.some((part) => part.type === "tool-call" && part.id === entry.data.message.source.callId));
-        if (assistant && selectedSet.has(assistant.seq) !== selectedSet.has(entry.seq)) {
-          throw new Error("surface 替换拆散工具配对");
-        }
-      }
-      for (const entry of selected) {
-        if (entry.type === "assistant/message" && entry.data.message.content.some((part) => part.type === "tool-call"
-          && !selected.some((result) => result.type === "tool/result" && result.data.turn === entry.data.turn
-            && result.data.step === entry.data.step && result.data.message.source.callId === part.id))) {
-          throw new Error("surface 替换拆散工具配对");
-        }
-      }
+    } else if (!isCompleteSurfaceToolRange(indexSurfaceToolGroups(this.#surface), from, to + 1)) {
+      throw new Error("surface 替换拆散工具配对");
     }
     this.#surface.splice(from, to - from + 1, event);
     this.#messages = undefined;
@@ -299,6 +315,14 @@ export class Session {
 
   /** 已接受的 surface 替换次数，重放时按日志恢复。 */
   get replaceGeneration(): number { return this.#replaceGeneration; }
+
+  /**
+   * 获取当前 surface 的独立数组快照，节点沿用不可变日志事件引用。
+   * @returns 按 surface 顺序排列的节点，不随之后的追加或替换改变。
+   */
+  deriveSurfaceNodes(): readonly SurfaceNode[] {
+    return this.#surface.slice();
+  }
 
   /**
    * 按当前 surface 顺序返回模型消息的独立数组。

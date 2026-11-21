@@ -97,9 +97,9 @@ export class LlmRuntime {
   /**
    * 校验配置并选择 Adapter，可在发起模型请求前读取可记录的路由和有效参数。
    * @param config - 请求的路由、生成参数和可选的请求级超时覆盖值。
-   * @param options - recordable 为 true 时，未显式覆盖旧 temperature 或 stop 默认值会被拒绝。
+   * @param options - recordable 为 true 时，未显式覆盖 Adapter 的 temperature 默认值会被拒绝。
    * @returns 冻结的配置快照和绑定该快照的生成入口。
-   * @throws Provider 未注册、路由或参数无效，或可记录模式依赖未覆盖的旧采样默认值时抛出错误。
+   * @throws Provider 未注册、路由或参数无效，或可记录模式依赖未覆盖的 temperature 默认值时抛出错误。
    */
   prepare(config: ModelConfig, options: { recordable?: boolean } = {}): PreparedModel {
     const provider = requiredId(config.provider, "provider");
@@ -124,10 +124,8 @@ export class LlmRuntime {
       ...(contextWindow === undefined ? {} : { contextWindow }),
       ...(defaultOutputTokens === undefined ? {} : { defaultOutputTokens }),
     }) : undefined;
-    if (options.recordable &&
-        ((config.params?.temperature === undefined && adapter.defaultParams?.temperature !== undefined) ||
-         (config.params?.stop === undefined && adapter.defaultParams?.stop !== undefined))) {
-      throw new TypeError("当前日志不能记录未显式覆盖的模型默认采样参数");
+    if (options.recordable && config.params?.temperature === undefined && adapter.defaultParams?.temperature !== undefined) {
+      throw new TypeError("当前日志不能记录未显式覆盖的模型默认温度");
     }
     const info = adapter.modelInfo;
     const reasoningEffort = config.params?.reasoningEffort ?? info?.defaultReasoningEffort ?? adapter.defaultParams?.reasoningEffort;
@@ -141,7 +139,7 @@ export class LlmRuntime {
       topP: config.params?.topP ?? adapter.defaultParams?.topP,
       maxOutputTokens,
       reasoningEffort,
-      stop: config.params?.stop ?? adapter.defaultParams?.stop,
+      stop: config.params?.stop,
     });
     adapter.validateParams?.(effectiveParams);
     const defaults = {

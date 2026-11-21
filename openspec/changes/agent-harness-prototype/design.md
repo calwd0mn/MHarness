@@ -8,7 +8,7 @@
 
 **Goals:** 对齐 DSH 的追加日志、历史派生、请求重建、fork、存储 handle、写入所有权和崩溃修复，提供显式 `session.flush()` 检查点；保持连接、Turn、工具操作和会话事实独立，验证审批前不执行、模拟工具幂等及超时结算。
 
-**Non-Goals** 第一期采用固定装配与 SQLite 新格式。工具结果核实、迟到结果结算、工具自动重试、跨进程续跑、权限体系与旧历史格式迁移留待后续。紧凑流保留已结算的统一流分片及时间，硬崩溃时仍在生成的草稿随进程退出。
+**Non-Goals** 第一期采用固定装配与 SQLite 新格式。工具结果核实、迟到结果结算、工具自动重试、跨进程续跑、权限体系与旧历史格式迁移留待后续。压缩不做分块摘要、长文本拆分、分层合并、摘要章节校验或格式修复，不增加压缩总时长限制；模型请求原有的超时与取消仍适用。紧凑流保留已结算的统一流分片及时间，硬崩溃时仍在生成的草稿随进程退出。
 
 ## Decisions
 
@@ -23,7 +23,9 @@
 | `packages/session` | Session 业务模块，维护会话核心、持久化能力和 Session API；通过独立入口向浏览器暴露公开契约，向后端暴露服务端能力。 |
 | `apps/mock-mcp` | 工具接入阶段加入的本地模拟 MCP 服务，独立启动，用于验证工具调用、超时及幂等。 |
 
-后端启动入口固定装配 SessionStore、SessionPersistence、AgentManager、LlmRuntime、Provider Adapter、工具批次调度器、工具执行服务、ApprovalService 与 MCP Client。SessionStore 管理内存 Session，Session 持有不可变日志和派生缓存；AgentManager 管理每会话 ReActAgent 及写 handle 的释放权。ReActAgent 驱动 Turn/Step，协调输入、活跃草稿和订阅顺序。工具执行服务负责参数与结果校验、策略和正文，审批服务负责等待及返回审批决定，批次调度器负责派发顺序和配对结果写日志。HTTP/SSE 负责请求与连接，网络等待在会话提交串行区外执行。
+后端启动入口固定装配 SessionStore、SessionPersistence、AgentManager、LlmRuntime、Provider Adapter、压缩能力、工具批次调度器、工具执行服务、ApprovalService 与 MCP Client。SessionStore 管理内存 Session，Session 持有不可变日志和派生缓存；AgentManager 管理每会话 ReActAgent 及写 handle 的释放权。ReActAgent 驱动 Turn/Step，协调输入、活跃草稿和订阅顺序。工具执行服务负责参数与结果校验、策略和正文，审批服务负责等待及返回审批决定，批次调度器负责派发顺序和配对结果写日志。HTTP/SSE 负责请求与连接，网络等待在会话提交串行区外执行。
+
+压缩由 `apps/server` 的应用能力拥有，组合 token-meter、工具结果修剪、安全前缀选择和摘要调用；模型容量由 LLM 服务提供。Session 核心只维护事件、surface 和暂存提交语义，不依赖 Provider 路由或应用 hook。浏览器继续从 Session API 消费纯契约，不引入服务端计量和模型调用实现，不为这些同一能力内的实现预建公共包。
 
 事件连接只提供类型化 `on/emit`：监听器同步接收通知，不通过返回值控制流程，不等待异步监听器。注册返回取消订阅函数；emit 按本次派发开始时的监听器快照顺序调用，单个监听器异常独立报告，不阻断其余监听器或撤销已接受事件。持久化监听器同步复制事件并入缓冲，异步数据库错误在 flush 时报告。Session.append 的日志接受与发布过程禁止重入。初始化先绑定持久化再开放生产；关闭先停止生产、排空缓冲、解除监听，再释放 handle 所有权和数据库资源。
 
@@ -34,6 +36,8 @@ React --> HTTP / SSE --> AgentManager --> ReActAgent
                               |              |
                               v              +--> LlmRuntime --> Adapter --> Provider
                        Session / Event Log   |
+                              |              +--> Compaction --> LlmRuntime
+                              |              |    meter / prune / summary
                               |              +--> Tool Scheduler --> Tool Service --> Tools
                          emit |                     |
                               v                     | await session.flush()
@@ -46,7 +50,7 @@ React --> HTTP / SSE --> AgentManager --> ReActAgent
 
 #### 1.1 会话级 Agent 生命周期与消息接受
 
-同一已加载 Session 对应一个 ReActAgent，跨多个 Turn 存活。AgentManager 按 sessionId 管理实例并合并并发加载，取得写 handle、读取日志并完成必要修复后才发布实例。创建空会话仅保存并 flush header，不创建 Agent；首次提交消息按需加载。历史查询和 SSE 只观察，不创建 Agent、不启动模型请求。Agent 的 `idle`、`running` 和压缩阶段引入的 `maintenance` 是进程运行状态。Turn 的成功、失败、取消、中断分别由持久记录表达。
+同一已加载 Session 对应一个 ReActAgent，跨多个 Turn 存活。AgentManager 按 sessionId 管理实例并合并并发加载，取得写 handle、读取日志并完成必要修复后才发布实例。创建空会话仅保存并 flush header，不创建 Agent；首次提交消息或显式执行手动压缩命令按需加载。历史查询和 SSE 只观察，不创建 Agent、不启动模型请求。Agent 的 `idle`、`running` 和压缩阶段引入的 `maintenance` 是进程运行状态。Turn 的成功、失败、取消、中断分别由持久记录表达。
 
 Turn 完成回到 idle，浏览器断线不销毁 Agent。AgentManager 显式关闭时先拒绝新输入、取消当前活动并等待驱动退出，再排空并关闭 handle、解绑和移除实例。空闲 Agent 继续持有写入权，不在每个 Turn 结束时释放；初期省略自动空闲回收、inbox、steering 和自动后台维护调度。
 
@@ -58,7 +62,9 @@ Turn 完成回到 idle，浏览器断线不销毁 Agent。AgentManager 显式关
 
 会话命令完成必要的恢复校验并取得写入权后，在同一 Session 串行区内先查 `requestId`，再执行新请求的状态检查和受理。命中直接确认首次受理，即使当前内容不同或 Agent 非空闲也沿用首次内容。客户端改动内容后使用新编号。未命中时仅 `idle` 可受理，其他 Agent 状态返回 `409 { code: "agent_busy" }`。被拒绝的新编号不占用，也不排队。
 
-首次受理时依次调用 `Session.append()` 追加 `turn/start`、首个 `step/start` 和真实用户的 `user/message`。每次追加独立接受并发布 `session/event`。用户消息已追加且执行循环接管后才确认受理。该响应无需等待 Provider 或磁盘写入。首次模型请求前显式 flush，失败时阻止模型调用，后续执行失败沿 Turn 的故障路径处理。编号从本会话已接受的用户消息派生，重启后从已提交前缀重建，继承消息不登记为子会话自身受理。若原事件在进程退出时尚未落盘，重开后原编号按未命中处理。
+首次受理时依次调用 `Session.append()` 追加 `turn/start` 和真实用户的 `user/message`。每次追加独立接受并发布 `session/event`。用户消息已追加且执行循环接管后才确认受理，不等待 pre-step、Provider 或磁盘写入。执行循环固定本 Step 的路由、系统提示词、工具和生效生成参数，等待 pre-step 后才追加 `step/start`，再从最新 surface 派生请求并显式 flush。取消或失败发生在 Step 打开前时，只结算实际打开的 Turn，不补造 Step。首次请求检查点失败时阻止模型调用，后续执行失败沿 Turn 的故障路径处理。编号从本会话已接受的用户消息派生，重启后从已提交前缀重建，继承消息不登记为子会话自身受理。若原事件在进程退出时尚未落盘，重开后原编号按未命中处理。
+
+pre-step 是可等待、传递当前取消信号的运行 hook，不是持久事件，也不复用同步 `Session.emit` 的返回值控制流程。首个和后续 Step 均遵守该顺序；本次只在固定装配中提供所需等待点，不引入通用插件框架。压缩期间或同 Step 超限重试期间配置变化不改变本步快照，下一 Step 才读取新配置。
 
 取消入口为 `POST /api/sessions/:sessionId/cancel`。命令按 `sessionId` 查找已挂载的 Agent 并调用 `agent.cancel(cause, options)`，返回 `202 { accept: true }`。`running` 时取消处理请求那一刻的当前 Turn，`maintenance` 时触发 `runMaintenance()` 持有的信号，`idle` 时直接确认受理。未挂载时返回 `404 { code: "session/not-found" }`。该入口只查找现有实例。任务结算由历史与 SSE 确认。
 
@@ -147,9 +153,9 @@ Session 的事实来源是只追加日志，会话元数据 header 独立保存�
 
 进程内写入方通过类型化的 `Session.append()` 提交事件。`type` 在编译期约束 `data`，输入和返回类型均由 Session 核心维护的共享事件 Schema 推导。返回的不可变事件保留输入的事件类别。例如，追加 `tool/call` 的调用方可以直接读取返回事件的 `data.callId`。输入涵盖多个事件类别时，返回相应类别的联合。`seq` 由 Session 分配。追加继续校验实际载荷，依赖当前日志的关联规则由 Session 判断。持久化重放接收未经信任的原始记录，按同一事件 Schema 校验，并核对记录原有序号与重放位置。
 
-只有 `user/message`、`assistant/message` 和 `tool/result` 参与 surface。它们在事件外层声明 `surfaceOp: "append"` 或 `surfaceOp: { op: "replace", start, end }`，替换用外层 `sourceEventSeqs` 引用被覆盖节点。`user/message.data` 直接保存消息的 `id`、`role`、`source` 和 `content`。真实用户消息另带 `turn` 和 `requestId`。压缩摘要使用 `source: { kind: "compact", compactionId }` 并分配新消息 ID。Assistant 和工具结果的消息本体放在 `data.message`。工具结果替换在日志追加完整结果，保留原消息身份与关联，仅改动模型可见 `content`。`deriveMessages()` 复用不可变节点并返回独立数组。普通追加增量扩展缓存，替换使缓存失效并递增 `replaceGeneration`。聊天视图继续显示原始交互。
+只有 `user/message`、`assistant/message` 和 `tool/result` 参与 surface。它们在事件外层声明 `surfaceOp: "append"` 或 `surfaceOp: { op: "replace", start, end }`，替换用外层 `sourceEventSeqs` 引用被覆盖节点。`user/message.data` 直接保存消息的 `id`、`role`、`source` 和 `content`。真实用户消息另带 `turn` 和 `requestId`。压缩摘要使用 `source: { kind: "compact", compactionId }` 并分配新消息 ID；手动命令产生的 checkpoint 另关联 `sourceCommandId`，自动压缩及既有记录无需该字段。Assistant 和工具结果的消息本体放在 `data.message`。工具结果替换在日志追加完整结果，保留原消息身份与关联，仅改动模型可见 `content`。`deriveMessages()` 复用不可变节点并返回独立数组。普通追加增量扩展缓存，替换使缓存失效并递增 `replaceGeneration`。聊天视图继续显示原始交互。
 
-`SessionCommandController.fork({ sessionId, atSeq? })` 从同一份父会话快照选取稳定前缀。已加载父会话用内存快照，未加载时用 `handle.read()`。锚点在 Turn 内时选该 Turn 的 `turn/end`，锚点在两轮之间时归到上一轮。省略锚点或超过已观察到的末尾时，选最近已经结束的 Turn。选定后包含直到下一轮 `turn/start` 之前的事件。遇到未闭合的独立压缩时回退到该次 `compaction/start` 前。没有已结束的 Turn，或锚点在尚未结束的 Turn 内时，返回 `session/fork-unavailable`。fork 只依赖这份父快照，父会话无需写入或 flush。
+`SessionCommandController.fork({ sessionId, atSeq? })` 从同一份父会话快照选取稳定前缀。已加载父会话用内存快照，未加载时用 `handle.read()`。锚点在 Turn 内时选该 Turn 的 `turn/end`，在两轮之间时归到上一轮。省略锚点或超过已观察到的末尾时，选最近已经结束的 Turn。候选尾部最多延伸至下一轮 `turn/start` 前。检查整个候选前缀中的 Turn、Step 和独立压缩是否闭合。若回退到未配对的开始记录前会截断它所在的 Turn，则再退到该 Turn 开始前并重新检查。保留满足条件的最长前缀。`command/done` 缺失本身不触发回退。压缩已有 `compaction/end` 时保留压缩终态及已提交的摘要和 checkpoint。只有 `command/run` 时也原样继承，前端显示为历史。没有稳定的闭合 Turn，或锚点在尚未结束的 Turn 内时，返回 `session/fork-unavailable`。fork 只依赖这份父快照，父会话无需写入或 flush。
 
 `cut` 是排他的父日志结束位置。子 Session 加载 `source.events.slice(0, cut)`，并保存 `inheritedEventCount: cut` 和 header 中的 `parentSession`、`isSeeded: true`。子会话自己的 `session/end-seed { inherited: true }` 在 `seq=cut`，是第一条自有事件。多层 fork 可能复制祖先的标记，各会话按自己的 `inheritedEventCount` 划界。继承事件保留 `seq`、原标识和关联，包括继承用户消息的 `requestId`。
 
@@ -219,7 +225,7 @@ SQLite 使用 `node:sqlite`，SQL 集中在后端。header 与事件分开保存
 
 检查点失败时协调器暂停该会话的新任务和外部效果，保持日志与缓冲顺序。持久化后端负责确认事务结局，提交成功后才确认相应位置。确认整批回滚且写入权仍有效时允许重试原批次。结果有待核对时，先确认原事务已结束，再读取已提交事件，初次创建同时核对 header 和继承数。完整批次一致时按成功处理，确认整批未提交时可重试。读取失败、部分匹配或内容冲突时向调用方报告并保持写入阻塞，下一次显式 flush 先重新核对。现有已确认历史和实时内存状态仍可观察。
 
-prompt 受理的三条事件依次进入普通缓冲，可进入不同批次。首次模型调用前的检查点覆盖当次消息快照以及生效的配置 header。压缩等先提交再发布的操作使用独立的暂存批次。
+prompt 受理的 `turn/start` 和用户消息依次进入普通缓冲，可进入不同批次；`step/start` 在 pre-step 后由驱动另行追加。模型调用前的检查点覆盖当次消息快照、生效配置 header 及所需的压缩提交核对。压缩等先提交再发布的操作使用独立的暂存批次。
 
 #### 2.3 所有权与崩溃修复
 
@@ -247,19 +253,178 @@ prompt 受理的三条事件依次进入普通缓冲，可进入不同批次。�
 
 #### 2.4 会话压缩
 
-纯文本问答阶段交付 `surface` 替换及重放。压缩阶段的手动入口通过 `agent.runMaintenance()` 从 `idle` 取得 `maintenance` 占用，取消信号传给实际压缩。自动压缩由正在运行的 Turn 在输入上下文超限的 Assistant 失败结算后触发，压缩和重试留在原 Step 并继续占用 `running`。独立压缩和 Turn 内压缩期间，同编号已受理消息仍可确认，新编号返回 `409 { code: "agent_busy" }`。
+压缩只改变后续模型可见的 surface。工具修剪、历史摘要和原始执行事实分开记录，原聊天历史不删除；摘要使用修剪后的当前前缀，不从原日志重新取出已隐藏内容。
 
-在串行区确认 `compaction/start` 落盘，取得选区节点序列及对应的不可变模型输入，再在区外调用摘要模型。HTTP 历史可读已提交日志，follow 可观察已接受的内存事件。提交时回到串行区重新定位选区，比较完整节点序列并复用 `surface` 替换与工具配对校验。只有选区本身变化或替换校验失败才因冲突拒绝。
+##### 2.4.1 路由、计量与预算
 
-复用暂存提交路径，将 `compaction/summary`、摘要替换和成功 `compaction/end` 放在同一事务。提交确认后才更新内存视图。已确认的终态优先于迟到取消。结果待核对时维持存储阻塞，等原事务终止后读取持久日志，只有确认本次写入未提交且已提交的开始记录仍无终态时才补写结算。启动修复先结算遗留压缩，再关闭实际打开的 Step 和 Turn。重放与 fork 共用持久记录，聊天继续显示原始交互。
+本 Step 在 pre-step 前解析并固定实际 `provider/model`、system、tools 和生效生成参数。LLM 服务从本地注册或配置的模型信息返回该路由的 `contextWindow` 与默认输出预算；首次请求不依赖历史 header，切换模型也不使用上次请求的旧容量。业务输出预留优先取本步生效的 `maxTokens`，缺省取模型默认输出预算。缺少预算所需信息时，自动压力检查告警并跳过，业务请求仍须通过正常准备、检查点和取消检查；不猜测窗口或以零代替未知输出预算。
+
+token-meter 对该路由实际会发送的消息投影计量；reasoning 是否计入取决于请求适配。基础估算采用 JavaScript 字符串 `.length`，即 UTF-16 code unit 数，不是 Unicode 码点：
+
+```text
+CHARS_PER_TOKEN = 4; BLOCK_OVERHEAD = 4; ROLE_OVERHEAD = 4
+文本或 reasoning 块 = ceil(text.length / 4) + 4
+工具调用块 = ceil(toolName.length / 4) + ceil(arguments.length / 4) + 4
+工具结果块 = 内部各内容块估算之和 + 4
+其他内容块 = ceil(JSON.stringify(block).length / 4) + 4
+消息 = 各内容块估算之和 + 4
+system = 存在时 ceil(system.length / 4) + 4，否则 0
+tools = 非空时 ceil(JSON.stringify(tools).length / 4) + 4，否则 0
+输入估算 = system + tools + 当前模型可见消息估算
+压力 = 输入估算 + 业务输出预留
+thresholdTokens = floor(contextWindow × 0.8)
+retainTokens = floor(contextWindow × 0.16)
+```
+
+多块分别计费，工具结果递归累计，未知块按 JSON 长度估算。它是确定性启发式，不声称与 Provider 精确计数一致；Provider 的规范化输入超限仍是独立恢复信号。16% 是完整模型窗口的尾部节点预算，不是已用量的比例，也不是压缩后总压力上限。
+
+##### 2.4.2 三种入口与机会
+
+| 入口 | 首次触发条件 | 先修剪工具结果 | 保留预算 | 摘要调用上限 |
+| --- | --- | --- | --- | --- |
+| pre-step `pressure` | 压力达到或超过阈值 | 是 | 窗口的 16% | 2 次 |
+| `context-overflow` | Provider 明确报告输入超限，不检查 80% | 是 | 0 | 1 次 |
+| 手动 `/compact` | 用户命令，不检查 80% | 否 | 0 | 1 次 |
+
+pressure 先修剪并重新计量，低于阈值就结束。仍达到阈值时选择安全前缀并摘要。`compactionRetries: 1` 只允许首次摘要成功替换后、压力仍达到阈值时再摘要一次，不用于调用失败重试。第二次使用更新后的 surface，并为该次摘要建立独立 `compactionId`；两次机会耗尽仍未达目标时保留已提交结果、告警并继续 pre-step。80% 是收敛目标，不是每次有效摘要落盘的条件。
+
+pre-step 压缩边界捕获摘要、校验或提交阶段异常，记录服务端警告后继续后续流程。继续流程不等于已获模型调用许可：取消仍生效，业务模型前必须检查存储准入并执行 `flush()`；提交有待核对或检查点失败时不能调用下游 Adapter。后续 Step 独立重新检查压力。此处不增加压缩总时长限制，也不保留此前讨论的 8 次调用预算；每次模型调用仍受请求级超时和取消约束。
+
+context-overflow 先保存失败的业务 Attempt，再修剪并重测，但无论重测是否低于 80%，均以零保留预算选择最大安全头部，有范围就尝试一次摘要。摘要失败但修剪已经落地时不回滚修剪。以恢复前后的 `replaceGeneration` 判断是否确有替换，且未取消、检查点通过后，才授权同 Step 内一次业务请求重试；没有替换则保留原业务请求错误。`maxOverflowRetries: 1` 限制连续超限的业务重试次数，不限制整个 Turn；成功的助手响应（含正常工具调用响应）或回到 idle 后重置。
+
+##### 2.4.3 工具结果修剪
+
+正常 pressure 仅在总压力达到阈值后调用修剪器，context-overflow 则直接尝试。对当前 surface 所有工具结果检查文本块合计长度，包括最近结果；文本超过 8192 个 Unicode 码点时，保留前 4096 和后 1024 个码点，中间使用 `[... tool result middle pruned ...]`。按文本块顺序应用合计预算，图片及其他非文本内容保留且不改变原有相对顺序。修剪计数与 token-meter 的 UTF-16 长度计数明确分开。
+
+修剪只改变工具结果块的模型可见 content，保留消息 ID、调用关联、turn/step、operationId、isError、error 和 meta；不重新执行工具或 render。暂存批次按 `compaction/prune`、对应的替换 `tool/result` 顺序整体提交，记录被遮蔽节点及其修剪前估算 token 数，替换来源引用原结果。确认后才发布一次并推进替换代数。该批次独立于后续摘要，摘要失败也保留已提交修剪；仅有修剪时不补造摘要事件或摘要模型调用。
+
+##### 2.4.4 安全前缀
+
+对完整消息节点从最新向前累计其模型可见估算，先纳入末尾节点，再检查是否达到 `retainTokens`。超过预算的整节点保留，不截断。随后检查工具调用与全部配对结果，必要时继续向更旧方向移动边界。预算为 0 时仍保留至少一个末尾节点和必要配对。边界到历史开头则返回无可压缩范围，不请求摘要模型。
+
+摘要候选只能是剩余的连续旧前缀；允许包含当前 Turn 已完成的旧 Step，但不能包含未结算交互或拆开工具配对。例如窗口 100000、尾部预算 16000，节点为 `[A:8000,B:6000,C:7000,D:5000,E:6000]` 时保留 C、D、E（18000），摘要 A、B。pressure 使用 16%，手动和 context-overflow 使用 0；三者共用选区校验。
+
+##### 2.4.5 摘要请求、提示词与包装
+
+一次摘要直接处理整个安全前缀，不读取保留尾部，也不拆分超长消息或分块合并。摘要调用使用本步固定路由（独立维护则在命令开始固定路由）、专用指令和 `maxTokens: 8192`，不提供业务工具；目标模型允许时关闭推理，不允许时使用合法配置。推理 token 可能消耗该预算。输入超限等调用失败直接退出，不自动拆分重试。
+
+固定摘要指令如下；`<compacted-summary>` 同时是包装标记：
+
+```text
+You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
+
+Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
+
+## Primary Request and Intent
+- [the user's original and evolving goals; quote verbatim where the exact wording matters]
+
+## Key Technical Concepts
+- [technologies, frameworks, patterns, and conventions in play]
+
+## Files and Code
+- [exact path: why it matters, key changes or snippets]
+
+## Errors and Fixes
+- [error: how it was resolved, plus any related user feedback]
+
+## Pending Jobs
+- [explicitly requested work not yet completed]
+
+## Current Work
+- [precisely what was in progress at this checkpoint]
+
+## Next Step
+- [the single next action, directly in line with the most recent request, or "(none)"]
+
+## Critical Context
+- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]
+
+Rules:
+- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.
+- Capture user feedback and explicit instructions faithfully, especially corrections.
+- Do NOT mention this summarization request or that the context was compacted.
+- Output only the checkpoint text: do not call any tool or take any other action.
+- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.
+```
+
+这里的 Current Work、Next Step 和最新请求均以候选前缀的截点为准，不推断未提供的保留尾部。已有检查点与新旧前缀合并，后续保留消息中的新指令继续生效。
+
+模型检查点 S 是新 ID、`role: user`、`source: { kind: compact, compactionId }` 的合成消息，不改写 system、tools 或保留尾部。内容按以下顺序包装为文本块，摘要正文可有多个文本块，Adapter 可按目标协议拼接：
+
+```text
+块 1：This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.
+
+<compacted-summary>
+块 2：摘要正文
+块 3：</compacted-summary>
+```
+
+只校验非空文本、未因输出上限截断、没有不支持的图片输出，以及带包装消息的估算严格小于被替换前缀。不校验八节是否齐全、顺序或 Markdown 格式，不做格式修复。未缩小等校验失败不提交替换，退出当前摘要循环；自动入口告警后继续，手动入口报告失败。
+
+##### 2.4.6 暂存提交与恢复
+
+在串行区确认该次 `compaction/start` 落盘，保存 `compactionId`、`turn`（独立维护为 null）并取得选区节点序列及不可变摘要输入，再在区外调用模型。HTTP 历史可读已提交日志，follow 可观察 live Session。提交时回到串行区重新定位，比较完整节点序列并复用 surface 替换与工具配对校验；选区外追加不单独构成冲突。
+
+复用暂存提交，将 `compaction/summary`、带包装的 user 替换和成功 `compaction/end` 放在同一事务。确认后才更新内存、发布结果和推进替换代数；替换来源引用摘要及全部被覆盖节点。失败不提交该次摘要替换，保留先前已提交的修剪或摘要。已确认终态优先于迟到取消。结果待核对时维持存储阻塞，等原事务终止后读取可靠持久日志，每个 compactionId 至多一个终态，不将回滚的暂存批次放入普通排空。
+
+普通已接受事件与压缩暂存批次的核对后动作必须分开。§2.2 的普通缓冲在确认回滚后仍可按原约定显式重试；压缩暂存尚未进入 live 日志，确认回滚后由原压缩流程处理失败，不允许普通 `flush()`、关闭排空或在线恢复隐式重新提交它。允许复用已开工的 8.5 提交接口，但不能只把暂存批次塞进现有 handle 的普通 pending/重提路径。这里约束结果和隔离语义，不要求更换已在实现的 API 名称或签名。
+
+以下矩阵分别对摘要开始批次、成功摘要批次及工具修剪批次验收；普通 Session/handle/store flush、writer/handle/store 关闭和在线恢复均不能绕过相同的核对门：
+
+| 核对结论 | 普通 flush | 关闭路径 | 在线恢复 |
+| --- | --- | --- | --- |
+| 原暂存批次已提交 | 采用原持久结果，仍加载的 Session 至多安装/发布一次，不重复 append | 不重提；已释放 Session 由重开重放，不为发布再激活 Agent | 先采用暂存结果再比较 live 与持久前缀，不能将“已提交但尚未安装”误判为普通历史损坏 |
+| 原暂存批次确认回滚 | 不重提、不放回普通队列；普通已接受批次的既有重试语义保留 | 不因最后排空重新写入回滚批次，按原关闭契约释放资源并报告必要错误 | 不先靠通用 flush 重提；按压缩 ID 处理确实缺少的终态，再核验修复检查点与准入 |
+| 原事务未终止或持久读取不可靠 | 核对失败，保持依赖写入与模型调用阻塞，不发布替换 | 不报成功排空或成功压缩，按关闭错误/资源释放契约处理 | 不采用暂时读不到作为未提交证据，不补终态、不开放 prompt/维护准入或调用 Adapter |
+
+`recoverStorage()` 可能经过普通 flush；它必须先让暂存结论可靠、将已确认提交的批次安装到仍加载的 Session，再执行既有前缀一致性检查和遗留范围修复，最后才开放准入。该交接回归由 8.3 承担，8.5 先用可控调用验证本层三态契约。pre-step 捕获异常后继续只表示运行链继续，不能绕过此门；prompt 和手动维护共用相同存储准入。
+
+启动恢复和在线恢复先取得可靠前缀。在线路径先核对并安装原暂存结论，再比较 live 与持久前缀。恢复先结算遗留压缩，再处理本会话自有的未闭合命令，最后只关闭实际打开的 Step 和 Turn。已有 `command/done` 原样保留。缺少 done 时，关联的 `compaction/end(succeeded)` 生成成功 done 并引用已提交摘要，`failed` 或 `cancelled` 生成错误 done 并保留可对外展示的失败或取消语义。已有或本次修复得出的 `interrupted` 沿用中断语义。没有可靠结局的自有命令在确认持久前缀后按中断结算。`run.seq < inheritedEventCount` 的命令属于父会话历史，子会话恢复既不续跑也不补写终态。修复写入失败或原事务未确认时维持存储阻塞。恢复采用已有结果，不重新请求模型、不重复补写终态。fork 按稳定前缀继承记录，聊天继续显示原始交互。
+
+##### 2.4.7 手动命令与传输
+
+输入框将 `/compact` 识别为独立命令，经 Session API 的维护 HTTP 入口 `POST /api/sessions/:sessionId/compact` 进入命令执行器，不走 prompt、不生成真实用户消息或 Turn。执行器识别命令后分配服务端 `commandId`，以会话原始日志记录 `command/run` 和结算时的 `command/done`；二者都是 log-only 事件，不改变模型 surface。识别前无效请求不造命令记录。命令显式按需加载并完成恢复，在空闲且存储准入开放时取得 maintenance 占用；忙碌时不排队执行压缩，但已识别的命令记录 busy 结算。已有 prompt 编号查重语义不变。
+
+`/compact` 在路由入口校验媒体类型、正文大小、JSON 和请求参数。只接受 `application/json`，允许合法参数（例如 `charset=utf-8`）。不支持的媒体类型即使有 Fastify 自带解析器（如 `text/plain`），也返回 415。正文超过生效限制返回 413，畸形或空 JSON、无效路径参数或正文结构返回 400。三种状态共用 `{ commandId: null, result: { kind: "error", text } }`，`text` 是对应原因的安全说明。入口拒绝不进入命令执行器、不分配命令 ID、不调用模型、不写 Session 日志。解析拒绝映射只用于该入口，意外异常保留脱敏 500。
+
+`command/run` 的公共外壳为 `type`、Session 分配的递增 `seq` 和 Unix 毫秒 `time`，`data` 包含 `commandId`、不带斜杠的命令 `name`、可选原始参数文本 `args` 和 `source: { kind: "user" }`。`args` 原样保留分隔空白，命令配置 `recordInput: false` 时省略。`command/done` 同样采用公共外壳，`data` 包含同一 `commandId`、`kind: "success" | "error"`、可选 `text` 和仅成功时可选的 `sourceEventSeq`。每个 Session 日志中同一 ID 只能出现一个 run 和至多一个 done，继承前缀也参与校验。不同命令允许交错。领域结果须属于同一命令且满足 `run.seq < sourceEventSeq < done.seq`，摘要成功时引用该次压缩的 `compaction/summary`。同一规则用于追加、暂存和重放，命令事件仅进入日志。
+
+手动压缩的 `compaction/start`、`compaction/summary`、`compaction/end` 和 checkpoint 关联同一 `sourceCommandId`，独立的 `compactionId` 继续关联单次压缩及其原始事件；自动压缩不依赖命令 ID。手动入口传递请求已有的压缩身份，避免请求、摘要与响应各自产生互不关联的 ID；已有不含命令关联的历史仍可读取。客户端请求身份不作为页面 A/B 的来源标识，也不授权自动重发。
+
+手动压缩不看阈值、不先修剪、保留预算为 0、最多一次摘要。无安全范围时以 `command/done` 的 `success` 和 `No compactable history yet.` 记录命令正常结算，不调用模型、不产生摘要或替换。成功生成摘要时，成功终态引用此前已确认的 `compaction/summary`；处理器正常返回后追加 `command/done`，确认持久化并完成必要 flush 后返回。正常 `200` 保留原有 `compactionId`、`status` 并增加服务端 `commandId`，具体文本由命令终态交付；其他原有成功状态含义不变。处理器抛错或取消时尽力追加 `kind: "error"` 的终态，再向上传递原错误；错误终态追加失败不得覆盖原错误，也不保证每次异常都有已持久化的 done。
+
+加载会话并完成必要恢复后，命令执行器在安排本次命令的异步写入前确定准入结论。发现 busy 时固定拒绝结论，只安排日志写入。同会话由 Agent 协调活动任务与 busy 记录的写入。活动任务先完成已占用的写入。若任务的所有相关写入者都能通过同一边界等待，则可在任务让出写入权时提交 busy 批次。仍有同步路径可能写入时，在活动任务结算后的交接点提交，只有交接完成且存储准入开放时才接收新任务。busy 的 `command/run` 和 `command/done(error)` 使用一个连续事务，且 HTTP 409 `{ commandId, result: { kind: "error", text } }` 只向发起方返回。正常提交后，所有客户端通过 follow 看到同一对事件。存储结果待核对时按原规则维持阻塞。无法安全落盘时保留原 busy 错误，不宣称记录已持久化。
+
+运行期间仍可读取历史/follow，取消入口向当时会话的活动任务传递信号；网络断开不取消。所有客户端按 `commandId` 从同一 Session 日志组装独立命令卡片，按运行事件的 seq 排序；无范围和 busy 显示普通结果卡，已有 checkpoint 时可显示摘要卡。卡片使用 `command/done` 展示命令结算。缺少 done 时，关联的 `compaction/end` 足以展示压缩结局，成功时保留摘要和 checkpoint 对应的展示。继承前缀只有 `command/run`、没有结果证据时，显示「结果未记录」，不计为子会话的活动维护。摘要事件和成功压缩终态原子提交，但 follow 可先逐条交付摘要、再交付 `command/done`；摘要已记录不等于 HTTP 最终响应已返回。断线保留已安装的已知终态，单有开始记录不能断言当前仍运行。浏览器对本地 HTTP 的观察上限仍为 5 秒，覆盖响应和响应体；到期不 abort、不取消、不重发，迟到的明确响应按当前会话和本次提交身份处理。共享卡片按已交付事件立即投影，不等待该本地观察上限。HTTP 丢失不自动重发；共享卡片可从事件重建，但没有可靠关联时不得猜测某条卡片属于哪次本地 HTTP 请求。用户再次明确执行才是新操作。
+
+HTTP 响应或正文尚未返回时，follow 已交付的终态立即结算共享卡片。发起页凭本次请求的 `compactionId` 或其他已确认的命令关联确定该终态属于本次提交时，结束「正在提交压缩」提示。后续等待、到期和迟到响应不让已知状态退回提交中或未知。别的命令终态只更新其共享卡片。发起页按状态码和严格响应体识别 400/413/415，直接展示 `result.text` 的请求拒绝说明。无可靠执行结局时，意外 500、传输失败或无法识别的响应仍保留「压缩结果未知」。
+
+##### 2.4.8 并行实施与分阶段验收
+
+按用户确认，8.5、8.7、8.8 和 1.7 已并行开工。维持这些任务的编号与职责，不要求暂停或等待彼此整项完成，不在本轮改写它们正在实现的接口。其余任务依据阶段交付接线：阶段须有一致契约与相应测试记录，任务整体勾选仍以全部验收完成为准，不能把替身通过当作真实存储/传输联验。
+
+| 当前工作 | 维持的交付边界 | 下游使用与协调 |
+| --- | --- | --- |
+| 8.5 | 暂存三态提交、核对、先提交再发布、与普通排空隔离 | 8.1、8.2、8.9 复用；flush/关闭/在线恢复矩阵是原隔离约定的补充验收，真实 Agent 交接由 8.3 配合 |
+| 8.7 | pre-step 等待点、固定配置快照、同 Step 业务请求循环 | 用空 hook/压缩替身推进；与 8.8 先对齐实际路由及消息投影；8.6/8.11 分别接入，不各自重写循环 |
+| 8.8 | 本地模型信息、节点/请求计量、缺省语义 | 用固定路由和投影输入推进；8.10 可先用确定权重测试；不把整个 pre-step 实现作为计量前置 |
+| 1.7 | 稳定前缀 fork、子首次提交与发布、独立重开 | 原 1.6/1.8 等前置保持，不新增压缩入口依赖；与 8.5 协调共享提交实现，压缩稳定边界真实联验留在 8.4 |
+
+8.2 摘要服务只消费当前 surface 的候选前缀，已提交修剪自然生效，因此可与 8.9 修剪并行。8.3 将单次摘要失败/取消/核对的基础结算先交付，保留已提交修剪的专项回归在 8.9 后补齐；不让手动入口因不使用的修剪策略而等待整个 8.3。8.6 与 8.11 共用修剪、选区、摘要及基础结算，但超限恢复不依赖压力阈值或第二次摘要策略，两入口可独立开发。正式接线均保留 8.5 的隔离门、8.7 的运行快照及各自所需能力。
+
+8.12 先冻结共享 HTTP 结果、命令事件与 turn:null 关联夹具，路由与前端可基于替身准备；真实接线等待维护占用、选区、单次摘要结算及已有 HTTP/follow 能力，不等待 pressure、context-overflow 或修剪专项回归。命令 busy 记录与暂存占位的写入协调须先验证，不得以替身冒充真实持久联验。8.4 可在事件契约稳定后用持久日志夹具实现命令与压缩恢复及稳定尾部；修剪场景只等 compaction/prune 定义，真实子会话提交/发布/重开等 1.7，最终三入口联验等 8.6、8.11、8.12、8.3 的相关验收。
+
+具体依赖分层以 tasks 的“压缩任务的依赖分层与当前并行工作”表为准。8.5/1.7 可能重叠 Session、writer 和 SQLite handle，8.7/8.6/8.11 可能重叠 Agent 驱动，事件和公共导出也需协调合并；这些是共享文件的装配顺序，不引入新的功能依赖。保留现有类型归属和入口，不为并行工作另建重复协议、快照或提交实现。
 
 ### 3. 从日志重建模型输入与已结算流
+
+本节的请求、Attempt 和实时草稿指业务模型调用；摘要调用的路由、参数与结果按 §2.4 单独处理，不写业务 Assistant 消息或回答草稿。
 
 `request/header.data` 保存 `{ header, reason, startsSeries? }`。`EpochHeader` 包含生效的 `config`，以及可选的 `adapterDefaults`、渲染后的 `system` 和组装后的 `tools`。`config` 包含 `provider`、`model` 和可选的 `reasoningEffort`、`temperature`、`maxTokens`、`stop`。调用方省略 `maxTokens` 且 Adapter 模型信息提供 `defaultMaxTokens` 时补入该值，`reasoningEffort` 根据模型支持值解析默认，显式传入不支持的值报错。`temperature` 和 `stop` 保留显式配置或保持缺省。由 Adapter 模型信息补入的值同时保存于 `config` 和 `adapterDefaults`。每个 Provider 配置一个入口，凭据只随调用在内存中使用。
 
 Agent 生命周期的第一次请求使用 `initial`，从已有日志恢复或 fork 后使用 `resume`。配置、系统提示词或工具 schema 变化写 `change`，同时开始新消息系列时附 `startsSeries: true`。配置相同但开始新消息系列或 surface 已替换时写 `series`。其余请求复用最近的 header。每次调用都重新取 `deriveMessages()` 的独立数组快照，再将配置与消息组成请求。
 
-构造请求时在会话串行区确定配置、必要的 header 及消息快照。`session.flush()` 成功后在串行区外使用同一份输入调用 Adapter。验证已结算请求时，用持久日志中对应 Assistant 结算事件之前的前缀重放新的 Session，分别用 `deriveMessages()` 和 `foldRequestHeader()` 核对实际捕获的模型消息与配置。含附件的请求若需重放，还需要日志所引用的附件对象及对应的代码版本。结算前崩溃时日志保留已提交的配置和消息历史，恢复关闭遗留 Turn。每个已结算的失败请求或重试使用各自的结算位置。
+构造业务请求时复用 pre-step 前固定的本步配置，在压缩后或同 Step 恢复后重新确定必要 header 及消息快照。`session.flush()` 成功且取消检查通过后，在串行区外使用同一份输入调用 Adapter；同 Step 的恢复重试不读取中途变更的生成配置，也不再次运行 pre-step。验证已结算请求时，用持久日志中对应 Assistant 结算事件之前的前缀重放新的 Session，分别用 `deriveMessages()` 和 `foldRequestHeader()` 核对实际捕获的模型消息与配置。含附件的请求若需重放，还需要日志所引用的附件对象及对应的代码版本。结算前崩溃时日志保留已提交的配置和消息历史，恢复关闭遗留 Turn。每个已结算的失败请求或重试使用各自的结算位置。
 
 成功生成追加 `assistant/message`，在 `data` 中保存 `turn`、`step`、`message`、`finishReason`、`stream`、可用时的 `usage` 及 `includeInModelContext: true`。`message` 包含 ID、角色、来源和有序内容块。完整工具调用块保存 `id`、`name` 及原始 `arguments`。成功消息落盘后才进入工具阶段。非成功生成追加 `assistant/attempt`，保存 `turn`、`step`、`outcome`、`reason`、`stream` 及 `includeInModelContext: false`。取消或截断可保存非空展示文字，失败流只用于诊断。表中列出的结算共同使用紧凑流格式。
 
@@ -278,7 +443,7 @@ Agent 生命周期的第一次请求使用 `initial`，从已有日志恢复或 
 
 ### 3.1 Turn 驱动统一决定继续或结算
 
-Turn 驱动拥有步数预算、工具调度、Step 推进和 Turn 结算。每次模型请求有独立的 `AssistantStreamAttempt`。同一个 Step 包含模型决策及该决策产生的工具批次，因而会在 Attempt 结算后继续处理该批工具。需要模型续答时，先保存工具结果和 `step/end`，通过检查点后开启下一 Step，重新派生请求并创建新 Attempt。经压缩后的同 Step 重试也创建新 Attempt。
+Turn 驱动拥有步数预算、工具调度、Step 推进和 Turn 结算。每次业务模型请求有独立的 `AssistantStreamAttempt`。同一个 Step 包含模型决策及该决策产生的工具批次，因而会在 Attempt 结算后继续处理该批工具。需要模型续答时，先保存工具结果和 `step/end` 并通过检查点，再固定下一步配置、等待 pre-step、追加新的 `step/start`，派生请求并创建 Attempt。同 Step 的超限恢复在内部请求循环重建消息，不重新执行 pre-step、不新建 Step 或消耗新的步数预算，但使用新的 Attempt。摘要调用不创建业务 Assistant 消息、实时回答草稿或额外 Step。
 
 Turn 驱动根据统一结束原因和组装结果决定结算。`stop` 携带可用正文、推理等允许的内容块时以正式消息结算，Turn 以 `{ kind: "completed" }` 结束。`tool-calls` 要求至少一个工具块，且所有工具块均已收到 `block-end` 并具有完整的调用标识、名称和原始参数。此时写入 `assistant/message`，持久 `finishReason.kind` 为 `tool_calls`，通过检查点后进入同一 Step 的工具阶段，继续参数校验、权限检查和审批。
 
@@ -312,7 +477,7 @@ Turn 驱动根据统一结束原因和组装结果决定结算。`stop` 携带�
 
 Runtime 捕获异常并输出一个终止 chunk。例如 `{ type: "finish", reason: { kind: "error", failure: { code: "STREAM_CLOSED", message: "SSE stream ended without [DONE]" } } }`。调用方取消使用 `reason.kind: "aborted"`。失败可以附 HTTP 状态、Provider 请求 ID 和建议重试间隔，诊断信息需排除敏感数据。Runtime 不修改 Session 或推进 Turn。
 
-Agent 收到错误终止后追加失败 `assistant/attempt` 及已接收的紧凑流。已发送 `start` 时，追加成功后发 `end` 并引用该结算。会话压缩里程碑中，只有 Adapter 明确报告输入上下文超限才触发压缩恢复，每个 Turn 最多重试一次。先结算原失败，再在同一步执行压缩，成功后写 `series` header、重新派生 surface 消息并通过检查点后重试。压缩失败、取消或重试仍超限时结算 Turn。Runtime 和 Adapter 每次生成只调用一次，SDK 的隐式重试关闭。
+Agent 收到错误终止后追加失败 `assistant/attempt` 及已接收的紧凑流。已发送 `start` 时，追加成功后发 `end` 并引用该结算。仅 Adapter 明确报告 `CONTEXT_WINDOW_EXCEEDED` 才进入 §2.4.2 的强制恢复；普通失败和输出截断不走该路径。先结算原失败，再在原 Step 内修剪及最多一次摘要，只有替换代数前进、未取消并通过检查点才重试业务请求。重试沿用本步配置、重新派生 surface，替换后写 `series` header；配置与此前历史不同且同时替换时仍按 §3 写 change/startsSeries。连续超限最多授权一次重试，成功助手响应或 idle 后重置，不按整个 Turn 永久计数。摘要失败但修剪已落地仍可重试；没有替换、取消、检查点失败或连续重试仍超限时按实际原因结算。Runtime 和 Adapter 每次生成只调用一次，SDK 的隐式重试关闭。
 
 请求级超时与 Agent 的 Turn 总预算独立。调用方取消、超时或提前结束消费时，Adapter 须中止实际请求及读取，释放流、计时器和监听器。超时值按集中配置提供，具体数值在模拟 Adapter 验证时确定。
 
@@ -497,7 +662,7 @@ ReActAgent 的对外观察入口将内部 `AssistantStreamFrame` 投影为 SSE �
 **活动草稿及 end 先到。** 快照覆盖 `start` 和前两条实时分片，恢复后的下一条分片为 `index=2`。结算用同一个 `seq=4` 交接。紧凑流的独立分片按相对毫秒保存。
 
 ```jsonl
-{"type":"snapshot","sessionId":"s2","inheritedEventCount":0,"cursor":3,"records":[{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}},{"type":"event","event":{"type":"step/start","seq":1,"time":1700000000001,"data":{"turn":1,"step":1}}},{"type":"event","event":{"type":"user/message","seq":2,"time":1700000000002,"surfaceOp":"append","data":{"turn":1,"requestId":"req-1","id":"1692aee5-495e-4a65-a350-62e3da31b3d2","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"查询设备 A-17"}]}}},{"type":"event","event":{"type":"request/header","seq":3,"time":1700000000003,"data":{"reason":"initial","header":{"config":{"provider":"mock","model":"test-model"}}}}}],"assistantStream":{"revision":3,"activeAttempt":{"attemptId":"a-1","turn":1,"step":1,"nextIndex":2,"chunks":[{"type":"reasoning","delta":"需要查询设备资料。"},{"type":"text","delta":"我来查询。"}]}}}
+{"type":"snapshot","sessionId":"s2","inheritedEventCount":0,"cursor":3,"records":[{"type":"event","event":{"type":"turn/start","seq":0,"time":1700000000000,"data":{"turn":1}}},{"type":"event","event":{"type":"user/message","seq":1,"time":1700000000001,"surfaceOp":"append","data":{"turn":1,"requestId":"req-1","id":"1692aee5-495e-4a65-a350-62e3da31b3d2","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"查询设备 A-17"}]}}},{"type":"event","event":{"type":"step/start","seq":2,"time":1700000000002,"data":{"turn":1,"step":1}}},{"type":"event","event":{"type":"request/header","seq":3,"time":1700000000003,"data":{"reason":"initial","header":{"config":{"provider":"mock","model":"test-model"}}}}}],"assistantStream":{"revision":3,"activeAttempt":{"attemptId":"a-1","turn":1,"step":1,"nextIndex":2,"chunks":[{"type":"reasoning","delta":"需要查询设备资料。"},{"type":"text","delta":"我来查询。"}]}}}
 {"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a-1","revision":4,"index":2,"chunk":{"type":"tool-call-delta","toolIndex":0,"callId":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}}}
 {"type":"assistant-stream","frame":{"type":"end","attemptId":"a-1","revision":5,"turn":1,"step":1,"index":3,"outcome":{"kind":"committed","eventType":"assistant/message","seq":4}}}
 {"type":"event","event":{"type":"assistant/message","seq":4,"time":1700000000017,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"1692aee5-495e-4a65-a350-62e3da31b3d3","role":"assistant","source":{"provider":"mock","model":"test-model"},"content":[{"type":"reasoning","text":"需要查询设备资料。"},{"type":"text","text":"我来查询。"},{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}]},"finishReason":{"kind":"tool_calls"},"includeInModelContext":true,"stream":[{"time":0,"chunk":{"type":"block-start","index":0,"blockType":"reasoning"}},{"time":0,"chunk":{"type":"reasoning-delta","index":0,"text":"需要查询设备资料。"}},{"time":4,"chunk":{"type":"block-end","index":0,"block":{"type":"reasoning","text":"需要查询设备资料。"}}},{"time":4,"chunk":{"type":"block-start","index":1,"blockType":"text"}},{"time":4,"chunk":{"type":"text-delta","index":1,"text":"我来查询。"}},{"time":7,"chunk":{"type":"block-end","index":1,"block":{"type":"text","text":"我来查询。"}}},{"time":7,"chunk":{"type":"block-start","index":2,"blockType":"tool-call"}},{"time":7,"chunk":{"type":"tool-call-delta","index":2,"id":"call-1","name":"lookup","argumentsDelta":"{\"device\":\"A-17\"}"}},{"time":8,"chunk":{"type":"block-end","index":2,"block":{"type":"tool-call","id":"call-1","name":"lookup","arguments":"{\"device\":\"A-17\"}"}}},{"time":8,"chunk":{"type":"finish","reason":{"kind":"tool-calls"}}}]}}}
@@ -558,6 +723,8 @@ ReActAgent 的对外观察入口将内部 `AssistantStreamFrame` 投影为 SSE �
 - 权限体系后置 → 以本地受控原型运行，不将审批当作生产授权。
 - 异步接受与落盘之间存在窗口 → 明确持久游标、关键动作检查点和失败后的会话停止状态，不用内存通知代替提交成功。
 - 新旧事件与数据库格式不兼容 → 版本校验拒绝误读，旧库保留，新库显式指定，禁止自动清空。
+- UTF-16 启发式可能低估实际压力 → 保留 Provider 明确输入超限后的强制恢复，不能把 80% 估算当作不会溢出的保证。
+- 工具结果中间修剪与摘要可能丢失语义 → 原始日志保留，调用事实和元数据不改写；摘要四项接受检查不声称证明语义无损，也不增加章节验收。
 
 ## Migration Plan
 
@@ -565,6 +732,8 @@ ReActAgent 的对外观察入口将内部 `AssistantStreamFrame` 投影为 SSE �
 
 重构交付时同步 README、HTTP 示例、Zod Schema 与测试，删除仅旧实现产生的孤立代码。空会话持久化后返回 201。首次内存受理及重发命中返回 `202 { accepted: true }`，非空闲 Agent 拒绝新编号并返回 `409 { code: "agent_busy" }`。序号与事件内容按新版协议验收。未知副作用、审批与超时等既有产品规则保留，验证完成前不接入真实副作用系统。
 
+本次压缩增量尚待第 8 组任务实施。新受理顺序不重写已有 turn/start → step/start → user/message 日志，旧记录仍按原序重放；新写入使用 §1.1 的两条受理事件及 pre-step 后打开 Step。新增 compaction/prune 的事件词汇、模型容量和 /compact 契约须与读写端一并交付，不能只改策略而漏掉重放、SSE 或前端消费者。
+
 ## Open Questions
 
-- 各项有限预算的默认数值在模拟工具验收时调整，并集中配置。
+- 压缩以外的工具等待与继续预算默认数值在模拟工具验收时调整，并集中配置；压缩阈值、保留比例、摘要输出预算和次数上限以 §2.4 的已确认值为准。

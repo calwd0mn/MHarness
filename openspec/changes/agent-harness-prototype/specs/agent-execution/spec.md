@@ -122,7 +122,7 @@ Session 核心 SHALL 独立定义事件的数据契约。持久化接口 SHALL �
 
 #### Scenario: 写入窗口内追加及写入期间追加
 - **WHEN** 后续事件在固定窗口内到达，另有事件在当前批次写入时到达
-- **THEN** 前者加入当前待写批次且不延长窗口，后者留到下一批。所有事件按原序号写入。prompt 的 Turn、Step 和用户消息事件可以分属不同持久化批次
+- **THEN** 前者加入当前待写批次且不延长窗口，后者留到下一批。所有事件按原序号写入。受理的 Turn 和用户消息可分属不同批次，Step 开始记录在 pre-step 后另行追加
 
 #### Scenario: 后台写入失败后显式排空
 - **WHEN** 后台写入失败后调用 flush、关闭写入器或关闭后端
@@ -190,7 +190,7 @@ Session 内的 `surface` SHALL 维护当前模型消息对应的事件序号及�
 - **THEN** 两个前缀派生出各自截点的模型消息。包含替换的前缀恢复替换后的顺序，调用方修改返回数组不改变后续派生结果
 
 ### Requirement: 稳定前缀分支
-fork SHALL 接收 `{ sessionId, atSeq? }`，已加载父会话使用内存快照，未加载时读取已提交前缀。锚点在 Turn 内时选该 Turn 的 `turn/end`，在两轮之间时归到上一轮。省略锚点或超过已观察末尾时选最近结束的 Turn。继承范围可延伸至下一 `turn/start` 之前，遇到未闭合的独立压缩 SHALL 回退到其 `compaction/start` 之前。没有已结束 Turn，或锚点在未结束 Turn 内时 SHALL 返回 `session/fork-unavailable`。
+fork SHALL 接收 `{ sessionId, atSeq? }`。父会话已加载时用内存快照，否则读已提交前缀。锚点在 Turn 内选其 `turn/end`，轮间归到上一轮。缺省或超过已观察末尾时选最近闭合 Turn。候选尾部延伸至下一 `turn/start` 前。遇到未闭合 Turn、Step 或独立压缩 SHALL 回退到最近稳定前缀。缺少 `command/done` 不影响截点。无稳定闭合 Turn 或锚点位于未闭合 Turn 时 SHALL 返回 `session/fork-unavailable`。
 
 `cut` SHALL 为排他的结束位置和 `inheritedEventCount`。子会话 SHALL 保留原事件的序号及标识，header 保存 `parentSession` 和 `isSeeded: true`。本次 fork 的 `session/end-seed { inherited: true }` SHALL 位于 `seq=cut`。嵌套分支按当前会话的继承数划界。
 
@@ -199,8 +199,8 @@ fork SHALL 接收 `{ sessionId, atSeq? }`，已加载父会话使用内存快照
 - **THEN** 子会话独立恢复继承事件 `0..7`、结束标记 `seq=8` 和谱系。下一条执行事件的序号为 9，父会话的恢复结果不改变子日志
 
 #### Scenario: 独立压缩后分支
-- **WHEN** 以成功独立压缩的 `compaction/end` 为截点创建分支
-- **THEN** 子会话继承替换后的模型视图和原始日志，重开后结果一致
+- **WHEN** 稳定候选前缀包含独立压缩已提交的 `compaction/end`，且该压缩没有命令关联或关联命令尚无 `command/done`
+- **THEN** 子会话保留压缩终态。成功时一并继承摘要、checkpoint 和替换后的模型视图。重开后结果一致，子会话不补写父命令的终态
 
 #### Scenario: 锚点落在未结束的 Turn 内
 - **WHEN** `atSeq` 指向正在执行且没有 `turn/end` 的 Turn
@@ -209,6 +209,14 @@ fork SHALL 接收 `{ sessionId, atSeq? }`，已加载父会话使用内存快照
 #### Scenario: 两轮之间的锚点与未结束的压缩
 - **WHEN** Turn 1 在 `seq=5` 结束，两轮间的独立压缩从 `seq=6` 开始，`atSeq=7` 指向压缩期间的事件
 - **THEN** 若压缩在 `seq=9` 完成，则复制 `0..9`，后续 Turn 是否完成不影响锚点归属。若压缩尚未结束，则复制 `0..5`
+
+#### Scenario: 两轮之间的命令只有运行记录
+- **WHEN** Turn 结束后的候选前缀包含 C1 的 `command/run`，没有对应终态或未闭合压缩，且包含 C2 的完整命令记录
+- **THEN** 子会话继承 C1 的 run 和 C2 的完整记录，保留原事件序号和标识
+
+#### Scenario: busy 命令的运行记录和终态跨 Turn
+- **WHEN** 候选前缀包含 T1 内的 busy 命令 `command/run`，其 `command/done` 位于候选边界之后
+- **THEN** 子会话继承完整的 T1 和该 `command/run`，不延伸到下一 Turn。父会话之后写入的终态不改变这份子会话历史
 
 ### Requirement: 分支会话的准备与发布
 系统 SHALL 先准备未发布的子 Session。子写 handle 的首次 `append()` SHALL 提交 header、继承数量、seed、结束标记及初始化期间新增的事件。成功后 SHALL 绑定后续写入监听，再发布子 Session 与 Agent，发出 `session/created`。初始化事件经初始快照交付。
@@ -224,7 +232,7 @@ fork SHALL 接收 `{ sessionId, atSeq? }`，已加载父会话使用内存快照
 ### Requirement: 会话创建与单个活动 Turn
 系统 SHALL 在创建会话时仅保存会话元数据，不调用模型。同一会话最多有一个活动 Turn，等待审批的 Turn 也计入。
 
-受理 prompt SHALL 依次追加 `turn/start`、首个 `step/start` 和 `user/message`。`turn/start.data` 为 `{ turn }`，Step 边界为 `{ turn, step }`。真实用户消息 SHALL 在 `data` 保存同一 `turn`、`requestId`、稳定 UUID、`role: "user"`、`source.kind: "user"` 及校验后的文本块，事件外层使用 `surfaceOp: "append"`。`turn/end.data` SHALL 为 `{ turn, reason }`，以 `reason.kind` 表达结算。
+受理 prompt SHALL 依次追加 `turn/start` 和 `user/message`，首个 `step/start` SHALL 由驱动在 pre-step 完成后追加。`turn/start.data` 为 `{ turn }`，Step 边界为 `{ turn, step }`。真实用户消息 SHALL 在 `data` 保存同一 `turn`、`requestId`、稳定 UUID、`role: "user"`、`source.kind: "user"` 及校验后的文本块，事件外层使用 `surfaceOp: "append"`。`turn/end.data` SHALL 为 `{ turn, reason }`，以 `reason.kind` 表达结算。
 
 #### Scenario: 创建空会话
 - **WHEN** 用户创建会话
@@ -239,7 +247,7 @@ fork SHALL 接收 `{ sessionId, atSeq? }`，已加载父会话使用内存快照
 - **THEN** 返回 `409 { code: "agent_busy" }`，不接受新消息或占用该编号
 
 ### Requirement: 会话级运行对象与按需加载
-同一会话在后端加载期间 SHALL 只有一个运行对象，跨多个 Turn 复用。创建空会话、读取历史和建立订阅 SHALL 不创建该对象或触发模型请求。首次提交时 SHALL 在取得写入权及完成必要修复后加载；并发加载 SHALL 不产生重复对象。Turn 结束 SHALL 回到空闲，显式关闭 SHALL 停止输入、等待活动退出并释放存储资源。
+同一会话在后端加载期间 SHALL 只有一个运行对象，跨多个 Turn 复用。创建空会话、读取历史和建立订阅 SHALL 不创建该对象或触发模型请求。首次提交或显式手动压缩命令 SHALL 在取得写入权及完成必要修复后按需加载；并发加载 SHALL 不产生重复对象。Turn 结束 SHALL 回到空闲，显式关闭 SHALL 停止输入、等待活动退出并释放存储资源。
 
 #### Scenario: 连续两个 Turn
 - **WHEN** 一个 Turn 已结算，用户在同一会话提交下一条消息
@@ -266,8 +274,172 @@ Agent 运行状态 SHALL 为 `idle`、`running` 或 `maintenance`。`running` �
 - **WHEN** 独立压缩正在执行，客户端重发已受理的 `requestId`
 - **THEN** 返回 `{ accepted: true }`，不重新调度
 
+### Requirement: Step 配置快照与非持久化 pre-step
+系统 SHALL 在每个 Step 开始前固定本步实际路由、system、tools 和生效生成参数，等待可取消的 pre-step 运行 hook 完成后才追加 `step/start`。pre-step SHALL 不作为持久化事件，不以同步事件通知代替等待。本 Step 的业务请求及同 Step 超限重试 SHALL 使用同一配置快照，消息 SHALL 从更新后的 surface 重新派生；中途配置变化 SHALL 在下一 Step 生效。
+
+#### Scenario: 首次受理后等待 pre-step
+- **WHEN** 新用户消息已受理而 pre-step 仍在等待摘要
+- **THEN** live Session 已包含依次追加的 `turn/start` 和用户消息，受理可返回，首个 `step/start` 尚未追加，也没有 pre-step 持久事件；新编号仍被拒绝
+
+#### Scenario: Step 打开前取消或失败
+- **WHEN** 当前 Turn 在 pre-step 期间取消，或后续无法打开本 Step
+- **THEN** 系统只结算实际打开的执行范围，不补造本 Step 的开始或结束，业务模型不在取消后启动
+
+#### Scenario: 压缩期间切换模型
+- **WHEN** Step 在路由 A 固定配置后开始压缩，期间配置切换到路由 B
+- **THEN** 当前预算、摘要路由及本 Step 的业务请求仍使用 A；压缩后的消息重新派生，B 从下一 Step 生效
+
+### Requirement: 实际路由模型容量与输出预留
+系统 SHALL 从本 Step 实际路由的模型信息取得显式声明的 `contextWindow`，不使用最近历史请求的旧路由容量。输出预留 SHALL 优先使用本次生效的 `maxTokens`，缺省时使用模型声明的默认输出预算。容量和默认值 SHALL 来自 LLM 服务的本地注册或配置，不通过生成或 usage 猜测。预算信息缺失时，自动压力检查 SHALL 告警并跳过，不猜测窗口或将未知输出预留算作零，后续业务请求仍须通过正常检查点与取消检查。
+
+#### Scenario: 没有请求历史或本步切换路由
+- **WHEN** 空会话首次请求，或历史请求属于 A 而本 Step 实际路由为 B
+- **THEN** 使用本步路由的容量及输出预算，不要求先存在持久请求，也不沿用 A 的窗口
+
+#### Scenario: 缺少容量或默认输出预算
+- **WHEN** 模型容量未知，或生效 maxTokens 与模型默认输出预算均缺失
+- **THEN** 自动压力检查告警后跳过，不以虚构值决定压缩；正常准备失败、取消或检查点失败仍可阻止业务请求
+
+### Requirement: 确定性上下文估算
+基础计量 SHALL 使用 JavaScript `.length` 的 UTF-16 code unit 数、每 4 个长度单位约 1 token、每块 4 tokens 和每消息角色 4 tokens 的开销。文本和 reasoning 块 SHALL 计 `ceil(length / 4) + 4`；工具调用 SHALL 分别对名称与参数字符串向上取整后相加再加 4；工具结果 SHALL 递归累计内部块再加 4；其他块 SHALL 计 `ceil(JSON.stringify(block).length / 4) + 4`。消息 SHALL 累计各块并加 4，多块不合并后再计费。是否计入 reasoning 等内容 SHALL 对应该路由实际发送的消息投影。
+
+#### Scenario: 文本及嵌套工具结果的开销
+- **WHEN** 一条消息只有长度 100 的文本块，另一条只有包含该文本块的工具结果块
+- **THEN** 两条消息分别估算为 33 和 37 tokens；工具结果的外层块开销不能省略
+
+#### Scenario: 工具调用分别取整
+- **WHEN** 一条消息仅有名称长度 12、参数字符串长度 100 的工具调用块
+- **THEN** 工具块估算为 32 tokens，整条消息为 36 tokens
+
+#### Scenario: 不同字符串长度单位
+- **WHEN** 文本分别含汉字和 emoji，工具修剪器同时检查同一文本
+- **THEN** token-meter 按 UTF-16 code unit 计长度，工具修剪按 Unicode 码点计长度，不混用两种单位
+
+### Requirement: 请求 envelope 与完整压力估算
+system 存在时 SHALL 计 `ceil(length / 4) + 4`，不存在为 0；tools 非空时 SHALL 计 `ceil(JSON.stringify(tools).length / 4) + 4`，否则为 0。请求压力 SHALL 为 system、tools、模型可见消息估算与业务输出预留之和。该值 SHALL 作为启发式而非 Provider 精确计数。
+
+#### Scenario: 包含系统提示、工具和输出预留
+- **WHEN** system 长度为 4000、tools JSON 长度为 8000、surface 合计为 10000 tokens，业务输出预留为 2000
+- **THEN** 输入估算为 13008，压力为 15008；缺少 system 或空 tools 不增加对应开销
+
+### Requirement: pre-step 压力压缩
+默认 `thresholdRatio` SHALL 为 0.8、`retainRatio` 为 0.16。压力达到或超过 `floor(contextWindow × 0.8)` 时，系统 SHALL 先按工具结果修剪契约修剪当前 surface 的大工具结果，再重新计量。低于阈值 SHALL 结束本次压缩；仍达到阈值 SHALL 以 `floor(contextWindow × 0.16)` 选择安全前缀并摘要。
+
+默认 `compactionRetries: 1` SHALL 表示单次 pre-step 最多两次摘要模型调用；额外一次仅用于首次摘要成功替换后压力仍达到阈值。摘要调用或校验失败 SHALL 退出，不自动重试、拆分或修复。每个后续 Step SHALL 重新检查；80% SHALL 是收敛目标，不阻止首次有效摘要提交。系统 SHALL 不新增压缩总时长限制，请求级超时和取消仍生效。
+
+#### Scenario: 正好达到阈值
+- **WHEN** 窗口为 100000、完整压力为 80000
+- **THEN** 触发修剪与重新计量，尾部保留预算为 16000，而不是当前使用量的 16%
+
+#### Scenario: 修剪已充分降压
+- **WHEN** 修剪提交后压力低于阈值
+- **THEN** 保留修剪结果，不调用摘要模型，也不补造摘要事件
+
+#### Scenario: 两次收敛机会
+- **WHEN** 第一次摘要已成功替换而压力仍达到阈值
+- **THEN** 可以在当前 surface 上再摘要一次；第一次调用失败则不使用该额外机会。两次成功后仍未达目标时保留已提交结果、告警并继续后续流程，不增加第三次摘要
+
+#### Scenario: 压缩异常后请求检查点决定能否继续
+- **WHEN** pre-step 压缩在生成、校验或提交阶段抛出错误
+- **THEN** 外层记录警告并继续后续流程，不因错误类别在此直接跳过下一流程；实际业务请求前仍检查取消与持久化，存储结果待核对或 flush 失败时下游 Adapter 调用次数为 0，已成功提交的修剪和摘要保留
+
+### Requirement: 保留尾部与安全摘要前缀
+系统 SHALL 对完整消息节点从最新向前累计模型可见估算，达到保留预算后停止；跨过预算的整节点 SHALL 保留，不截断。随后 SHALL 校验工具调用与全部配对结果，边界拆开配对时继续向更旧方向移动。预算为 0 时 SHALL 先纳入末尾节点，因此仍至少保留一个节点及必要配对。候选 SHALL 为剩余连续旧前缀，可包含当前 Turn 已完成的旧 Step，不包含未结算交互。无安全头部时 SHALL 返回未压缩且不调用摘要模型。
+
+#### Scenario: 整节点跨过尾部预算
+- **WHEN** 节点估算从旧到新为 `[8000,6000,7000,5000,6000]`，尾部预算为 16000
+- **THEN** 从右累计为 6000、11000、18000，保留后三个完整节点，候选为前两个节点
+
+#### Scenario: 工具配对跨越边界
+- **WHEN** 初选边界将 Assistant 工具声明与其结果分到两侧
+- **THEN** 向旧方向移动边界并保留更多节点，直到配对完整；若退到开头则不摘要
+
+#### Scenario: 零预算仍保留末尾
+- **WHEN** 手动命令或超限恢复以 0 作为尾部预算
+- **THEN** 不将所有消息清空为摘要，至少保留末尾节点及必要配对
+
+### Requirement: 摘要请求参数与输入范围
+摘要 SHALL 只读取所选当前前缀，不读取保留尾部，也不恢复已修剪原文。一次调用 SHALL 直接处理整个安全前缀，不分块、不拆长文本、不分层合并。摘要 SHALL 沿用固定实际路由，设置独立的 `maxTokens: 8192`、专用摘要指令且不提供业务工具；模型允许时关闭推理，否则使用合法配置。该预算 SHALL 不被解释为正文长度保证，推理可消耗预算。
+
+#### Scenario: 候选前缀超出摘要模型输入能力
+- **WHEN** 直接摘要请求返回输入超限
+- **THEN** 本次摘要失败，不拆分源文本或分块合并；自动入口告警后继续至请求检查点，手动入口报告失败
+
+### Requirement: 摘要提示词与先前检查点合并
+系统 SHALL 要求摘要按 Primary Request and Intent、Key Technical Concepts、Files and Code、Errors and Fixes、Pending Jobs、Current Work、Next Step、Critical Context 八节依次输出 Markdown，空节为 `(none)`，使用简短英文条目，保留精确指令、路径、命令、错误、标识、数值及用户纠正。当前工作及下一步 SHALL 以所选前缀截点为准。已有 `<compacted-summary>` 检查点 SHALL 被要求合并更新，保留仍有效事实并删除过时内容，不原样复制。
+
+#### Scenario: 再次摘要包含先前检查点
+- **WHEN** 候选前缀包含既有检查点及更新的交互，保留尾部另有新指令
+- **THEN** 摘要提示词要求合并前缀中的仍有效事实和新信息、去除过时内容；不推断未提供的尾部，后续原文中的新指令继续生效
+
+### Requirement: 摘要输出接受条件
+接受输出 SHALL 只检查非空文本、未因输出上限截断、没有不支持的图片输出，以及包装后的摘要消息估算严格小于被替换历史。系统 SHALL 不校验章节完整性、顺序或格式，不发起格式修复调用。调用或校验失败 SHALL 不提交该次替换并退出摘要循环。
+
+#### Scenario: 摘要章节不完整但通过接受检查
+- **WHEN** 摘要非空、未截断、无不支持图片且包装后更小，但缺少某一提示词要求的章节
+- **THEN** 不因章节缺失拒绝或修复，继续选区复验与原子提交
+
+#### Scenario: 包装后未缩小或输出截断
+- **WHEN** 摘要加包装后不比原范围小，或生成达到输出上限而截断
+- **THEN** 不提交替换，退出本次循环，不用额外收敛机会重新生成；保留已有结果，手动入口向用户报告失败
+
+### Requirement: 手动压缩命令
+用户 SHALL 可运行 `/compact`，通过按会话定位的独立维护 HTTP 入口 `POST /api/sessions/:sessionId/compact` 执行，不作为普通 prompt 发送，不创建真实用户消息或 Turn。命令 SHALL 明确按需加载运行对象、完成恢复并取得空闲维护占用；忙碌时拒绝压缩，不排队执行，并按命令事件契约记录已识别命令的错误结算。手动压缩 SHALL 不检查压力阈值、不先修剪，以零保留预算选择最大安全前缀，最多一次摘要。响应 SHALL 区分摘要成功、无安全范围、取消和失败，正常完成 SHALL 显式等待持久化及 flush，不只确认受理。
+
+#### Scenario: 低压力会话执行手动命令
+- **WHEN** 用户在空闲会话运行 /compact，压力低于 80% 但存在安全前缀
+- **THEN** 仍可摘要该前缀，不先修剪工具结果，不追加 Turn 或普通用户消息，完成持久化后报告结果
+
+#### Scenario: 手动命令没有安全范围
+- **WHEN** 保留末尾及工具配对后不存在可摘要前缀
+- **THEN** 返回未压缩结果，摘要模型调用次数为 0；命令以 `success` 和 `No compactable history yet.` 结算，不生成压缩摘要或 checkpoint。正常 200 保留 `compactionId`、`status` 并携带服务端 `commandId`
+
+#### Scenario: 手动命令响应丢失
+- **WHEN** 维护操作已开始，浏览器断开或 HTTP 响应丢失
+- **THEN** 操作不因断线取消，客户端不自动重发；可以通过 follow 中的压缩开始和终态恢复状态，用户再次明确运行命令才发起新操作
+
+### Requirement: 手动压缩请求入口校验
+`/compact` SHALL 在命令识别前校验请求。入口 SHALL 接受 `application/json` 及其合法媒体类型参数。畸形或空 JSON、无效路径参数或正文结构 SHALL 返回 400，超出正文大小限制 SHALL 返回 413，不支持的媒体类型 SHALL 返回 415。三者的响应体均为 `{ commandId: null, result: { kind: "error", text } }`，`text` 提供对应拒绝原因的安全说明。
+
+#### Scenario: 入口拒绝不进入会话日志
+- **WHEN** `/compact` 收到畸形或空 JSON、无效路径或正文、超限正文或不支持的媒体类型（包括 Fastify 能解析的 `text/plain`）
+- **THEN** 返回对应的 400、413 或 415 及约定错误体；不分配命令 ID、不调用命令执行器或摘要模型、不写任何 Session 事件
+
+#### Scenario: 意外异常保留脱敏错误
+- **WHEN** `/compact` 遇到非上述入口校验失败的未分类内部异常
+- **THEN** 返回脱敏 500，不把异常标记为明确的请求拒绝，不暴露内部错误细节
+
+### Requirement: 共享命令生命周期事件
+执行器识别命令后 SHALL 生成 `commandId`，记录 log-only `command/run` 和 `command/done`，沿用 `type`、Session 分配的 `seq` 和 Unix 毫秒 `time`。`run.data` 含 `commandId`、无斜杠的 `name`、可选 `args` 和 `source: { kind: "user" }`。`args` 保留分隔空白，`recordInput: false` 时 SHALL 省略。
+
+`done.data` SHALL 包含相同 `commandId`、`kind: "success" | "error"`、可选 `text` 和仅成功可选的 `sourceEventSeq`。该引用属于同一命令且满足 `run.seq < sourceEventSeq < done.seq`，压缩成功时指向 `compaction/summary`。不同命令允许交错。同一 Session 日志（含继承前缀）的 ID SHALL 只有一个 `run`、至多一个 `done`。识别前的拒绝不生成记录。
+
+#### Scenario: 无范围命令成功结算
+- **WHEN** 识别 `/compact` 且确认没有安全可压缩范围
+- **THEN** 记录同一命令的 `run` 和 `done`，后者为 `success` 和 `No compactable history yet.`；不记录摘要引用，也不调用摘要模型
+
+#### Scenario: 重复命令 ID 或无效摘要引用
+- **WHEN** 追加、暂存或重放包含重复 `command/run`，或成功 done 引用发生在对应 run 之前、位于 done 及之后或属于其他命令的摘要
+- **THEN** 拒绝该不合法记录或批次，不合并两次命令，不让无效关联进入会话卡片
+
+#### Scenario: 忙碌命令在共享日志结算
+- **WHEN** 命令执行器识别 `/compact` 后发现会话有活动任务，且日志可可靠写入
+- **THEN** 将同一命令的 `run` 和带 busy 文本的 `done(error)` 作为一个连续批次提交，向发起请求返回 `409` 及 `{ commandId, result: { kind: "error", text } }`。原活动继续，后到压缩不排队、不执行
+
+#### Scenario: 异常结算事件追加失败
+- **WHEN** 已识别命令的处理器抛错或取消，且追加错误 `command/done` 失败
+- **THEN** 保留并向上传递原错误，不将追加错误替换为原错误，不声称错误终态已经持久化；不保证该异常调用留下 `done`
+
+#### Scenario: 暂存占位与 busy 竞争
+- **WHEN** 原活动的压缩暂存写入占用会话，另一个已识别命令发现 busy
+- **THEN** 只协调拒绝记录的安全写入，不重新判断并执行后到压缩，不破坏原活动及其原子提交；存储结论不可靠时不绕过准入或伪称记录已持久化
+
+#### Scenario: 活动任务在 busy 记录暂存期间准备继续写入
+- **WHEN** busy 记录正在安全的让渡点提交，原活动准备追加事件或启动下一批暂存写入
+- **THEN** 两方按同会话写入顺序协调，原活动不因 busy 记录占位而报写入竞争。正常提交时两条 busy 记录连续可见，原活动可继续结算。待核对或存储故障时依原存储规则阻塞
+
 ### Requirement: 压缩的开始与选区校验
-`compaction/start` SHALL 保存 `compactionId` 与 `turn`，独立压缩使用 `turn: null`，Turn 内压缩使用所属数字轮次。系统 SHALL 确认开始记录提交后才调用摘要模型。系统 SHALL 在生成前记录待替换节点序列，并在提交前回到串行区重新定位选区、比较完整节点序列及校验工具调用配对。
+`compaction/start` SHALL 保存 `compactionId` 与 `turn`，独立压缩使用 `turn: null`，Turn 内压缩使用所属数字轮次。由手动命令产生的开始、摘要、终态及 checkpoint SHALL 关联原 `sourceCommandId`；自动压缩和既有历史不要求该字段。系统 SHALL 确认开始记录提交后才调用摘要模型。系统 SHALL 在生成前记录待替换节点序列，并在提交前回到串行区重新定位选区、比较完整节点序列及校验工具调用配对。
 
 #### Scenario: 摘要生成期间选区变化
 - **WHEN** 摘要返回时，待替换的节点已变化，即使起止节点仍存在
@@ -286,6 +458,13 @@ Agent 运行状态 SHALL 为 `idle`、`running` 或 `maintenance`。`running` �
 - **WHEN** 摘要生成成功且替换校验通过
 - **THEN** 持久历史同时包含摘要、替换消息和成功终态。重放只从替换消息派生摘要节点，原始消息事件保留
 
+### Requirement: 合成 user 检查点的包装与尾部保留
+摘要替换 SHALL 是合成 user 消息，不是 system 或 assistant 消息。内容 SHALL 按顺序包含自动检查点说明及 `<compacted-summary>` 开标记、摘要正文、`</compacted-summary>` 闭标记，正文可有多个文本块，适配器可转换最终格式。说明 SHALL 要求将摘要当作既有背景、从后续消息直接继续而不确认该检查点。system、tools、保留消息的角色、内容和顺序 SHALL 不被改写。
+
+#### Scenario: 摘要替代旧前缀但不重复发送原文
+- **WHEN** 安全前缀 A、B、C 被检查点 S 替换，尾部为 D、E
+- **THEN** 后续业务 messages 为合成 user S、原 D、原 E，不同时发送 A、B、C 原文；system 和 tools 保持本 Step 的固定值，原交互仍保留在日志中
+
 ### Requirement: 压缩结算与提交核对
 `compaction/end` SHALL 保存 `compactionId`、与开始一致的 `turn`、`status` 以及非成功时的 `reason`。`status` 取 `succeeded`、`failed`、`cancelled` 或 `interrupted`。同一会话每个 `compactionId` 最多提交一个终态。取消与提交竞争时 SHALL 以已提交结果为准。
 
@@ -297,7 +476,7 @@ Agent 运行状态 SHALL 为 `idle`、`running` 或 `maintenance`。`running` �
 
 #### Scenario: 摘要失败、取消或成功批次确认回滚
 - **WHEN** 摘要失败、取消阻止成功提交，或成功批次确认未提交
-- **THEN** 系统提交对应的失败或取消终态，确认后释放占用。本次压缩不产生 surface 替换，保留其他已提交操作造成的变化
+- **THEN** 系统提交对应的失败或取消终态；独立维护在确认后释放占用，Turn 内由驱动决定继续或结算。该次摘要不产生替换，先前已提交的工具修剪或摘要不回滚
 
 #### Scenario: 原事务仍可能提交
 - **WHEN** 暂时读不到压缩记录，且原事务尚未确认终止
@@ -307,11 +486,34 @@ Agent 运行状态 SHALL 为 `idle`、`running` 或 `maintenance`。`running` �
 - **WHEN** 成功批次已提交，随后收到取消或在核对时发现已提交的成功终态
 - **THEN** 采用已提交的成功结果，不追加第二条终态
 
+### Requirement: 暂存批次在排空关闭与在线恢复中的隔离
+压缩暂存批次 SHALL 与普通已接受事件的待写重试分开。普通 flush、关闭排空或在线恢复 SHALL 不隐式重提已确认回滚的暂存批次，也不把它放入普通队列；普通已接受批次的既有重试语义 SHALL 保留。已确认提交的暂存结果 SHALL 至多安装和发布一次，不重复追加。原事务未终止或持久读取不可靠时 SHALL 保持相关存储准入和依赖模型阻塞。在线恢复 SHALL 先核对并采用暂存结果，再检查 live 与持久前缀及修复遗留范围；关闭失败 SHALL 按原关闭合约报告错误并释放资源，不伪称成功压缩。
+
+#### Scenario: 普通 flush 核对到暂存回滚
+- **WHEN** 摘要开始、成功摘要或工具修剪的暂存批次曾返回结果待核对，后续 Session、handle 或统一存储 flush 确认原批次未提交
+- **THEN** 不重新提交原暂存批次，不把它放入普通缓冲，不增加其事件、替换代数或成功通知；由原压缩流程按可靠结论处理失败，普通已接受批次仍按原约定排空或显式重试
+
+#### Scenario: 已提交暂存结果的重复排空与恢复
+- **WHEN** 原暂存提交的确认响应丢失，后续 flush 或在线恢复可靠读到整个原批次已提交
+- **THEN** 采用原持久结果，仍加载的 Session 只安装发布一次；重复 flush 或恢复不再次 append、分配序号或重复推进替换代数
+
+#### Scenario: 关闭时确认暂存回滚
+- **WHEN** writer、handle 或存储关闭引发最后排空，暂存批次被确认已经回滚
+- **THEN** 不因关闭重新写入该批次，不暴露半个摘要或修剪结果；按原关闭合约释放资源及报告必要错误，原已提交历史保持不变
+
+#### Scenario: 在线恢复前 live 尚未安装已提交暂存结果
+- **WHEN** 运行对象的存储准入关闭，原暂存批次实际已提交而 live 前缀尚未包含它，开始在线恢复
+- **THEN** 先核对并安装原提交，再比较前缀和修复遗留范围，不把该差异直接当作普通历史损坏；修复检查点成功前不开放 prompt 或手动维护准入
+
+#### Scenario: 排空关闭或在线恢复仍无法核对
+- **WHEN** 这些路径中原事务尚未终止或持久读取仍不可靠
+- **THEN** 不以暂时查不到当作回滚、不重提或补终态、不发布替换；未关闭的运行对象保持准入关闭且不调用依赖 Adapter，关闭路径报告失败并按关闭合约释放资源，不报告压缩完成
+
 ### Requirement: live Session 受理 prompt
-Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SHALL 在完成必要的恢复校验并取得写入权后，受理空闲 Agent 的输入。Turn、Step 开始事件及用户消息依次进入内存日志且执行循环接管后，接口 SHALL 返回 `202 { accepted: true }`。响应只确认受理，首次模型请求 SHALL 等待相应的持久化检查点。
+Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SHALL 在完成必要的恢复校验并取得写入权后，受理空闲 Agent 的输入。Turn 开始事件及用户消息依次进入内存日志且执行循环接管后，接口 SHALL 返回 `202 { accepted: true }`，不等待 pre-step 或 Step 开始。响应只确认受理，首次模型请求 SHALL 等待相应的持久化检查点。
 
 #### Scenario: 内存已受理但尚未调用模型
-- **WHEN** Turn、Step 开始事件及用户消息已进入 live Session，执行循环已接管
+- **WHEN** Turn 开始事件及用户消息已进入 live Session，执行循环已接管
 - **THEN** 接口可立即确认受理，连接断开不取消该 Turn。若首次请求前的检查点失败，Provider 调用次数为 0
 
 #### Scenario: 受理前加载或取得写入权失败
@@ -341,7 +543,7 @@ Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SH
 - **THEN** 结果和审批按所属 Session、Turn、Step 正确关联，不因 callId 相同而相互覆盖或合并。Provider 要求同一请求内工具调用 ID 唯一时，Adapter SHALL 在发送时同步转换相关调用和结果的引用
 
 ### Requirement: 统一模型与工具循环
-系统 SHALL 通过统一模型合约处理文本、Provider 提供的 reasoning、工具调用、结束原因、用量及错误。每次模型请求 SHALL 具有独立的 Attempt。Step SHALL 包含该 Step 的模型决策及其工具批次。只有完整且参数通过校验的调用才能进入工具执行。需要模型续答时，系统 SHALL 在工具结果和当前 `step/end` 持久化后开启新 Step，并用新的 Attempt 生成。系统 SHALL 以有限步数限制循环。
+系统 SHALL 通过统一模型合约处理文本、Provider 提供的 reasoning、工具调用、结束原因、用量及错误。每次业务模型请求 SHALL 具有独立的 Attempt。Step SHALL 包含该 Step 的模型决策及其工具批次。只有完整且参数通过校验的调用才能进入工具执行。需要模型续答时，系统 SHALL 在工具结果和当前 `step/end` 持久化后，固定下一步配置并等待 pre-step，再开启新 Step、以新 Attempt 生成。系统 SHALL 以有限步数限制循环；摘要调用和同 Step 恢复重试 SHALL 不创建额外 Step。
 
 #### Scenario: 工具参数仍在生成
 - **WHEN** 模型只返回部分工具参数
@@ -361,7 +563,7 @@ Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SH
 
 #### Scenario: 工具批次结束后需要续答
 - **WHEN** 当前 Step 的工具结果和 `step/end` 已持久化，且没有结束 Turn 的条件
-- **THEN** 系统开启新 Step，为新 Attempt 重新准备模型请求和流状态，请求包含此前提交的 Assistant 文字、对应工具调用与结果
+- **THEN** 系统先等待下一步的 pre-step，再开启新 Step、准备 Attempt；请求从压缩后的当前 surface 派生，未被合法替换的 Assistant 文字、调用与结果按原顺序保留
 
 #### Scenario: 循环预算耗尽
 - **WHEN** Turn 达到配置的最大模型步数
@@ -376,7 +578,7 @@ Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SH
 
 #### Scenario: 请求期间配置改变
 - **WHEN** 请求准备完成后、发送前或生成期间，凭据或生成配置发生变化
-- **THEN** 本次请求继续使用准备时确定的快照。下一次请求使用新配置时，`request/header` 记录其生效配置，模型输入包含从同一会话当前前缀派生的历史
+- **THEN** 本次请求及同 Step 恢复重试继续使用该步快照；新配置从下一 Step 生效并由 `request/header` 记录，模型输入包含从同一会话当前前缀派生的历史
 
 ### Requirement: DeepSeek 流的结束边界
 
@@ -424,7 +626,7 @@ Adapter SHALL 将厂商协议或传输失败表示为带稳定代码的 `LlmErro
 - **THEN** Agent 收到 `STREAM_CLOSED` 错误终止，保存失败的 `assistant/attempt` 和紧凑流，结束本轮，不追加正式回答或自动重试。追加成功后实时 `end: committed` 引用该失败事件
 
 ### Requirement: 模型请求错误与资源清理
-模型接入层 SHALL 区分鉴权、限流、网络、协议、请求超时和上游取消，保留安全诊断而不泄露秘密。请求级超时 SHALL 与 Turn 总预算分别执行；取消 SHALL 传播至实际请求和流读取。提前停止消费 SHALL 释放底层流、计时器和监听器。Runtime 和 Adapter 的单次调用 SHALL 只发起一次请求，并关闭 SDK 的隐式重试。
+模型接入层 SHALL 区分鉴权、限流、网络、协议、请求超时、上游取消及明确的输入上下文超限，后者使用稳定分类 `CONTEXT_WINDOW_EXCEEDED`，不与输出截断混同。诊断 SHALL 不泄露秘密。请求级超时 SHALL 与 Turn 步数预算分别执行，不新增压缩总时长限制；取消 SHALL 传播至实际请求和流读取。提前停止消费 SHALL 释放底层流、计时器和监听器。Runtime 和 Adapter 的单次调用 SHALL 只发起一次请求，并关闭 SDK 的隐式重试。
 
 #### Scenario: 用户取消流式请求
 - **WHEN** 上游取消当前模型请求
@@ -542,26 +744,64 @@ Turn 驱动 SHALL 根据模型尝试与 Step 批次结果决定续答或终结�
 - **THEN** 返回 `404 { code: "session/not-found" }`，不为该请求创建 Agent
 
 ### Requirement: 输入上下文超限后的压缩重试
-会话压缩里程碑中，Adapter 明确报告输入上下文超限时，Agent SHALL 先保存失败的 `assistant/attempt`，再在原 Step 内压缩。成功后 SHALL 写 `series` header，重新派生 surface 并通过检查点后重试。每个 Turn 最多重试一次。压缩失败、用户取消或重试再次超限 SHALL 结算 Turn。
+Adapter 明确报告输入上下文超限时，系统 SHALL 先保存失败的 `assistant/attempt`，再在原 Step 内保持 running 执行 context-overflow 恢复：直接尝试修剪，重测后仍不检查 80% 阈值，以 `retainTokens: 0` 选择安全前缀，存在范围时最多调用一次摘要。恢复前后的替换代数前进、未取消且检查点通过时 SHALL 才授权重试；修剪成功但后续摘要失败仍可满足替换条件。无替换时 SHALL 保留原业务请求错误，不重试。
+
+默认 `maxOverflowRetries: 1` SHALL 限制一次连续超限期间最多一次业务请求重试，成功助手响应或 idle 后重置，不按整个 Turn 累计。立即重试 SHALL 留在同一 Step，重新派生消息并沿用本步配置，按请求 header 契约记录新系列且通过检查点，不再次运行 pre-step、不消耗新 Step。输出截断和普通请求失败 SHALL 不触发该恢复。
 
 #### Scenario: 压缩后重试成功
 - **WHEN** 初次模型请求因输入上下文超限失败，压缩成功并完成重试
-- **THEN** 首次结算前缀重放出原消息，重试结算前缀重放出带摘要的消息。两次 Assistant 结算属于同一 Step。若两次都发出 `start`，其 `attemptId` 不同
+- **THEN** 首次结算前缀重放出原消息，重试结算前缀重放出带摘要的消息。两次 Assistant 结算属于同一 Step，重试前不再次运行 pre-step。若两次都发出 `start`，其 `attemptId` 不同
+
+#### Scenario: 估算低于阈值但 Provider 超限
+- **WHEN** 窗口为 100000、估算压力为 70000，但 Provider 返回规范化输入超限
+- **THEN** 仍直接尝试修剪，再按零保留预算选择安全前缀；有范围就摘要，不因估算低于 80000 跳过
+
+#### Scenario: 修剪成功而摘要失败
+- **WHEN** 恢复中的工具结果替换已提交，但后续摘要失败
+- **THEN** 已有替换保留；未取消、预算尚有机会且检查点通过时，允许使用更新后的 surface 重试业务请求
+
+#### Scenario: 没有替换或连续重试再次超限
+- **WHEN** 恢复没有任何 surface 替换，或已授权的一次业务重试仍返回输入超限
+- **THEN** 无替换时保留原请求错误，连续重试耗尽时按实际错误结束本轮，不无限恢复或再次运行 pre-step
+
+#### Scenario: 同一 Turn 的后续 Step 再次超限
+- **WHEN** 某 Step 的业务请求恢复重试成功并产生正常工具调用响应，随后进入新 Step 又遇到输入超限
+- **THEN** 成功助手响应已经重置连续超限计数，新 Step 可取得自己的一次恢复重试机会；新 Step 的正常 pre-step 检查照常执行
 
 ### Requirement: 启动恢复的写入边界
 系统 SHALL 持写入权结算中断的已持久化活动范围。启动修复 SHALL 保留既有结局，提交修复后才开放新任务准入。
 
 #### Scenario: 启动阶段修复但不加载 Agent
-- **WHEN** 服务启动发现未闭合的持久 Turn 或压缩
+- **WHEN** 服务启动发现未闭合的持久 Turn、压缩或本会话自有命令
 - **THEN** 取得临时写入权后修复并持久化，释放临时资源，不创建 Agent、不续跑；查询历史无需先发送新消息，其他进程持有的会话不被修改
 
 #### Scenario: 恢复未闭合压缩
 - **WHEN** 系统取得会话写入所有权并核对已提交日志后，发现 `compaction/start` 没有对应终态
 - **THEN** 按原 `compactionId` 写入 `compaction/end`，记录 `interrupted / process_interrupted`，再依次关闭实际打开的 Step 和 Turn。没有活动 Step 时不补造 Step。确认修复提交后重建 surface 和运行状态，再开放新任务
 
+#### Scenario: pre-step 中断且下一 Step 尚未打开
+- **WHEN** 已提交 Turn 和用户消息，或前一 Step 已关闭，pre-step 摘要开始后进程退出而下一 `step/start` 尚未追加
+- **THEN** 先结算未闭合摘要，再只关闭实际打开的 Turn；不补造下一 Step。已有修剪及前一次成功摘要保持原样，恢复不请求模型
+
 #### Scenario: 重启读到已结算的成功压缩
 - **WHEN** 成功批次在进程退出前已提交，或对已修复会话再次执行恢复
 - **THEN** 采用原终态及其持久日志，不重复追加结束事件或调用摘要模型
+
+#### Scenario: 已提交压缩但命令终态缺失
+- **WHEN** 本会话自有手动命令的压缩成功批次已可靠提交，但 `command/done` 尚未提交
+- **THEN** 恢复采用已提交的成功压缩事实结算对应命令并引用摘要；不再次压缩或覆盖已有终态，修复不能可靠提交时保持存储阻塞
+
+#### Scenario: 已提交压缩失败或取消但命令终态缺失
+- **WHEN** 启动或在线恢复确认本会话自有命令的 `compaction/end` 已持久化为 `failed` 或 `cancelled`，但该命令尚无 `command/done`
+- **THEN** 保留原压缩终态，按已知失败或取消补写一次 `command/done(kind: "error")`，结果文本表达对应结局，且不带成功事件引用。不重复执行压缩
+
+#### Scenario: 命令尚无可靠结局
+- **WHEN** 本会话自有的 `command/run` 已提交但没有 `command/done`，且没有可靠的关联压缩结局
+- **THEN** 不推断命令成功或重新执行；在存储与原事务结论可靠后按中断事实修复，重复恢复不重复结算
+
+#### Scenario: 子会话恢复遇到继承的命令运行记录
+- **WHEN** 启动或在线恢复在继承前缀（`run.seq < inheritedEventCount`）看到缺少 `command/done` 的命令
+- **THEN** 原样保留继承记录。子会话不补写父命令终态、不重新执行命令，也不将其视为自身的活动任务
 
 #### Scenario: 重启时存在遗留工具调用
 - **WHEN** 后端重启发现未结算的 Turn 及已发出但未确认结果的工具

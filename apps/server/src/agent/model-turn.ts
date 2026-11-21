@@ -38,6 +38,10 @@ export type ModelTurnContext = {
 /** 等待点可见的本步上下文，不包含模型凭据。 */
 export type StepHookContext = Readonly<{
   session: Session; turn: number; step: number; signal: AbortSignal;
+  /** 即时读取会话存储准入；本轮首次通过 hook 报告待核对后，即使普通 flush 完成核对也保持关闭。 */
+  storageOpen: () => boolean;
+  /** 报告压缩写入待核对的原始错误；本轮保留首次报告并跳过普通持久收尾。 */
+  blockStorage: (error: unknown) => void;
   /** 已固定并冻结的可记录路由、生成参数、system 和 tools。 */
   header: Readonly<StepSnapshot["header"]>;
 }>;
@@ -78,6 +82,7 @@ type Content = (
  * 已取消时不进入下一步；否则先固定模型配置并等待 preStep，检查存储准入后开步。
  * 每次请求在检查点后重新检查准入和取消；检查点失败优先于同时发生的取消。
  * 超限恢复回调只在失败 Attempt 及实时结束交付后调用一次，获准后在同一步重建请求。
+ * 等待点报告压缩写入待核对后，以首次错误拒绝并保留未闭合的 Step 和 Turn。
  * @param options - Runtime、每步配置及可选等待和恢复回调。
  * @returns 可注入 Agent 的异步驱动；取消信号传给等待点、模型请求和工具批次。
  * @throws 步数或只读超时上限不是正安全整数时抛出 RangeError。
@@ -103,6 +108,15 @@ export function createModelTurnDriver(
     storageOpen = () => true,
   }) => {
     let step = initialStep;
+    let hookStorageFailure: { error: unknown } | undefined;
+    const blockHookStorage = (error: unknown) => {
+      if (hookStorageFailure) return;
+      hookStorageFailure = { error };
+      if (storageOpen()) blockStorage(error);
+    };
+    const assertHookStorage = () => {
+      if (hookStorageFailure) throw hookStorageFailure.error;
+    };
     const timeoutBudget = { count: 0, max: maxReadOnlyTimeouts };
     let turnReason:
       | { kind: "completed" | "max-tokens" | "blocked" }
@@ -126,16 +140,18 @@ export function createModelTurnDriver(
         try {
           const fixed = prepareRequest.snapshot();
           if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
-          const hookContext: StepHookContext = Object.freeze({ session, turn, step, signal, header: fixed.header });
+          const hookContext: StepHookContext = Object.freeze({ session, turn, step, signal, header: fixed.header, storageOpen: () => hookStorageFailure === undefined && storageOpen(), blockStorage: blockHookStorage });
           try {
             await options.preStep?.(hookContext);
           } catch (error) {
+            assertHookStorage();
             if (storageOpen() && error instanceof Error && error.name === "AbortError") {
               turnReason = { kind: "aborted", reason: "user" };
               break;
             }
             throw error;
           }
+          assertHookStorage();
           if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
           if (!storageOpen()) throw new Error("存储准入已关闭");
           session.append({ type: "step/start", data: { turn, step } });
@@ -264,12 +280,14 @@ export function createModelTurnDriver(
               try {
                 approved = await options.recoverOverflow(Object.freeze({ ...hookContext, failure: Object.freeze({ ...finish.failure }) }));
               } catch (error) {
+                assertHookStorage();
                 if (!storageOpen()) throw error;
                 if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
                   turnReason = { kind: "aborted", reason: "user" };
                   break;
                 }
               }
+              assertHookStorage();
               if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
               if (!storageOpen()) throw new Error("存储准入已关闭");
               if (approved) { retried = true; continue; }
@@ -311,6 +329,7 @@ export function createModelTurnDriver(
             break;
           }
         } catch (error) {
+          assertHookStorage();
           if (!storageFailed && signal.aborted) {
             turnReason = { kind: "aborted", reason: "user" };
           } else {
@@ -322,7 +341,7 @@ export function createModelTurnDriver(
           }
         } finally {
           attempt?.abandon();
-          if (stepOpen) session.append({ type: "step/end", data: { turn, step } });
+          if (stepOpen && !hookStorageFailure) session.append({ type: "step/end", data: { turn, step } });
         }
         if (!continued) break;
         try {
@@ -342,7 +361,7 @@ export function createModelTurnDriver(
         }
       }
     } finally {
-      session.append({ type: "turn/end", data: { turn, reason: turnReason } });
+      if (!hookStorageFailure) session.append({ type: "turn/end", data: { turn, reason: turnReason } });
     }
   };
 }

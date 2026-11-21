@@ -90,6 +90,32 @@
 - **WHEN** 自有文件更新工具成功结算并保存了模型内容和 diff 展示数据
 - **THEN** 模型历史直接使用已保存消息，页面读取事件的 `meta`，普通持久结果中没有原始业务值，也不重新运行转换函数
 
+### Requirement: 压力与超限恢复中的工具结果文本修剪
+系统 SHALL 在自动压力达到阈值时、或 Provider 明确报告输入上下文超限后，扫描当前模型 surface 的工具结果。正常压力未达阈值时 SHALL 不因单条结果较大而主动修剪；手动 /compact SHALL 不执行该修剪。对单个结果的文本块合计超过 8192 个 Unicode 码点时，系统 SHALL 保留前 4096 和后 1024 个码点，中间使用 `[... tool result middle pruned ...]`。多文本块 SHALL 共用该预算，图片和其他非文本内容 SHALL 保留且保持原有相对顺序。最近的工具结果也 SHALL 参与扫描。
+
+#### Scenario: 单条结果很大但总压力未达阈值
+- **WHEN** 工具结果超过 8192 个码点，但正常 pre-step 压力仍低于阈值且没有 Provider 超限
+- **THEN** 暂不修剪；若 Provider 随后明确报告输入超限，则不受压力阈值限制，直接尝试修剪
+
+#### Scenario: 多块文本包含 emoji 和非文本内容
+- **WHEN** 工具结果有多个文本块、emoji、图片和其他非文本内容，文本合计超过 8192 个 Unicode 码点
+- **THEN** 按码点保留合计前 4096 和后 1024，中间插入修剪标记；非文本内容及相对顺序保留，不将 emoji 的 UTF-16 双单元误算成两个码点
+
+#### Scenario: 修剪临界值及重复检查
+- **WHEN** 文本合计恰为 8192 个码点，或先前修剪后的当前结果已低于该长度
+- **THEN** 不再次替换，不增加修剪记录或替换代数
+
+### Requirement: 工具结果修剪的事实保留与原子提交
+修剪 SHALL 只改变工具结果块中的模型可见 content，保留消息 ID、角色与工具来源、turn/step、callId、已有 operationId、isError、error 和 meta。系统 SHALL 记录 `compaction/prune` 所遮蔽的节点及修剪前估算 token 数，并追加完整替换 `tool/result`，来源引用原结果。记录与对应替换 SHALL 作为暂存批次原子提交，确认后才更新 surface、发布及推进替换代数；原始结果 SHALL 仍在日志中。该批次 SHALL 独立于后续摘要，后续摘要失败不撤销已提交修剪，也不重新执行工具、render 或审批。
+
+#### Scenario: 修剪后摘要失败
+- **WHEN** 修剪批次已提交，后续历史摘要失败
+- **THEN** 修剪后的模型内容继续生效，原始内容仍可从日志读取，工具执行事实及审批决定均保持不变
+
+#### Scenario: 修剪批次回滚或提交结果待核对
+- **WHEN** 修剪记录与替换结果未确认整体提交
+- **THEN** 不提前发布新 surface；确认回滚不把该暂存批次放入普通排空，提交结果未知则核对并维持存储阻塞，不能暴露半个修剪批次
+
 ### Requirement: 审批绑定确切操作
 参数通过校验后 SHALL 写入 `tool/operation`，保存调用键、`operationId`、`toolName`、`toolVersion` 与不可变的 `validatedArgs`。免审批的操作也 SHALL 写入此事件。审批 SHALL 绑定该操作的工具身份、定义版本和参数，执行时 SHALL 使用同一份绑定。
 

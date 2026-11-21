@@ -1,4 +1,5 @@
 import { useApprovals } from "./use-approvals.ts";
+import { useCompaction } from "./use-compaction.ts";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   createSessionResponseSchema,
@@ -52,6 +53,7 @@ export function useConversation() {
     setSelectedState(id);
   }
   const [state, setState] = useState<FollowState>(initialState);
+  const compaction = useCompaction(selected, state, sessionPath);
   const [submissions, setSubmissions] = useState<Record<string, Submission>>(
     {},
   );
@@ -143,6 +145,13 @@ export function useConversation() {
     const id = selected;
     const content = text;
     if (!id || !content.trim()) return;
+    if (content.trim() === "/compact") {
+      if (compaction.submit(id)) {
+        setDrafts((previous) => ({ ...previous, [id]: "" }));
+        setNotice("");
+      }
+      return;
+    }
     const item = makeSubmission(submissionsRef.current[id], content, () =>
       crypto.randomUUID(),
     );
@@ -212,5 +221,5 @@ export function useConversation() {
       state.inheritedEventCount,
     ).status === "accepted";
   const visibleMessages = state.sessionId === selected ? messages(state) : [];
-  return { approvals, sessions, selected, setSelected, state, submissions, text, setText, notice, creating, controller, createSession, send, cancel, submission, confirmedRecord, visibleMessages };
+  return { approvals, sessions, selected, setSelected, state, submissions, text, setText, notice, creating, controller, createSession, send, cancel, submission, confirmedRecord, visibleMessages, compaction };
 }

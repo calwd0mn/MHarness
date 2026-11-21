@@ -11,7 +11,7 @@ export type GenerationParams = Readonly<{
   maxOutputTokens?: number;
   /** 模型推理强度；支持值由模型信息约束。 */
   reasoningEffort?: string;
-  /** 生成遇到任一停止序列时结束。 */
+  /** 模型生成遇到任一序列时结束；只采用本次请求显式传入的值。 */
   stop?: readonly string[];
 }>;
 
@@ -156,8 +156,8 @@ export interface ModelAdapter {
    * @returns 是否发送助手历史中的推理块。
    */
   includesAssistantReasoning?(params: GenerationParams, tools: readonly ModelTool[]): boolean;
-  /** 请求省略字段时使用的 Adapter 生成参数默认值。 */
-  readonly defaultParams?: GenerationParams;
+  /** 请求省略字段时使用的 Adapter 默认值；停止序列由每次请求显式决定。 */
+  readonly defaultParams?: Omit<GenerationParams, "stop">;
   /** 当前 Adapter 模型的能力和可记录默认值。 */
   readonly modelInfo?: ModelInfo;
 

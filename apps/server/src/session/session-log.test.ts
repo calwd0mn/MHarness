@@ -345,3 +345,27 @@ test("恢复校验事件类型、原序号和分支标记，成功时保留已�
   assert.deepEqual(restored.snapshot(), { cursor: 1, events: [start, marker] });
   assert.equal(restored.append({ type: "step/start", data: { turn: 1, step: 1 } }).seq, 2);
 });
+
+test("命令日志校验交错、引用与继承的身份且拒绝不污染前缀", async () => {
+  const session = new Session(header);
+  const run = (commandId: string) => ({ type: "command/run", data: { commandId, name: "compact", args: "  x", source: { kind: "user" } } } as unknown as SessionAppendInput);
+  const done = (commandId: string, sourceEventSeq?: number) => ({ type: "command/done", data: { commandId, kind: "success", ...(sourceEventSeq === undefined ? {} : { sourceEventSeq }) } } as unknown as SessionAppendInput);
+  session.append(run("one"));
+  session.append(run("two"));
+  assert.throws(() => session.append({ type: "command/done", data: { commandId: "two", kind: "error", sourceEventSeq: 0 } } as unknown as SessionAppendInput));
+  assert.throws(() => session.append(done("two", 1)));
+  const summary = session.append({ type: "compaction/summary", data: { compactionId: "c1", sourceCommandId: "one", summary: "摘要", shadowedRange: { start: 0, end: 0 }, shadowedSeqs: [], route: { provider: "p", model: "m" } } } as unknown as SessionAppendInput);
+  assert.throws(() => session.append(done("two", summary.seq)));
+  session.append(done("one", summary.seq));
+  assert.throws(() => session.append(run("one")));
+  assert.throws(() => session.append(done("one")));
+  assert.throws(() => session.append(done("missing")));
+  const before = session.snapshot();
+  session.bindCheckpoint(async () => {}, async (_events, finish) => { const result = { status: "committed" } as const; finish(result); return result; });
+  await assert.rejects(session.commitStaged(() => [done("two"), run("one")]));
+  assert.deepEqual(session.snapshot(), before);
+  const fork = new Session({ sessionId: "child", createdAt: 100, isSeeded: true, parentSession: header.sessionId }, { seed: { kind: "fork", events: before.events } });
+  assert.throws(() => fork.append(run("one")));
+  assert.throws(() => new Session(header, { seed: { kind: "restore", inheritedEventCount: 0, events: [...before.events, { ...before.events[0], seq: before.events.length }] } }));
+  assert.equal(session.append(done("two")).seq, before.events.length);
+});

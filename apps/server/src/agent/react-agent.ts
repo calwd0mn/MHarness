@@ -16,7 +16,7 @@ type StreamFrame =
 export type AgentObservation = { type: "event"; event: Event } | { type: "assistant-stream"; frame: StreamFrame }
   | Extract<ExecutionNotice, { type: "agent/error" }>;
 type ActiveAttempt = { attemptId: string; turn: number; step: number; chunks: Chunk[]; nextIndex: number };
-/** 驱动一次已受理 Turn；驱动负责开启并结算实际执行的 Step 和 Turn，并在等待后读取存储准入。 */
+/** 驱动一次已受理 Turn；驱动负责开启并结算执行范围，压缩写入待核对时保留未闭合范围。 */
 export type RunTurn = (context: {
   session: Session; turn: number; step: number; signal: AbortSignal;
   publish: (notice: ExecutionNotice) => void; blockStorage: (error: unknown) => void; storageOpen: () => boolean;
@@ -164,9 +164,7 @@ export class ReActAgent {
     const events = this.session.snapshot().events;
     if (events.some((event) => event.seq >= this.session.inheritedEventCount && event.type === "user/message"
       && event.data.source.kind === "user" && "requestId" in event.data && event.data.requestId === request.requestId)) return { accepted: true };
-    if (this.#closing) throw new AgentError("agent_closed");
-    if (this.#state !== "idle") throw new AgentError("agent_busy");
-    if (this.#storageBlocked) throw new AgentError("storage_blocked", { cause: this.#storageError });
+    this.#assertAdmission();
     const turn = events.reduce((max, event) => event.type === "turn/start" ? Math.max(max, event.data.turn) : max, 0) + 1;
     this.#state = "running";
     this.#controller = new AbortController();
@@ -178,20 +176,21 @@ export class ReActAgent {
     const signal = this.#controller.signal;
     this.#running = Promise.resolve().then(() => this.runTurn({ session: this.session, turn, step: 1, signal,
       publish: (notice) => this.#publish(notice), blockStorage: (error) => this.blockStorage(error), storageOpen: () => this.storageOpen }))
-      .catch((error: unknown) => { this.blockStorage(error); console.error("Turn 驱动失败", error); })
+      .catch((error: unknown) => {
+        if (this.storageOpen) this.blockStorage(error);
+        console.error("Turn 驱动失败", error);
+      })
       .finally(() => { this.#state = "idle"; this.#controller = undefined; });
     return { accepted: true };
   }
   /**
    * 在会话空闲且存储准入开放时独占执行维护任务，取消信号作用于该任务。
    * @param work - 接收取消信号并负责自身收尾的维护任务。
-   * @returns 任务退出并释放占用后兑现；任务失败时以原错误拒绝。
+   * @returns 任务退出并释放占用后返回任务结果；任务失败时以原错误拒绝。
    * @throws 会话关闭、忙碌或存储阻塞时拒绝。
    */
-  runMaintenance(work: (signal: AbortSignal) => Promise<void>): Promise<void> {
-    if (this.#closing) return Promise.reject(new AgentError("agent_closed"));
-    if (this.#state !== "idle") return Promise.reject(new AgentError("agent_busy"));
-    if (this.#storageBlocked) return Promise.reject(new AgentError("storage_blocked", { cause: this.#storageError }));
+  runMaintenance<TResult>(work: (signal: AbortSignal) => Promise<TResult>): Promise<TResult> {
+    try { this.#assertAdmission(); } catch (error) { return Promise.reject(error); }
     this.#state = "maintenance";
     this.#controller = new AbortController();
     const signal = this.#controller.signal;
@@ -199,8 +198,13 @@ export class ReActAgent {
       this.#state = "idle";
       this.#controller = undefined;
     });
-    this.#running = task.catch(() => {});
+    this.#running = task.then(() => {}, () => {});
     return task;
+  }
+  #assertAdmission(): void {
+    if (this.#closing) throw new AgentError("agent_closed");
+    if (this.#state !== "idle") throw new AgentError("agent_busy");
+    if (this.#storageBlocked) throw new AgentError("storage_blocked", { cause: this.#storageError });
   }
   /** 请求取消当前活动；完成仍需等待运行退出。空闲时不产生影响。 */
   cancel(): void { this.#controller?.abort(); }

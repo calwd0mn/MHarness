@@ -44,6 +44,10 @@
 - **WHEN** Agent 处于 `maintenance` 并等待摘要结果
 - **THEN** 历史查询与 follow 可继续读取已确认的会话事实，观察操作不会改变维护任务的执行占用
 
+#### Scenario: 手动压缩期间断开连接
+- **WHEN** /compact 已进入维护执行，浏览器切换会话、关闭 SSE 或丢失 HTTP 响应
+- **THEN** 后端维护任务继续，断线不等价于取消；重连通过压缩原始事件恢复状态，不自动重发命令
+
 ### Requirement: 快照初始化与当前会话订阅
 首次打开、重连及切回会话时，实时页面 SHALL 建立 follow，以首帧 snapshot replace 重建视图后顺序消费后续帧，不额外 GET 首屏历史，不将旧草稿与新快照拼接。第一版 SHALL 只订阅当前选中会话；切走关闭订阅，切回重新订阅，不取消后端 Turn。快照 SHALL 包含完整原始事件前缀，分页后置。
 
@@ -149,8 +153,74 @@ HTTP 历史、SSE 快照和增量 SHALL 使用同一 `{ type: "event", event }` 
 - **WHEN** 用户读取已提交摘要替换的会话或连接 follow
 - **THEN** 同步窗口包含压缩和替换事件，聊天继续显示原始问答，模型历史可按 surface 派生摘要
 
+#### Scenario: 工具结果修剪后读取历史
+- **WHEN** 历史包含 compaction/prune 和工具结果替换，随后摘要失败或页面重连
+- **THEN** HTTP/follow 原样交付修剪记录、来源和替换，聊天仍显示原始工具交互，不将替换当作第二次执行或丢弃已确认的修剪结果
+
+#### Scenario: pre-step 尚未打开 Step
+- **WHEN** 快照包含活动 Turn 及用户消息，pre-step 正在执行，但本 Step 的 step/start 尚未追加
+- **THEN** 客户端接受该状态并保持忙碌，不要求补造 Step 或 Assistant 草稿，也不将 pre-step 当作缺失的持久事件
+
+### Requirement: 手动压缩命令与维护状态反馈
+输入框 SHALL 将用户明确执行的 `/compact` 识别为独立维护命令，通过会话维护 HTTP 接口提交，不走普通消息的 prompt 或 requestId 自动重发流程，不创建用户聊天气泡、Turn 或业务回答草稿。前端 SHALL 区分进行中、成功摘要、无安全范围、取消、失败和响应未知，不以请求已发送或普通 accepted 当作成功。
+
+HTTP 响应丢失 SHALL 不自动重发或猜测本地请求的归属；没有可靠结局时保留未知。用户再次明确执行才构成新命令。取消 SHALL 通过已有会话取消入口发出，网络断开不取消。本地 HTTP 观察上限 SHALL 为 5 秒，覆盖请求及响应体；到期不取消或重发，迟到响应仍按提交身份处理。
+
+命令入口的 400/413/415 与约定错误体均匹配时，发起页 SHALL 展示 `result.text` 的明确拒绝说明。意外 500、传输失败或无法识别的响应在缺少可靠结局时 SHALL 显示为结果未知。
+
+#### Scenario: 手动压缩不生成普通消息
+- **WHEN** 用户在空闲会话执行 /compact
+- **THEN** 客户端调用独立维护入口，展示维护反馈；历史没有 /compact 用户消息或新 Turn，摘要不作为新的 Assistant 回答出现
+
+#### Scenario: 响应丢失后从 follow 恢复
+- **WHEN** 服务端已经提交手动摘要，但客户端未收到 HTTP 完成响应
+- **THEN** 客户端不重发，根据同会话命令及压缩事件重建共享卡片；没有可靠请求关联时不猜测卡片归属，切换会话后的迟到响应不得改写当前其他会话
+
+#### Scenario: 请求在命令识别前被明确拒绝
+- **WHEN** 发起页收到 400、413 或 415，且响应体严格匹配 `{ commandId: null, result: { kind: "error", text } }`
+- **THEN** 发起页展示对应的请求拒绝说明并结束提交等待，两页均不生成该请求的共享卡片
+
+#### Scenario: 自动摘要不占用业务草稿
+- **WHEN** pre-step 或同 Step 超限恢复调用摘要模型
+- **THEN** 摘要生成不产生业务 assistant-stream 草稿或额外 Step；压缩事实由原始事件交付，业务请求的 Attempt 和实时 revision 仍按业务流维护
+
+### Requirement: 共享命令卡片
+前端 SHALL 在会话区域按 `commandId` 从 follow 原始 `command/run`、`command/done` 和关联压缩事件按 seq 重建独立命令卡片，及时投影已交付事件，不等待本地 HTTP 观察上限。HTTP 和 follow SHALL 不生成重复正式卡片；同一 Session 的客户端按相同记录显示，不按页面来源过滤。
+
+#### Scenario: 两个客户端观察先后执行的压缩
+- **WHEN** A、B 订阅同一会话，C1 已成功且 B 发起的 C2 已开始，相关历史处于已加载窗口
+- **THEN** 两端均保留 C1 摘要卡并显示独立的 C2 进行中卡，按同一 `commandId` 更新 C2，不以本地旧结果覆盖新维护
+
+#### Scenario: 无范围或忙碌命令的共享结果
+- **WHEN** 已识别命令分别以无安全范围成功或 busy 错误结算，且 `command/run`、`command/done` 已可靠交付
+- **THEN** 两端依据各自相同 ID 的事件显示普通命令结果卡；无范围不显示虚构的压缩数量或摘要，busy 不改变既有卡片
+
+#### Scenario: 摘要先于命令终态交付
+- **WHEN** 同一命令的成功压缩摘要事件已到达，但 `command/done` 或 HTTP 最终响应尚未到达
+- **THEN** 客户端可展示已记录的摘要，摘要到达不能证明已收到 HTTP 响应。收到命令或压缩终态时更新同一卡片
+
+#### Scenario: 共享卡片先于 HTTP 响应结算
+- **WHEN** 发起页仍在 5 秒窗口内等待 HTTP 响应或响应体，follow 已交付对应的 `command/done` 或关联 `compaction/end`
+- **THEN** 两页立即按该终态更新同一张卡片。发起页能可靠关联本次提交时结束「正在提交压缩」提示，后续等待、到期或迟到响应不让已知终态退回提交中或未知。其他命令的终态只更新自己的卡片，不结束本次提交等待
+
+#### Scenario: 命令 HTTP 观察超时
+- **WHEN** 本地 HTTP 请求或响应体超过 5 秒仍未完成，而共享事件继续交付
+- **THEN** 不取消、不重发，按已观察事件更新共享卡片；本地结果缺乏可靠关联时保持未知，迟到响应不得污染新提交或其他会话
+
+#### Scenario: 重连和重开恢复命令卡片
+- **WHEN** 历史窗口包含已持久化的命令和关联压缩事件，或断线时仍保留已安装的终态
+- **THEN** 按同样的 ID 和事件顺序重建或保留卡片，不重复生成；仅有开始记录且连接中断时不断言维护当前仍在运行
+
+#### Scenario: 无命令终态时展示已有压缩结局
+- **WHEN** 历史或 follow 已交付关联的 `compaction/end`，尚未交付该命令的 `command/done`
+- **THEN** 同一卡片显示已知压缩结果。成功时显示记录中的摘要，失败、取消或中断时显示对应结局。若稍后收到 done，则在同一卡片更新命令结果
+
+#### Scenario: 子会话只继承命令运行记录
+- **WHEN** fork 的继承前缀中只有该命令的 `command/run`，没有 `command/done` 或关联压缩终态
+- **THEN** 子会话将该历史卡片显示为「结果未记录」。刷新、重连及重开后显示一致，该命令不显示为进行中
+
 ### Requirement: Attempt 实时帧
-每次模型请求 SHALL 拥有 Agent 生命周期内唯一的 `attemptId`。对外实时帧 SHALL 按实际发布顺序分配连续递增的 `revision`。`start`、`chunk`、`end` 均携带两者，`start` 和 `end` 还携带 `turn`、`step`。取得异步流对象并检查取消后，读取首个模型分片前发送 `start`。草稿的 `chunk.index` 从 0 开始，`end.index` 等于已发送草稿分片数。每次 `start` 后均有对应 `end`，包括零分片。发出 `end` 后停止该次增量。
+每次业务模型请求 SHALL 拥有 Agent 生命周期内唯一的 `attemptId`。对外实时帧 SHALL 按实际发布顺序分配连续递增的 `revision`。`start`、`chunk`、`end` 均携带两者，`start` 和 `end` 还携带 `turn`、`step`。取得异步流对象并检查取消后，读取首个模型分片前发送 `start`。草稿的 `chunk.index` 从 0 开始，`end.index` 等于已发送草稿分片数。每次 `start` 后均有对应 `end`，包括零分片。发出 `end` 后停止该次增量。压缩摘要不作为业务实时回答发布。
 
 #### Scenario: 按序交付模型增量
 - **WHEN** Attempt 发出 `start` 后产生两个增量

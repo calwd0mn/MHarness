@@ -4,6 +4,7 @@ import { Approval as ApprovalView } from "./features/conversation/Approval.tsx";
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { Session } from "@mharness/session/server";
 import { App } from "./App.tsx";
 
 function Approval({ approval, enabled, decision, closed }) {
@@ -66,6 +67,301 @@ test("网络结果未知时相同正文沿用编号，改文使用新编号", as
 const record = (seq, type, data, extra = {}) => ({ type: "event", event: { seq, time: seq + 1, type, data, ...extra } });
 const userRecord = (requestId) => record(0, "user/message", { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId, content: [{ type: "text", text: "你好" }] }, { surfaceOp: "append" });
 const ok = () => ({ ok: true, json: async () => ({ accepted: true }) });
+test("手动压缩独立提交并展示终态", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "cmd", status: "succeeded" }) }));
+  await enter("  /compact  "); await submit();
+  expect(fetch.mock.calls[0][0]).toBe("/api/sessions/a/compact");
+  expect(Object.keys(JSON.parse(fetch.mock.calls[0][1].body))).toEqual(["compactionId"]);
+  expect(container.querySelectorAll("article.user")).toHaveLength(0);
+  expect(container.textContent).toContain("已压缩");
+});
+for (const content of ["/Compact", "/compact now", "/compact\n请继续", "说 /compact"]) test(`普通消息保留原文 ${content}`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockResolvedValue(ok());
+  await enter(content); await submit();
+  expect(fetch.mock.calls[0][0]).toBe("/api/sessions/a/messages");
+  expect(JSON.parse(fetch.mock.calls[0][1].body).content[0].text).toBe(content);
+});
+for (const [status, body, label] of [
+  [409, { code: "agent_busy" }, "压缩结果未知"],
+  [409, { commandId: "cmd", result: { kind: "error", text: "助手忙碌" } }, "助手忙碌"],
+  [400, { commandId: null, result: { kind: "error", text: "请求无效" } }, "请求无效"],
+  [413, { commandId: null, result: { kind: "error", text: "正文过大" } }, "正文过大"],
+  [415, { commandId: null, result: { kind: "error", text: "媒体类型无效" } }, "媒体类型无效"],
+  [415, { commandId: "cmd", result: { kind: "error", text: "不应显示" } }, "压缩结果未知"],
+  [400, { code: "invalid_request" }, "压缩结果未知"],
+  [409, { code: "compaction_id_conflict" }, "标识已使用"],
+  [503, { code: "compaction_unavailable" }, "暂不可用"],
+  [500, { code: "compaction_internal_error" }, "压缩结果未知"],
+  [500, { code: "private-error" }, "压缩结果未知"],
+  [503, { code: "agent_busy" }, "压缩结果未知"],
+  [202, { accepted: true }, "压缩结果未知"],
+  [200, { status: "succeeded" }, "压缩结果未知"],
+]) test(`压缩 HTTP ${status} 显示 ${label}`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockResolvedValue({ status, json: async () => body });
+  await enter("/compact"); await submit();
+  expect(container.textContent).toContain(label);
+});
+for (const status of [200, 500]) test(`压缩 HTTP ${status} 不会误用其他响应的终态`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(async (_url, options) => ({
+    status,
+    json: async () => ({
+      compactionId: status === 500 ? JSON.parse(options.body).compactionId : "2dfe7336-a43e-4fcb-9530-1880d94588ce",
+      status: "failed",
+    }),
+  }));
+  await enter("/compact"); await submit();
+  expect(container.textContent).toContain("压缩结果未知");
+  expect(container.textContent).not.toContain("压缩失败");
+});
+test("无法解析的压缩 500 只显示结果未知", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockResolvedValue({ status: 500, json: async () => { throw new SyntaxError("private-body"); } });
+  await enter("/compact"); await submit();
+  expect(container.textContent).toContain("压缩结果未知");
+  expect(container.textContent).not.toContain("private-body");
+});
+for (const hangingBody of [false, true]) test(`HTTP ${hangingBody ? "响应体" : "请求"}挂起时按可靠日志恢复，迟到冲突仍优先`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  fetch.mockImplementation(() => hangingBody ? Promise.resolve({ status: 200, json: () => gate }) : gate);
+  vi.useFakeTimers();
+  try {
+    await enter("/compact");
+    await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+    await act(async () => { connections[0].frame(record(0, "compaction/start", { compactionId: id, turn: null })); });
+    await act(async () => { connections[0].frame(record(1, "compaction/end", { compactionId: id, turn: null, status: "succeeded" })); });
+    expect(container.textContent).toContain("已压缩");
+    expect(container.textContent).not.toContain("正在提交压缩");
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(container.textContent).toContain("已压缩");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await act(async () => { release(hangingBody ? { compactionId: id, commandId: "cmd", status: "succeeded" } : { status: 409, json: async () => ({ code: "compaction_id_conflict" }) }); });
+    if (!hangingBody) expect(container.textContent).toContain("标识已使用");
+  } finally { vi.useRealTimers(); }
+});
+test("提交前的旧开始不能用于恢复同 ID 的新请求", async () => {
+  const id = "2dfe7336-a43e-4fcb-9530-1880d94588ce";
+  await sendFrame(connections[0], snapshot("a", [record(0, "compaction/start", { compactionId: id, turn: null })]));
+  vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+  fetch.mockRejectedValue(new Error("lost"));
+  await enter("/compact"); await submit();
+  await sendFrame(connections[0], record(1, "compaction/end", { compactionId: id, turn: null, status: "succeeded" }));
+  expect(container.textContent).toContain("压缩结果未知");
+  expect(container.textContent).not.toContain("已压缩");
+  vi.restoreAllMocks();
+});
+test("取消请求确认不等于压缩终态", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockRejectedValueOnce(new Error("lost")).mockResolvedValueOnce({ ok: true, status: 202, json: async () => ({ accept: true }) });
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], record(0, "compaction/start", { compactionId: id, turn: null }));
+  expect(container.textContent).toContain("压缩进行中");
+  await click(button("取消任务"));
+  expect(container.textContent).toContain("已请求取消");
+  expect(container.textContent).toContain("压缩进行中");
+  expect(container.textContent).not.toContain("压缩已取消");
+  await sendFrame(connections[0], record(1, "compaction/end", { compactionId: id, turn: null, status: "cancelled", reason: "cancel" }));
+  expect(container.textContent).toContain("压缩已取消");
+});
+test("follow 成功先于取消 HTTP 确认时保留成功状态", async () => {
+  await sendFrame(connections[0], snapshot("a", [userRecord("original")]));
+  let confirmCancel;
+  const cancellation = new Promise(resolve => { confirmCancel = resolve; });
+  fetch.mockRejectedValueOnce(new Error("lost")).mockReturnValueOnce(cancellation);
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], record(1, "compaction/start", { compactionId: id, turn: null }));
+  expect(container.textContent).toContain("压缩进行中");
+
+  await click(button("取消任务"));
+  expect(fetch.mock.calls[1][0]).toBe("/api/sessions/a/cancel");
+  expect(container.textContent).not.toContain("已请求取消");
+  await sendFrame(connections[0], record(2, "compaction/summary", { compactionId: id, summary: "摘要", shadowedRange: { start: 0, end: 0 }, shadowedSeqs: [0], route: { provider: "p", model: "m" } }));
+  await sendFrame(connections[0], record(3, "user/message", { id: "summary", role: "user", source: { kind: "compact", compactionId: id }, content: [{ type: "text", text: "摘要" }] }, { surfaceOp: { op: "replace", start: 0, end: 0 }, sourceEventSeqs: [0, 2] }));
+  await sendFrame(connections[0], record(4, "compaction/end", { compactionId: id, turn: null, status: "succeeded" }));
+  expect(container.textContent).toContain("已压缩");
+  expect(container.textContent).not.toContain("已请求取消");
+
+  await act(async () => { confirmCancel({ ok: true, status: 202, json: async () => ({ accept: true }) }); });
+  expect(container.textContent).toContain("已请求取消");
+  expect(container.textContent).toContain("已压缩");
+  expect(container.textContent).not.toContain("压缩已取消");
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+test("切换会话时迟到的压缩响应不污染当前页面和草稿", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  let release;
+  fetch.mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await enter("会话 B 草稿");
+  await act(async () => { release({ status: 200, json: async () => ({ compactionId: id, commandId: "cmd", status: "succeeded" }) }); });
+  expect(container.textContent).not.toContain("已压缩");
+  expect(container.querySelector("textarea").value).toBe("会话 B 草稿");
+  await click(button("会话 1")); await sendFrame(connections[2], snapshot("a"));
+  expect(container.textContent).toContain("已压缩");
+});
+for (const [status, label] of [["no_safe_range", "没有可压缩范围"], ["cancelled", "压缩已取消"], ["failed", "压缩失败"]]) test(`压缩 HTTP 终态 ${status}`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "cmd", status }) }));
+  await enter("/compact"); await submit();
+  expect(container.textContent).toContain(label);
+});
+test("只用同 ID 的自有手动记录恢复未知请求", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockRejectedValue(new Error("lost"));
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], record(0, "compaction/start", { compactionId: "other", turn: null }));
+  await sendFrame(connections[0], record(1, "compaction/end", { compactionId: "other", turn: null, status: "succeeded" }));
+  await sendFrame(connections[0], record(2, "compaction/start", { compactionId: id, turn: 1 }));
+  await sendFrame(connections[0], record(3, "compaction/end", { compactionId: id, turn: 1, status: "succeeded" }));
+  expect(container.textContent).toContain("压缩结果未知");
+  await sendFrame(connections[0], record(4, "compaction/start", { compactionId: id, turn: null }));
+  expect(container.textContent).toContain("压缩进行中");
+  await sendFrame(connections[0], record(5, "compaction/end", { compactionId: id, turn: null, status: "cancelled", reason: "cancel" }));
+  expect(container.textContent).toContain("压缩已取消");
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+test("没有本地提交时仅展示自有独立维护记录", async () => {
+  const frames = [record(0, "compaction/start", { compactionId: "old", turn: null }), record(1, "compaction/end", { compactionId: "old", turn: null, status: "succeeded" }), record(2, "compaction/start", { compactionId: "auto", turn: 1 }), record(3, "compaction/end", { compactionId: "auto", turn: 1, status: "succeeded" })];
+  await sendFrame(connections[0], { ...snapshot("a", frames), inheritedEventCount: 2 });
+  expect(container.textContent).not.toContain("已压缩");
+  await sendFrame(connections[0], record(4, "compaction/start", { compactionId: "manual", turn: null }));
+  expect(container.textContent).toContain("压缩进行中");
+  await sendFrame(connections[0], record(5, "compaction/end", { compactionId: "manual", turn: null, status: "interrupted", reason: "lost" }));
+  expect(container.textContent).toContain("压缩已中断");
+});
+test("重新同步快照用匹配记录恢复未知结果", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockRejectedValue(new Error("lost"));
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await click(button("会话 2")); await sendFrame(connections[1], snapshot("b"));
+  await click(button("会话 1"));
+  await sendFrame(connections[2], snapshot("a", [record(0, "compaction/start", { compactionId: id, turn: null }), record(1, "compaction/end", { compactionId: id, turn: null, status: "failed", reason: "private" })]));
+  expect(container.textContent).toContain("压缩失败");
+  expect(container.textContent).not.toContain("private");
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+test("HTTP 回包丢失后，已观察到的压缩成功在重连及同步失败时保留", async () => {
+  const original = userRecord("original");
+  await sendFrame(connections[0], snapshot("a", [original]));
+  fetch.mockRejectedValueOnce(new Error("lost"));
+  await enter("/compact"); await submit();
+  expect(container.textContent).toContain("压缩结果未知");
+  const compactionId = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  const range = { start: 0, end: 0 };
+  const frames = [
+    record(1, "compaction/start", { compactionId, turn: null }),
+    record(2, "compaction/summary", { compactionId, summary: "摘要", shadowedRange: range, shadowedSeqs: [0], route: { provider: "p", model: "m" } }),
+    record(3, "user/message", { id: "summary", role: "user", source: { kind: "compact", compactionId }, content: [{ type: "text", text: "摘要" }] }, { surfaceOp: { op: "replace", ...range }, sourceEventSeqs: [0, 2] }),
+    record(4, "compaction/end", { compactionId, turn: null, status: "succeeded" }),
+  ];
+  const records = [original, ...frames];
+  const replay = new Session({ sessionId: "a", createdAt: 0 }, {
+    seed: { kind: "restore", inheritedEventCount: 0, events: records.map(({ event }) => event) },
+  });
+  expect(replay.deriveMessages().map(({ id }) => id)).toEqual(["summary"]);
+  for (const frame of frames) await sendFrame(connections[0], frame);
+  expect(container.textContent).toContain("已压缩");
+
+  vi.useFakeTimers();
+  try {
+    await act(async () => { connections[0].onerror(); });
+    expect(container.textContent).toContain("正在同步");
+    expect(container.textContent).toContain("已压缩");
+    expect(container.textContent).not.toContain("压缩结果未知");
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+  } finally { vi.useRealTimers(); }
+
+  await sendFrame(connections[1], { type: "error", error: { code: "follow_sync_failed", message: "同步故障", details: {} } });
+  expect(container.textContent).toContain("同步故障");
+  expect(container.textContent).toContain("已压缩");
+  await click(button("重新同步"));
+  expect(container.textContent).toContain("已压缩");
+  await sendFrame(connections[2], snapshot("a", records));
+  expect(container.textContent).toContain("已连接");
+  expect(container.textContent).toContain("已压缩");
+  await click(button("会话 2"));
+  await sendFrame(connections[3], snapshot("b"));
+  expect(container.textContent).not.toContain("已压缩");
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+test("未获得可信游标时不将快照中的旧结果当成本次提交", async () => {
+  fetch.mockRejectedValue(new Error("lost"));
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], snapshot("a", [record(0, "compaction/start", { compactionId: id, turn: null }), record(1, "compaction/end", { compactionId: id, turn: null, status: "succeeded" })]));
+  expect(container.textContent).toContain("压缩结果未知");
+  expect(container.textContent).not.toContain("已压缩");
+});
+test("较早的明确冲突不会被后续同 ID 事件覆盖", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockResolvedValue({ status: 409, json: async () => ({ code: "compaction_id_conflict" }) });
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], record(0, "compaction/start", { compactionId: id, turn: null }));
+  await sendFrame(connections[0], record(1, "compaction/end", { compactionId: id, turn: null, status: "succeeded" }));
+  expect(container.textContent).toContain("标识已使用");
+  expect(container.textContent).not.toContain("已压缩");
+});
+test("请求永久挂起且没有日志证据时超时保持未知", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(() => new Promise(() => {}));
+  vi.useFakeTimers();
+  try {
+    await enter("/compact");
+    await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(container.textContent).toContain("压缩结果未知");
+    expect(container.textContent).not.toContain("压缩失败");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});
+test("压缩事件和替换副本不改变原消息与工具卡", async () => {
+  const id = "2dfe7336-a43e-4fcb-9530-1880d94588ce";
+  const frames = [
+    userRecord("original"),
+    record(1, "assistant/message", { turn: 1, step: 1, message: { id: "m", role: "assistant", source: { provider: "p", model: "m" }, content: [{ type: "text", text: "原始回答" }, { type: "tool-call", id: "x", name: "mock_read", arguments: "{}" }] }, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true }, { surfaceOp: "append" }),
+    record(2, "tool/call", { turn: 1, step: 1, callId: "x", name: "mock_read", arguments: "{}" }),
+    record(3, "tool/result", { turn: 1, step: 1, message: { id: "r", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "原始结果" }] }] } }, { surfaceOp: "append", sourceEventSeqs: [2] }),
+    record(4, "compaction/start", { compactionId: id, turn: null }),
+    record(5, "compaction/summary", { compactionId: id, summary: "秘密摘要", shadowedRange: { start: 0, end: 0 }, shadowedSeqs: [0], route: { provider: "p", model: "m" } }),
+    record(6, "user/message", { id: "summary", role: "user", source: { kind: "compact", compactionId: id }, content: [{ type: "text", text: "秘密摘要" }] }, { surfaceOp: { op: "replace", start: 0, end: 0 }, sourceEventSeqs: [0, 5] }),
+    record(7, "compaction/end", { compactionId: id, turn: null, status: "succeeded" }),
+    record(8, "tool/result", { turn: 1, step: 1, message: { id: "r", role: "user", source: { kind: "tool", callId: "x" }, content: [{ type: "tool-result", toolCallId: "x", isError: false, content: [{ type: "text", text: "替换正文" }] }] } }, { surfaceOp: { op: "replace", start: 3, end: 3 }, sourceEventSeqs: [3] }),
+  ];
+  const replay = new Session({ sessionId: "a", createdAt: 0 }, {
+    seed: { kind: "restore", inheritedEventCount: 0, events: frames.map(({ event }) => event) },
+  });
+  expect(replay.deriveMessages().map(({ id }) => id)).toEqual(["summary", "m", "r"]);
+  const expectOriginalHistory = () => {
+    expect(container.querySelector("article.user").textContent).toBe("你你好");
+    expect(container.querySelectorAll("article.user")).toHaveLength(1);
+    expect(container.querySelectorAll("article.assistant")).toHaveLength(1);
+    expect(container.textContent).toContain("原始回答");
+    expect(container.textContent).not.toContain("秘密摘要");
+    expect(container.textContent).not.toContain("替换正文");
+    expect(container.textContent).not.toContain("正在生成");
+    expect(container.textContent.match(/mock_read/g)).toHaveLength(1);
+  };
+  await sendFrame(connections[0], snapshot("a", frames.slice(0, 4)));
+  for (const frame of frames.slice(4)) await sendFrame(connections[0], frame);
+  expectOriginalHistory();
+  await click(button("会话 2"));
+  await click(button("会话 1"));
+  await sendFrame(connections[2], snapshot("a", frames));
+  expectOriginalHistory();
+});
 for (const eventFirst of [true, false]) test(`受理${eventFirst ? "事件" : "HTTP"}先到只显示一条用户消息`, async () => {
   await sendFrame(connections[0], snapshot("a"));
   let resolve;
@@ -695,4 +991,379 @@ test("只有受理事件的活动 Turn 快照保持忙碌并接收首步", async
   await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "start", attemptId: "a1", revision: 1, turn: 1, step: 1 } });
   await sendFrame(connections[0], { type: "assistant-stream", frame: { type: "chunk", attemptId: "a1", revision: 2, index: 0, chunk: { type: "text", delta: "开始" } } });
   expect(container.textContent.split("等待")).toHaveLength(2); expect(container.textContent).toContain("开始"); expect(connections).toHaveLength(1);
+});
+
+function sharedCompactionFixture() {
+  const session = new Session({ sessionId: "a", createdAt: 0 });
+  const frames = [];
+  const add = input => { const event = session.append(input); frames.push({ type: "event", event }); return event; };
+  add({ type: "turn/start", data: { turn: 1 } });
+  const original = add({ type: "user/message", data: { id: "original", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [{ type: "text", text: "原文" }] }, surfaceOp: "append" });
+  add({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  const start = (commandId, compactionId) => {
+    add({ type: "command/run", data: { commandId, name: "compact", source: { kind: "user" } } });
+    add({ type: "compaction/start", data: { compactionId, sourceCommandId: commandId, turn: null } });
+  };
+  const finish = (commandId, compactionId, summary, sourceSeq, done = true) => {
+    const summaryEvent = add({ type: "compaction/summary", data: { compactionId, sourceCommandId: commandId, summary, shadowedRange: { start: sourceSeq, end: sourceSeq }, shadowedSeqs: [sourceSeq], route: { provider: "p", model: "m" } } });
+    const checkpoint = add({ type: "user/message", data: { id: `checkpoint-${commandId}`, role: "user", source: { kind: "compact", compactionId }, sourceCommandId: commandId, content: [{ type: "text", text: summary }] }, surfaceOp: { op: "replace", start: sourceSeq, end: sourceSeq }, sourceEventSeqs: [sourceSeq, summaryEvent.seq] });
+    add({ type: "compaction/end", data: { compactionId, sourceCommandId: commandId, turn: null, status: "succeeded" } });
+    if (done) add({ type: "command/done", data: { commandId, kind: "success", sourceEventSeq: summaryEvent.seq } });
+    return checkpoint.seq;
+  };
+  return { session, frames, add, start, finish, original: original.seq };
+}
+const sharedCards = page => [...page.querySelectorAll("article")].filter(card => card.textContent.includes("/compact"));
+
+for (const lateResponse of [false, true]) test(`连续提交后旧 C1 ${lateResponse ? "HTTP 响应迟到" : "start 迟到"}不冒充 C2 活动`, async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
+    let release;
+    fetch.mockImplementationOnce((_url, options) => {
+      const id = JSON.parse(options.body).compactionId;
+      const response = { status: 200, json: async () => ({ compactionId: id, commandId: "c1", status: "succeeded" }) };
+      return lateResponse ? new Promise(resolve => { release = () => resolve(response); }) : Promise.resolve(response);
+    });
+    if (lateResponse) vi.useFakeTimers();
+    await enter("/compact");
+    await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const id1 = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+    if (lateResponse) { await act(async () => { await vi.advanceTimersByTimeAsync(5000); }); vi.useRealTimers(); }
+    else await flush();
+    fetch.mockImplementationOnce(() => new Promise(() => {}));
+    await enter("/compact");
+    await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const id2 = JSON.parse(fetch.mock.calls[1][1].body).compactionId;
+    const { frames, add, start } = sharedCompactionFixture();
+    start("c1", id1);
+    for (const frame of frames) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    if (lateResponse) await act(async () => { release(); });
+    expect(container.querySelector("header").textContent).toContain("正在提交压缩");
+    expect(container.querySelector("header").textContent).not.toContain("压缩进行中");
+    const before = frames.length;
+    add({ type: "compaction/end", data: { compactionId: id1, sourceCommandId: "c1", turn: null, status: "succeeded" } });
+    add({ type: "command/done", data: { commandId: "c1", kind: "success" } });
+    start("c2", id2);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) expect(page.querySelector("header").textContent).toContain("压缩进行中");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  } finally { vi.useRealTimers(); await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+test("连续多个已确认终态各自抑制迟到开始", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "cmd", status: "succeeded" }) }));
+  await enter("/compact"); await submit();
+  await enter("/compact"); await submit();
+  const [first, second] = fetch.mock.calls.map(([, options]) => JSON.parse(options.body).compactionId);
+  fetch.mockImplementationOnce(() => new Promise(() => {}));
+  await enter("/compact");
+  await act(async () => { container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+  const third = JSON.parse(fetch.mock.calls[2][1].body).compactionId;
+  const { frames, add, start } = sharedCompactionFixture();
+  start("c1", first);
+  for (const frame of frames) await sendFrame(connections[0], frame);
+  expect(container.querySelector("header").textContent).not.toContain("压缩进行中");
+  let before = frames.length;
+  add({ type: "compaction/end", data: { compactionId: first, sourceCommandId: "c1", turn: null, status: "succeeded" } });
+  add({ type: "command/done", data: { commandId: "c1", kind: "success" } });
+  start("c2", second);
+  for (const frame of frames.slice(before)) await sendFrame(connections[0], frame);
+  expect(container.querySelector("header").textContent).not.toContain("压缩进行中");
+  before = frames.length;
+  add({ type: "compaction/end", data: { compactionId: second, sourceCommandId: "c2", turn: null, status: "succeeded" } });
+  add({ type: "command/done", data: { commandId: "c2", kind: "success" } });
+  start("c3", third);
+  for (const frame of frames.slice(before)) await sendFrame(connections[0], frame);
+  expect(container.querySelector("header").textContent).toContain("压缩进行中");
+  expect(fetch).toHaveBeenCalledTimes(3);
+});
+
+test("已确认压缩身份只影响所属会话", async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "cmd", status: "succeeded" }) }));
+  await enter("/compact"); await submit();
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await click(button("会话 2"));
+  const { frames, start } = sharedCompactionFixture();
+  start("other-session-command", id);
+  await sendFrame(connections[1], snapshot("b", frames));
+  expect(container.querySelector("header").textContent).toContain("压缩进行中");
+});
+
+test("HTTP 已确认的 C1 迟到 start 不显示活动，另一页 C2 开始仍显示", async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
+    fetch.mockImplementationOnce(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "c1", status: "succeeded" }) }));
+    await enter("/compact"); await submit();
+    const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+    const { frames, start, finish, original } = sharedCompactionFixture();
+    start("c1", id);
+    for (const frame of frames) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    expect(container.querySelector("header").textContent).toContain("已压缩");
+    expect(container.querySelector("header").textContent).not.toContain("压缩进行中");
+    let before = frames.length;
+    const checkpoint = finish("c1", id, "摘要一", original);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    expect(container.querySelector("header").textContent).not.toContain("压缩进行中");
+    fetch.mockImplementationOnce(() => new Promise(() => {}));
+    const textarea = other.querySelector("textarea");
+    await act(async () => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "/compact"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { other.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const id2 = JSON.parse(fetch.mock.calls[1][1].body).compactionId;
+    before = frames.length;
+    start("c2", id2);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) expect(page.querySelector("header").textContent).toContain("压缩进行中");
+    before = frames.length;
+    finish("c2", id2, "摘要二", checkpoint);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) expect(page.querySelector("header").textContent).not.toContain("压缩进行中");
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+test("本地 C1 已完成后另一页 C2 运行仍显示活动状态", async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
+    fetch.mockImplementationOnce(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "c1", status: "succeeded" }) }));
+    await enter("/compact"); await submit();
+    const c1 = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+    const { frames, start, finish, original } = sharedCompactionFixture();
+    start("c1", c1);
+    const checkpoint = finish("c1", c1, "摘要一", original);
+    for (const frame of frames) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    expect(container.textContent).toContain("已压缩");
+    fetch.mockImplementationOnce(() => new Promise(() => {}));
+    const textarea = other.querySelector("textarea");
+    await act(async () => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "/compact"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { other.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const c2 = JSON.parse(fetch.mock.calls[1][1].body).compactionId;
+    let before = frames.length;
+    start("c2", c2);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) {
+      expect(page.querySelector("header").textContent).toContain("压缩进行中");
+      expect(sharedCards(page)[1].textContent).toContain("执行中");
+    }
+    before = frames.length;
+    finish("c2", c2, "摘要二", checkpoint);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) expect(page.querySelector("header").textContent).not.toContain("压缩进行中");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+for (const status of [400, 409]) test(`活动压缩期间保留本页 HTTP ${status} 拒绝和活动提示`, async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    const id = "2dfe7336-a43e-4fcb-9530-1880d94588ce";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+    const { frames, start } = sharedCompactionFixture();
+    start("c1", id);
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a", frames));
+    fetch.mockResolvedValue({ status, json: async () => ({ commandId: status === 400 ? null : "busy", result: { kind: "error", text: "明确拒绝" } }) });
+    await enter("/compact"); await submit();
+    const header = container.querySelector("header").textContent;
+    expect(header).toContain("明确拒绝");
+    expect(header.split("压缩进行中")).toHaveLength(2);
+    expect(other.querySelector("header").textContent.split("压缩进行中")).toHaveLength(2);
+    expect(other.textContent).not.toContain("明确拒绝");
+  } finally { vi.restoreAllMocks(); await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+test("两个独立页面按同一 Session 记录显示独立共享命令卡", async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    const { session, frames, add, start, finish, original } = sharedCompactionFixture();
+    start("c1", "cp1");
+    add({ type: "command/run", data: { commandId: "c2", name: "compact", source: { kind: "user" } } });
+    add({ type: "command/done", data: { commandId: "c2", kind: "error", text: "助手忙碌" } });
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a", frames));
+    for (const page of [container, other]) {
+      const cards = sharedCards(page);
+      expect(cards[0].textContent).toContain("执行中");
+      expect(cards[1].textContent).toContain("助手忙碌");
+    }
+    const before = frames.length;
+    finish("c1", "cp1", "摘要一", original);
+    const replay = new Session({ sessionId: "a", createdAt: 0 }, { seed: { kind: "restore", inheritedEventCount: 0, events: session.snapshot().events } });
+    expect(replay.snapshot().events).toEqual(session.snapshot().events);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) {
+      const cards = sharedCards(page);
+      expect(cards).toHaveLength(2);
+      expect(cards[0].textContent).toContain("摘要一");
+      expect(cards[0].querySelector("details summary").textContent).toBe("查看摘要");
+      expect(cards[1].textContent).toContain("助手忙碌");
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+for (const outcome of ["success", "no-range"]) test(`两页保留 C1 并在重连后重放 C2 ${outcome}`, async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    const { session, frames, add, start, finish, original } = sharedCompactionFixture();
+    start("c1", "cp1");
+    const checkpoint = finish("c1", "cp1", "摘要一", original);
+    if (outcome === "success") start("c2", "cp2");
+    else add({ type: "command/run", data: { commandId: "c2", name: "compact", source: { kind: "user" } } });
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a", frames));
+    for (const page of [container, other]) {
+      const cards = sharedCards(page);
+      expect(cards).toHaveLength(2);
+      expect(cards[0].textContent).toContain("摘要一");
+      expect(cards[1].textContent).toContain("执行中");
+    }
+    const before = frames.length;
+    if (outcome === "success") {
+      finish("c2", "cp2", "摘要二", checkpoint);
+    } else {
+      add({ type: "command/done", data: { commandId: "c2", kind: "success", text: "No compactable history yet." } });
+    }
+    const replay = new Session({ sessionId: "a", createdAt: 0 }, { seed: { kind: "restore", inheritedEventCount: 0, events: session.snapshot().events } });
+    expect(replay.snapshot().events).toEqual(session.snapshot().events);
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    const verify = page => {
+      const cards = sharedCards(page);
+      expect(cards).toHaveLength(2);
+      expect(cards[0].textContent).toContain("摘要一");
+      expect(cards[1].textContent).toContain(outcome === "success" ? "摘要二" : "No compactable history yet.");
+    };
+    for (const page of [container, other]) verify(page);
+    await act(async () => { connections[0].onerror(); connections[1].onerror(); });
+    for (const page of [container, other]) verify(page);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    expect(connections).toHaveLength(4);
+    for (const connection of connections.slice(2)) await sendFrame(connection, snapshot("a", frames));
+    for (const page of [container, other]) verify(page);
+    expect(fetch).not.toHaveBeenCalled();
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+for (const [status, text] of [[400, "请求无效"], [413, "正文过大"], [415, "媒体类型无效"]]) test(`两页中仅发起页显示 HTTP ${status} 入口拒绝`, async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
+    fetch.mockResolvedValue({ status, json: async () => ({ commandId: null, result: { kind: "error", text } }) });
+    const textarea = other.querySelector("textarea");
+    await act(async () => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "/compact"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { other.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); }); await flush();
+    expect(other.textContent).toContain(text);
+    expect(container.textContent).not.toContain(text);
+    for (const page of [container, other]) expect(page.querySelectorAll("article")).toHaveLength(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+test("两页观察 C2 运行时 C1 迟到 done 不覆盖当前状态", async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
+    const { frames, add, start, finish, original } = sharedCompactionFixture();
+    start("c1", "cp1");
+    finish("c1", "cp1", "摘要一", original, false);
+    const summarySeq = frames.find(frame => frame.event.type === "compaction/summary").event.seq;
+    start("c2", "cp2");
+    add({ type: "command/done", data: { commandId: "c1", kind: "success", sourceEventSeq: summarySeq } });
+    for (const frame of frames) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) {
+      expect(page.textContent).toContain("压缩进行中");
+      expect(page.textContent).not.toContain("压缩命令已完成");
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+test("两页即时结算共享卡且其他命令不结束本地等待", async () => {
+  const other = document.createElement("div"); document.body.append(other);
+  const otherRoot = createRoot(other);
+  await act(async () => otherRoot.render(<App />));
+  try {
+    await sendFrame(connections[0], snapshot("a"));
+    await sendFrame(connections[1], snapshot("a"));
+    fetch.mockImplementation(() => new Promise(() => {}));
+    await enter("/compact");
+    await act(async () => container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+    const { frames, add, start, finish, original } = sharedCompactionFixture();
+    add({ type: "command/run", data: { commandId: "other", name: "compact", source: { kind: "user" } } });
+    add({ type: "command/done", data: { commandId: "other", kind: "error", text: "另一命令忙碌" } });
+    const before = frames.length;
+    start("mine", id);
+    finish("mine", id, "即时摘要", original);
+    for (const frame of frames.slice(0, before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    expect(container.textContent).toContain("正在提交压缩");
+    for (const frame of frames.slice(before)) for (const connection of connections.slice(0, 2)) await sendFrame(connection, frame);
+    for (const page of [container, other]) {
+      const cards = sharedCards(page);
+      expect(cards).toHaveLength(2);
+      expect(cards[0].textContent).toContain("另一命令忙碌");
+      expect(cards[1].textContent).toContain("即时摘要");
+      expect(cards[1].textContent).toContain("已完成");
+    }
+    expect(container.textContent).not.toContain("正在提交压缩");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally { await act(async () => otherRoot.unmount()); other.remove(); }
+});
+
+for (const status of ["succeeded", "failed", "cancelled", "run-only"]) test(`继承命令缺 done 显示 ${status} 的可靠事实`, async () => {
+  const parent = new Session({ sessionId: "parent", createdAt: 0 });
+  parent.append({ type: "turn/start", data: { turn: 1 } });
+  const original = parent.append({ type: "user/message", data: { id: "original", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [{ type: "text", text: "原文" }] }, surfaceOp: "append" });
+  parent.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  parent.append({ type: "command/run", data: { commandId: "old", name: "compact", source: { kind: "user" } } });
+  if (status !== "run-only") {
+    parent.append({ type: "compaction/start", data: { compactionId: "cp", sourceCommandId: "old", turn: null } });
+    if (status === "succeeded") {
+      const summary = parent.append({ type: "compaction/summary", data: { compactionId: "cp", sourceCommandId: "old", summary: "继承摘要", shadowedRange: { start: original.seq, end: original.seq }, shadowedSeqs: [original.seq], route: { provider: "p", model: "m" } } });
+      parent.append({ type: "user/message", data: { id: "checkpoint", role: "user", source: { kind: "compact", compactionId: "cp" }, sourceCommandId: "old", content: [{ type: "text", text: "继承摘要" }] }, surfaceOp: { op: "replace", start: original.seq, end: original.seq }, sourceEventSeqs: [original.seq, summary.seq] });
+    }
+    parent.append({ type: "compaction/end", data: { compactionId: "cp", sourceCommandId: "old", turn: null, status, ...(status === "succeeded" ? {} : { reason: "stopped" }) } });
+  }
+  const child = new Session({ sessionId: "a", createdAt: 1, isSeeded: true, parentSession: "parent" }, { seed: { kind: "fork", events: parent.snapshot().events } });
+  const frames = child.snapshot().events.map(event => ({ type: "event", event }));
+  await sendFrame(connections[0], { ...snapshot("a", frames), inheritedEventCount: child.inheritedEventCount });
+  const card = [...container.querySelectorAll("article")].find(node => node.textContent.includes("/compact"));
+  expect(card.textContent).toContain({ succeeded: "已压缩", failed: "压缩失败", cancelled: "压缩已取消", "run-only": "结果未记录" }[status]);
+  if (status === "succeeded") expect(card.textContent).toContain("继承摘要");
+  expect(container.textContent).not.toContain("压缩进行中");
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+for (const kind of ["error", "success"]) test(`关联 start 后 command/done(${kind}) 即时结束本地等待`, async () => {
+  await sendFrame(connections[0], snapshot("a"));
+  fetch.mockImplementation(() => new Promise(() => {}));
+  await enter("/compact");
+  await act(async () => container.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  const id = JSON.parse(fetch.mock.calls[0][1].body).compactionId;
+  await sendFrame(connections[0], record(0, "command/run", { commandId: "other", name: "compact", source: { kind: "user" } }));
+  await sendFrame(connections[0], record(1, "command/done", { commandId: "other", kind: "success", text: "No compactable history yet." }));
+  expect(container.textContent).toContain("正在提交压缩");
+  await sendFrame(connections[0], record(2, "command/run", { commandId: "mine", name: "compact", source: { kind: "user" } }));
+  await sendFrame(connections[0], record(3, "compaction/start", { compactionId: id, sourceCommandId: "mine", turn: null }));
+  await sendFrame(connections[0], record(4, "command/done", { commandId: "mine", kind, text: kind === "error" ? "命令失败" : "命令完成" }));
+  expect(container.textContent).not.toContain("正在提交压缩");
+  expect(container.textContent).not.toContain("压缩进行中");
+  expect(container.textContent).toContain(kind === "error" ? "压缩命令失败" : "压缩命令已完成");
+  expect(container.textContent).not.toContain("已压缩");
 });

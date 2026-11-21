@@ -14,15 +14,14 @@ test("模型信息默认值与显式请求归一为独立快照", () => {
   assert.throws(() => runtime.prepare({ provider: "mock", model: "m", params: { reasoningEffort: "invalid" } }), /reasoningEffort/);
 });
 
-test("可记录模式拒绝未显式覆盖的旧采样默认值，普通模式保留原行为", () => {
-  const runtime = new LlmRuntime({ mock: { ...createMockAdapter(() => []), defaultParams: { temperature: 0.7, stop: ["old"], maxOutputTokens: 128 } } });
+test("可记录模式要求显式覆盖旧温度默认值，普通模式仍继承温度", () => {
+  const runtime = new LlmRuntime({ mock: { ...createMockAdapter(() => []), defaultParams: { temperature: 0.7, maxOutputTokens: 128 } } });
   const base = { provider: "mock", model: "m" };
-  assert.deepEqual(runtime.prepare(base).effectiveParams, { temperature: 0.7, stop: ["old"], maxOutputTokens: 128 });
+  assert.deepEqual(runtime.prepare(base).effectiveParams, { temperature: 0.7, maxOutputTokens: 128 });
   assert.throws(() => runtime.prepare(base, { recordable: true }), /默认/);
-  assert.throws(() => runtime.prepare({ ...base, params: { temperature: 0 } }, { recordable: true }), /默认/);
   assert.throws(() => runtime.prepare({ ...base, params: { stop: [] } }, { recordable: true }), /默认/);
-  const prepared = runtime.prepare({ ...base, params: { temperature: 0, stop: [] } }, { recordable: true });
-  assert.deepEqual(prepared.effectiveParams, { temperature: 0, stop: [], maxOutputTokens: 128 });
+  const prepared = runtime.prepare({ ...base, params: { temperature: 0 } }, { recordable: true });
+  assert.deepEqual(prepared.effectiveParams, { temperature: 0, maxOutputTokens: 128 });
   assert.deepEqual(prepared.adapterDefaults, { maxTokens: 128 });
 });
 

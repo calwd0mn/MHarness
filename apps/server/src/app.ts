@@ -12,8 +12,9 @@ import {
   SqliteSessionPersistence,
   type SessionStore,
 } from "@mharness/session/server";
-import Fastify from "fastify";
+import Fastify, { type FastifyHttpOptions } from "fastify";
 import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
 import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
 import { AgentManager } from "./agent/manager.ts";
@@ -32,6 +33,32 @@ import { registerApprovalRoutes } from "./approval/routes.ts";
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
 
 const deepseekModel = "deepseek-v4-pro";
+
+function requestPath(target: string): string {
+  if (target.startsWith("/")) return target.split("?", 1)[0];
+  const scheme = /^https?:\/\//i.exec(target);
+  if (!scheme || target.includes("#")) return "";
+  try {
+    const parsed = new URL(target);
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.host) return "";
+    const start = target.indexOf("/", scheme[0].length);
+    const query = target.indexOf("?", scheme[0].length);
+    if (start < 0 || (query >= 0 && query < start)) return "/";
+    if (start === scheme[0].length || /[\\\s]/.test(target.slice(scheme[0].length, start))) return "";
+    // URL 校验 authority，但使用原始路径以保留转义和路由器的路径语义。
+    return target.slice(start).split("?", 1)[0];
+  } catch { return ""; }
+}
+
+function isCompactPath(pathname: string): boolean {
+  const segments = pathname.split("/");
+  const prefix = sessionsPath.split("/");
+  if (segments.length !== prefix.length + 2 || !segments[prefix.length]) return false;
+  try {
+    return prefix.every((part, index) => decodeURIComponent(segments[index]) === part)
+      && decodeURIComponent(segments[prefix.length + 1]) === "compact";
+  } catch { return false; }
+}
 
 function configuredBudget(name: string): number | undefined {
   const raw = process.env[name];
@@ -60,8 +87,22 @@ function configuredModel(): ModelConfig {
   } };
 }
 
-function createHttpApp(logger: boolean) {
-  const app = Fastify({ logger });
+function createHttpApp(logger: boolean, compactBoundary = false) {
+  const options: FastifyHttpOptions<Server> = { logger, ...(compactBoundary ? { frameworkErrors(error, request, reply) {
+    const pathname = requestPath(request.raw.url ?? "");
+    // URL 解码和参数长度错误发生在路由匹配之前，路由级错误处理器无法接收。
+    if ((error.code === "FST_ERR_BAD_URL" || error.code === "FST_ERR_MAX_PARAM_LENGTH") && request.method === "POST" && isCompactPath(pathname)) {
+      const body = JSON.stringify({ commandId: null, result: { kind: "error", text: "压缩请求无效" } });
+      reply.raw.writeHead(400, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+      reply.raw.end(body);
+      return;
+    }
+    const statusCode = error.statusCode ?? 500;
+    const body = JSON.stringify({ error: statusCode === 500 ? "Internal Server Error" : "Bad Request", ...(error.code === "FST_ERR_ASYNC_CONSTRAINT" ? {} : { code: error.code }), message: error.code === "FST_ERR_ASYNC_CONSTRAINT" ? "Unexpected error from async constraint" : error.message, statusCode });
+    reply.raw.writeHead(statusCode, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+    reply.raw.end(body);
+  } } : {}) };
+  const app = Fastify(options);
   app.get(`${localConfig.apiPrefix}${healthPath}`, async () =>
     healthResponseSchema.parse({ status: "ok" }),
   );
@@ -152,7 +193,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     await ownership.release();
     throw error;
   }
-  const app = createHttpApp(logger);
+  const app = createHttpApp(logger, true);
   const approvalService = options.approvalService ?? new ApprovalService();
   const driver = runTurn ?? createModelTurnDriver({
     toolRegistry: options.toolRegistry, approvalService,

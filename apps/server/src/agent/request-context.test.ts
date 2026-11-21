@@ -80,9 +80,9 @@ test("工具描述无效时不追加事件或改变准备器状态", () => {
   assert.equal(event.data.reason, "initial");
 });
 
-test("Turn 未覆盖旧采样默认值时拒绝且不追加头", () => {
+test("Turn 未覆盖旧温度默认值时拒绝且不追加头", () => {
   const s = session();
-  const runtime = new LlmRuntime({ mock: { ...createMockAdapter(() => []), defaultParams: { temperature: 0.5, stop: ["end"] } } });
+  const runtime = new LlmRuntime({ mock: { ...createMockAdapter(() => []), defaultParams: { temperature: 0.5 } } });
   const prepare = createRequestPreparer({ runtime, config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "" });
   assert.throws(() => prepare(s), /默认/);
   assert.equal(s.seq, 0);

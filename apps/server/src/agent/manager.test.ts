@@ -7,6 +7,52 @@ import { SqliteSessionPersistence } from "@mharness/session/server";
 import { AgentManager } from "./manager.ts";
 import { SessionCommandController } from "../commands.ts";
 
+test("维护任务保留返回值并与 prompt 共用准入", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-maintenance-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create({ sessionId: "s", createdAt: 1 });
+  await handle.flush(); await handle.close();
+  const manager = new AgentManager(store, async () => {});
+  let release: (() => void) | undefined;
+  try {
+    const agent = await manager.load("s");
+    const request = { requestId: "old", content: [{ type: "text" as const, text: "hello" }] };
+    agent.prompt(request);
+    await agent.waitForIdle();
+    const task: Promise<string> = agent.runMaintenance(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return "result";
+    });
+    assert.equal(agent.state, "maintenance");
+    assert.deepEqual(agent.prompt(request), { accepted: true });
+    assert.throws(() => agent.prompt({ ...request, requestId: "new" }), { code: "agent_busy" });
+    await assert.rejects(agent.runMaintenance(async () => {}), { code: "agent_busy" });
+    let idle = false;
+    const waiting = agent.waitForIdle().then(() => { idle = true; });
+    await Promise.resolve();
+    assert.equal(idle, false);
+    release?.();
+    assert.equal(await task, "result");
+    await waiting;
+    assert.equal(agent.state, "idle");
+    assert.equal(agent.session.snapshot().events.filter((event) => event.type === "user/message").length, 1);
+    const failure = new Error("maintenance");
+    await assert.rejects(agent.runMaintenance(async () => { throw failure; }), (error) => error === failure);
+    await agent.waitForIdle();
+    agent.blockStorage(failure);
+    assert.throws(() => agent.prompt({ ...request, requestId: "blocked" }), { code: "storage_blocked", cause: failure });
+    await assert.rejects(agent.runMaintenance(async () => {}), { code: "storage_blocked", cause: failure });
+    agent.beginStop();
+    assert.throws(() => agent.prompt({ ...request, requestId: "closed" }), { code: "agent_closed" });
+    await assert.rejects(agent.runMaintenance(async () => {}), { code: "agent_closed" });
+  } finally {
+    release?.();
+    await manager.close();
+    await store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("继承的用户编号不占用子会话的受理编号", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-inherited-"));
   const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));

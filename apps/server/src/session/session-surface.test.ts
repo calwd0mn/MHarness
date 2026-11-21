@@ -6,6 +6,22 @@ const header = { sessionId: "surface", createdAt: 1 };
 const user = (id: string) => ({ type: "user/message", surfaceOp: "append", data: { id, role: "user", source: { kind: "user" }, turn: 1, requestId: id, content: [{ type: "text", text: id }] } } as const);
 const replace = (start: number, end: number, sourceEventSeqs: number[]) => ({ type: "user/message", surfaceOp: { op: "replace", start, end }, sourceEventSeqs, data: { id: "summary", role: "user", source: { kind: "compact", compactionId: "c" }, content: [{ type: "text", text: "summary" }] } } as const);
 
+test("当前节点按 surface 顺序提供独立快照并支持重放", () => {
+ const session = new Session(header);
+ session.append(user("a")); session.append(user("b")); session.append(user("c"));
+ session.append(replace(0, 0, [0]));
+ const first = session.deriveSurfaceNodes();
+ const second = session.deriveSurfaceNodes();
+ assert.notEqual(first, second);
+ assert.deepEqual(first.map((node) => node.seq), [3, 1, 2]);
+ assert.deepEqual(session.deriveMessages().map((message) => message.id), ["summary", "b", "c"]);
+ const replay = new Session(header, { seed: { kind: "restore", events: session.snapshot().events, inheritedEventCount: 0 } });
+ assert.deepEqual(replay.deriveSurfaceNodes().map((node) => node.seq), [3, 1, 2]);
+ session.append(user("d"));
+ assert.deepEqual(first.map((node) => node.seq), [3, 1, 2]);
+ assert.deepEqual(session.deriveSurfaceNodes().map((node) => node.seq), [3, 1, 2, 4]);
+});
+
 test("surface 替换验证来源、保持原日志并可重放", () => {
  const s = new Session(header);
  s.append(user("a")); s.append(user("b")); s.append(user("c"));

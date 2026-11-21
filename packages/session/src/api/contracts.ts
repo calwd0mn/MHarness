@@ -1,4 +1,6 @@
 /** Session HTTP 与 SSE 的公开契约，可在浏览器中解析。 */
+export { compactRequestSchema, compactResponseSchema, compactErrorSchema, compactRejectionSchema } from "./compact.ts";
+export type { CompactRequest, CompactResponse, CompactError } from "./compact.ts";
 export { assistantChunkSchema, followFrameSchema } from "./follow.ts";
 export type { AssistantChunk, FollowFrame } from "./follow.ts";
 export {

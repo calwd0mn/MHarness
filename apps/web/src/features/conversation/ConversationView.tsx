@@ -4,7 +4,7 @@ import { ToolCard } from "./ToolCard.tsx";
 import { useLayoutEffect, useRef, useState } from "react";
 import { AssistantMarkdown } from "./AssistantMarkdown.tsx";
 import { Button } from "../../components/ui/Button.tsx";
-import { lastTurn } from "../../session/view.ts";
+import { commandCards, lastTurn } from "../../session/view.ts";
 import type { useConversation } from "../../session/use-conversation.ts";
 
 
@@ -57,7 +57,7 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
 }
 
 /** 显示所选会话和运行状态。 */
-export function ConversationHeader({ selected, sessions, state, cancel }: Pick<ReturnType<typeof useConversation>, "selected" | "sessions" | "state" | "cancel">) {
+export function ConversationHeader({ selected, sessions, state, cancel, compaction }: Pick<ReturnType<typeof useConversation>, "selected" | "sessions" | "state" | "cancel" | "compaction">) {
   return (
     <header className={"conversation-header " + styles["conversation-header"]}>
           <div>
@@ -76,6 +76,8 @@ export function ConversationHeader({ selected, sessions, state, cancel }: Pick<R
                 : "创建会话后即可发送消息"}
             </p>
           </div>
+          {compaction.label && <p role="status">{compaction.label}</p>}
+          {compaction.activityLabel && <p role="status">{compaction.activityLabel}</p>}
           {selected && <Button onClick={() => void cancel()}>取消任务</Button>}
         </header>
   );
@@ -154,8 +156,9 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
             <p className={"error " + styles["error"]}>执行错误：{state.agentError}</p>
           )}
           {[...visibleMessages.map((message) => ({ kind: "message" as const, order: message.order, message })),
+            ...(state.sessionId === selected ? commandCards(state) : []).map((card) => ({ kind: "command" as const, order: card.order, card })),
             ...(state.sessionId === selected ? projectTools(state.records) : []).map((tool) => ({ kind: "tool" as const, order: tool.order, tool }))]
-            .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} approvals={approvals} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
+            .sort((a, b) => a.order - b.order).map((entry) => entry.kind === "command" ? <article key={`${selected}:command:${entry.card.id}`}><strong>/{entry.card.name}{entry.card.args}</strong><p>{entry.card.result}</p>{entry.card.summary && <details><summary>查看摘要</summary><AssistantMarkdown text={entry.card.summary} /></details>}</article> : entry.kind === "tool" ? <ToolCard key={`${selected}:${entry.tool.key}`} tool={entry.tool} approvals={approvals} sessionId={selected ?? ""} enabled={state.sessionId === selected && state.status === "ready"} /> : (() => {
               const message = entry.message;
               if (message.role === "系统") return <p key={message.key} role="status">{message.text}</p>;
               return (
