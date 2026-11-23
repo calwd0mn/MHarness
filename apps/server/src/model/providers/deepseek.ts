@@ -56,19 +56,28 @@ function messageBody(message: ModelMessage, includeReasoning: boolean) {
 }
 
 /** DeepSeek 单次请求的连接配置；凭据不会进入可记录模型路由。 */
-export type DeepSeekOptions = Readonly<{ apiKey: string; fetch?: typeof fetch }>;
+export type DeepSeekOptions = Readonly<{ apiKey: string; baseUrl?: string; fetch?: typeof fetch }>;
 
 /**
  * 创建绑定连接凭据的 DeepSeek Chat Completions Adapter。
  * 不支持的显式结束原因在收到 DONE 后以 PROTOCOL 失败，不推断成功或调用方取消。
  * 每次生成至多发送一次请求；超时或取消会中止请求并释放本地 reader、计时器和监听器，
  * 不等待不合作的传输或取消回调完成。
- * @param options - 请求凭据与可选的受控传输，未提供时使用全局 fetch。
+ * @param options - 请求凭据、可选 API 基础地址及受控传输。基础地址缺省或为空时使用 DeepSeek 官方地址，
+ * 保留路径前缀并追加 /chat/completions；传输缺省时使用全局 fetch。
  * @returns 可注册到 Runtime 的单次请求 Adapter。
+ * @throws 基础地址不是 HTTP(S) URL，或包含用户信息、查询参数或片段时抛出 TypeError。
  */
 export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
   const apiKey = options.apiKey;
   const transport = options.fetch ?? globalThis.fetch;
+  const baseUrl = options.baseUrl?.trim() || "https://api.deepseek.com";
+  const endpoint = URL.parse(baseUrl);
+  if (!endpoint || !/^https?:\/\//i.test(baseUrl) || endpoint.username || endpoint.password || /[?#]/.test(baseUrl)) {
+    throw new TypeError("DeepSeek 基础地址必须是无用户信息、查询参数和片段的 HTTP(S) URL");
+  }
+  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/chat/completions`;
+  const requestUrl = endpoint.href;
   return {
     includesAssistantReasoning: includesReasoning,
     modelInfo: { defaultReasoningEffort: "none", supportedReasoningEfforts: ["none", "low", "high", "max"] },
@@ -121,7 +130,7 @@ export function createDeepSeekAdapter(options: DeepSeekOptions): ModelAdapter {
         checkBudget();
         let response: Response;
         try {
-          response = await wait(transport("https://api.deepseek.com/chat/completions", {
+          response = await wait(transport(requestUrl, {
             method: "POST", redirect: "error", signal: controller.signal,
             headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
             body: JSON.stringify({ model: request.route.model, stream: true,

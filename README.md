@@ -17,6 +17,8 @@ pnpm dev
 
 DeepSeek 单次生成只发送一次请求，不自动重试。鉴权、限流、传输、协议、提前断流、请求或空闲超时和调用方取消分别归类；明确的输入上下文超限使用 `CONTEXT_WINDOW_EXCEEDED`，输出达到上限仍为 `max-tokens`。请求超时累计到首个有效 SSE 事件，之后使用空闲超时；下游暂停不消耗等待预算。取消、超时或提前停止消费会中止请求并释放本地资源，不保证远端或不合作的取消回调已完成。
 
+可用 `MHARNESS_MODEL_NAME` 指定模型，用 `MHarness_BASE_URL` 指定 API 基础地址。未设置或留空时分别使用 `deepseek-v4-pro` 和 `https://api.deepseek.com`。基础地址支持 HTTP(S) 和路径前缀，例如 `https://gateway.example/v1` 会请求其 `/v1/chat/completions` 端点。基础地址不能包含用户信息、查询参数或片段。配置自定义地址时，`DEEPSEEK_API_KEY` 会发送给该地址。
+
 可选环境变量 `MHARNESS_MODEL_CONTEXT_WINDOW` 与 `MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS` 分别声明本地上下文窗口及默认输出预留，单位均为 token，须使用十进制正安全整数表示（允许前后空白和前导零）。缺少窗口，或既没有生效的生成上限也没有声明默认输出预留时，无法进行自动压力判断。它们不改变发送参数；`MHARNESS_MODEL_MAX_TOKENS` 仍控制实际显式输出上限。
 
 默认仍使用 Mock。要手动验证 DeepSeek，在 PowerShell 7 中配置凭据、临时数据库与低输出上限，然后启动后端：
@@ -29,6 +31,13 @@ $env:MHARNESS_SESSION_DB_PATH = Join-Path $env:TEMP ("mharness-deepseek-" + [gui
 pnpm --filter @mharness/server dev
 ```
 
+也可参考 `@.env.example` 在仓库根目录填写本地 `.env`，再显式加载它启动后端。
+
+```powershell
+$mharnessEnvFile = (Resolve-Path -LiteralPath '.env').Path
+pnpm --filter @mharness/server exec node "--env-file=$mharnessEnvFile" --import tsx src/index.ts
+```
+
 在另一个 PowerShell 7 窗口提交一次纯文本并查询历史：
 
 ```powershell
@@ -39,12 +48,12 @@ Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/message
 Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)" | ConvertTo-Json -Depth 30
 ```
 
-受理返回后可能需要稍后重新查询历史。预期看到 `request/header` 中的 `deepseek-v4-pro`、Assistant 正式回答及 `turn/end` 的 `completed`；`max-tokens` 表示输出上限截断。真实请求会使用相应 Provider 账户。自动测试使用受控传输，不访问外部账户；本次实现未执行真实密钥验证。
+受理返回后可能需要稍后重新查询历史。预期看到 `request/header` 中的实际模型名、Assistant 正式回答及 `turn/end` 的 `completed`。`max-tokens` 表示输出上限截断。真实请求会使用相应 Provider 账户，自动测试使用受控传输。
 
 可选配置 `MHARNESS_MODEL_REASONING_EFFORT` 为 `none`、`low`、`high` 或 `max`，以及 `MHARNESS_MODEL_TEMPERATURE`、`MHARNESS_MODEL_STOP`（JSON 字符串数组）。推理模式不接受显式温度。退出后端后，在原窗口清除模型配置和凭据即可恢复 Mock：
 
 ```powershell
-Remove-Item Env:MHARNESS_MODEL_PROVIDER, Env:DEEPSEEK_API_KEY, Env:MHARNESS_MODEL_MAX_TOKENS, Env:MHARNESS_MODEL_CONTEXT_WINDOW, Env:MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS, Env:MHARNESS_SESSION_DB_PATH -ErrorAction SilentlyContinue
+Remove-Item Env:MHARNESS_MODEL_PROVIDER, Env:MHARNESS_MODEL_NAME, Env:MHarness_BASE_URL, Env:DEEPSEEK_API_KEY, Env:MHARNESS_MODEL_MAX_TOKENS, Env:MHARNESS_MODEL_CONTEXT_WINDOW, Env:MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS, Env:MHARNESS_SESSION_DB_PATH -ErrorAction SilentlyContinue
 Remove-Item Env:MHARNESS_MODEL_REASONING_EFFORT, Env:MHARNESS_MODEL_TEMPERATURE, Env:MHARNESS_MODEL_STOP -ErrorAction SilentlyContinue
 pnpm --filter @mharness/server dev
 ```

@@ -34,7 +34,9 @@ import { registerApprovalRoutes } from "./approval/routes.ts";
 
 const sessionsPath = `${localConfig.apiPrefix}/sessions`;
 
-const deepseekModel = "deepseek-v4-pro";
+function configuredDeepSeekModel(): string {
+  return process.env.MHARNESS_MODEL_NAME?.trim() || "deepseek-v4-pro";
+}
 
 function requestPath(target: string): string {
   if (target.startsWith("/")) return target.split("?", 1)[0];
@@ -81,7 +83,7 @@ function configuredModel(): ModelConfig {
   const maxOutputTokens = number("MHARNESS_MODEL_MAX_TOKENS");
   const temperature = number("MHARNESS_MODEL_TEMPERATURE");
   const reasoningEffort = process.env.MHARNESS_MODEL_REASONING_EFFORT;
-  return { provider, model: deepseekModel, params: {
+  return { provider, model: configuredDeepSeekModel(), params: {
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
     ...(temperature === undefined ? {} : { temperature }),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
@@ -181,7 +183,7 @@ export function createApp(store: SessionStore, logger = false) {
  * 取得新版库的在线实例锁并组装会话创建和持久历史接口。应用开始服务前完成遗留会话修复。
  * @param path - 新版库路径，父目录必须存在。
  * @param logger - 是否启用 HTTP 日志，默认关闭。
- * @param runTurn - 可替换的 Turn 驱动，默认使用进程内模拟模型。
+ * @param runTurn - 可替换的 Turn 驱动。缺省时按环境配置选择模型，未配置 Provider 时使用进程内模拟模型。
  * @param options - 可注入工具注册表、共享审批服务和模型 HTTP 传输；默认提供 HTTP 审批渠道。
  * @returns 尚未开始监听的应用；完成 ready 或 listen 后，可通过 getDecorator("sessionCommands") 获取进程内命令；调用方须关闭应用以释放存储及实例锁。
  * @throws 实例锁冲突或存储格式不受支持时拒绝；后续修复失败会使应用启动失败。
@@ -207,10 +209,12 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     }), modelBudgets: { "test-model": { contextWindow: 100_000, defaultOutputTokens: 2_000 } } }, deepseek: () => {
       const apiKey = process.env.DEEPSEEK_API_KEY;
       if (!apiKey?.trim()) throw new TypeError("DEEPSEEK_API_KEY 必须配置");
+      const baseUrl = process.env.MHarness_BASE_URL;
       const contextWindow = configuredBudget("MHARNESS_MODEL_CONTEXT_WINDOW");
       const defaultOutputTokens = configuredBudget("MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS");
-      return { ...createDeepSeekAdapter({ apiKey, ...(options.modelFetch ? { fetch: options.modelFetch } : {}) }),
-        modelBudgets: { [deepseekModel]: { ...(contextWindow === undefined ? {} : { contextWindow }),
+      return { ...createDeepSeekAdapter({ apiKey, ...(baseUrl === undefined ? {} : { baseUrl }),
+        ...(options.modelFetch ? { fetch: options.modelFetch } : {}) }),
+        modelBudgets: { [configuredDeepSeekModel()]: { ...(contextWindow === undefined ? {} : { contextWindow }),
           ...(defaultOutputTokens === undefined ? {} : { defaultOutputTokens }) } } };
     } });
   const warnCompaction = (context: StepHookContext, entry: "pressure" | "context-overflow", reason: string) => {

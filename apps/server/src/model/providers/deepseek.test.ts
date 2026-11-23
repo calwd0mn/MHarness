@@ -108,6 +108,17 @@ test("推理模式请求携带历史推理、工具与生成配置", async () =>
   thinking: { type: "enabled" }, reasoning_effort: "high", max_tokens: 50, stop: ["END"] });
 });
 
+test("创建 DeepSeek Adapter 时拒绝无效或带额外信息的基础地址", () => {
+  for (const baseUrl of [
+    "gateway.example/v1", "ftp://gateway.example", "https://user:password@gateway.example",
+    "https://gateway.example/v1?key=test", "https://gateway.example/v1#section",
+  ]) {
+    assert.throws(() => createDeepSeekAdapter({ apiKey: "test", baseUrl }), {
+      name: "TypeError", message: "DeepSeek 基础地址必须是无用户信息、查询参数和片段的 HTTP(S) URL",
+    });
+  }
+});
+
 test("发网前拒绝 DeepSeek 不支持的采样、token 与停止序列", () => {
   let calls = 0;
   const transport: typeof fetch = async () => { calls++; throw new Error("不应发网"); };

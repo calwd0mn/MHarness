@@ -127,37 +127,53 @@ for (const cancelled of [false, true]) test(
   }
 });
 
-test("正式会话装配通过受控 DeepSeek 传输保存请求头与回答", async () => {
+for (const route of [
+  { name: "默认路由", modelName: undefined, baseUrl: undefined, model: "deepseek-v4-pro", url: "https://api.deepseek.com/chat/completions" },
+  { name: "环境变量自定义路由", modelName: " gateway/deepseek-r1 ", baseUrl: " https://gateway.example/v1/ ",
+    model: "gateway/deepseek-r1", url: "https://gateway.example/v1/chat/completions" },
+] as const) test(`正式 DeepSeek 会话装配使用${route.name}并保存请求头与回答`, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "mharness-deepseek-"));
-  const previousProvider = process.env.MHARNESS_MODEL_PROVIDER;
-  const previousKey = process.env.DEEPSEEK_API_KEY;
-  process.env.MHARNESS_MODEL_PROVIDER = "deepseek";
-  process.env.DEEPSEEK_API_KEY = "fake-assembly-key";
-  const requests: string[] = [];
-  const transport: typeof fetch = async (_url, init) => {
-    requests.push(new Headers(init?.headers).get("authorization") ?? "");
+  const settings = {
+    MHARNESS_MODEL_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "fake-assembly-key",
+    MHARNESS_MODEL_NAME: route.modelName, MHarness_BASE_URL: route.baseUrl,
+  };
+  const previous = Object.fromEntries(Object.keys(settings).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(settings)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+  t.after(async () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const requests: { url: string; model: unknown; authorization: string | null; redirect: RequestInit["redirect"] }[] = [];
+  const transport: typeof fetch = async (url, init) => {
+    const body: { model?: unknown } = JSON.parse(String(init?.body));
+    requests.push({ url: String(url), model: body.model, authorization: new Headers(init?.headers).get("authorization"), redirect: init?.redirect });
     return new Response('data: {"choices":[{"delta":{"content":"真实装配"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
   };
   const app = await createEventSessionApp(join(dir, "events.sqlite"), false, undefined, { modelFetch: transport });
   try {
     const created = await app.inject({ method: "POST", url: "/api/sessions" });
     const { sessionId } = created.json() as { sessionId: string };
-    await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "你好" }] } });
-    let history = "";
+    const accepted = await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "你好" }] } });
+    assert.equal(accepted.statusCode, 202);
+    let events: ReturnType<typeof rawSessionHistorySchema.parse>["records"][number]["event"][] = [];
     for (let i = 0; i < 100; i++) {
-      history = (await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` })).body;
-      if (history.includes('"type":"turn/end"')) break;
+      const history = await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` });
+      events = rawSessionHistorySchema.parse(history.json()).records.map(({ event }) => event);
+      if (events.at(-1)?.type === "turn/end") break;
       await setTimeout(10);
     }
-    assert.deepEqual(requests, ["Bearer fake-assembly-key"]);
-    assert.match(history, /deepseek-v4-pro/);
-    assert.match(history, /真实装配/);
-    assert.doesNotMatch(history, /fake-assembly-key/);
+    assert.deepEqual(requests, [{ url: route.url, model: route.model, authorization: "Bearer fake-assembly-key", redirect: "error" }]);
+    assert.equal(events.find((event) => event.type === "request/header")?.data.header.config.model, route.model);
+    assert.equal(events.find((event) => event.type === "assistant/message")?.data.message.source.model, route.model);
+    assert.deepEqual(events.at(-1)?.data, { turn: 1, reason: { kind: "completed" } });
+    assert.match(JSON.stringify(events), /真实装配/);
+    assert.doesNotMatch(JSON.stringify(events), /fake-assembly-key|gateway\.example/);
   } finally {
     await app.close();
-    if (previousProvider === undefined) delete process.env.MHARNESS_MODEL_PROVIDER; else process.env.MHARNESS_MODEL_PROVIDER = previousProvider;
-    if (previousKey === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = previousKey;
-    await rm(dir, { recursive: true, force: true });
   }
 });
 
