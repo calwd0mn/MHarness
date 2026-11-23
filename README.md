@@ -13,6 +13,32 @@ pnpm dev
 
 `pnpm typecheck` 检查全部工作区包的 TypeScript 类型。
 
+## 原型闭环验收
+
+在仓库根目录用 PowerShell 7 执行。服务端和 Web 联验会创建临时 SQLite 数据库，模型默认使用模拟 Adapter。
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm --filter @mharness/server test
+pnpm --filter @mharness/web test
+pnpm --filter @mharness/web build
+openspec validate agent-harness-prototype --strict
+```
+
+2026-11-23 以 `main` 的 `4ce28fe` 为基线完成回归验收。服务端与 Session 600 项、Web 176 项通过，类型检查、Web 构建和 OpenSpec 严格校验通过。Web 构建有两条来自 Zod 依赖的 Rollup 注解警告。
+
+| OpenSpec 项 | 验收结果与复现位置 |
+| --- | --- |
+| 1.15 | SQLite 重开逐条还原混存的旧分片和统一内容块，正式消息与工具配对可重建模型历史。追加、替换、分支、写入权、检查点失败及关闭回归随服务端测试执行。见 `@apps/server/src/agent/model-replay.test.ts` 和 `@apps/server/src/session/session-writer.test.ts`。 |
+| 8.4 | 三个压缩入口的持久化、取消和预算，以及分支、重启修复和前端恢复已有联合验收。见 `@docs/superpowers/plans/2026-11-23-task-8.4-fork-recovery-first-slice.md:50`。 |
+| 7.1、7.2 | 真实页面与模拟 MCP 验收审批、超时、拒绝、取消、响应丢失、检查点失败和重启。核对页面、持久历史、模型请求和工具效果。见 `@apps/web/src/mcp-turn-acceptance.test.jsx` 和 `@apps/server/src/fault-crash-acceptance.test.ts`。 |
+| 7.4–7.6 | 切回会话补齐草稿并只结算一次，丢失结束帧后可取消审批且下一轮保留工具配对，工具批次处理完毕后按结束意向结算。见 `@apps/web/src/app.test.jsx`、`@apps/web/src/approval-cancel-live.test.jsx` 和 `@apps/web/src/conclude-turn-live.test.jsx`。 |
+| 7.7、7.9 | 真实 follow 验证续答帧顺序及结算引用。Web 测试覆盖乱序交接、跨 Step 调用号复用、切换会话与重连竞态。见 `@apps/web/src/mcp-turn-acceptance.test.jsx`、`@apps/web/src/app.test.jsx` 和 `@apps/web/src/session/follow-controller.test.js`。 |
+| 7.8 | 同一会话验证按需加载、审批及取消收尾时的忙碌拒绝和跨轮复用。关闭期间拒绝新任务，等待活动退出后释放写入权，重新取得写入权后可读取两轮完整历史。启动修复没有加载 Agent。见 `@apps/server/src/session/routes-acceptance.test.ts` 和 `@apps/server/src/event-session-app.test.ts`。 |
+
+2026-11-23 完成 7.3 的真实 DeepSeek 验证。用隔离 SQLite 库向官方接口提交一条短文本，后端返回 `202 {"accepted":true}`。关闭后端并重开数据库后，读到一条 `request/header`（`deepseek/deepseek-flash`）、Assistant 正式回答「你好」和 `turn/end` 的 `completed` 终态。此次真实验证覆盖该模型的一轮纯文本问答，工具、压缩和故障场景采用表中的自动化用例。复现步骤见下一节。受控传输用例见 `@apps/server/src/deepseek-assembly.test.ts:130`。
+
 ## DeepSeek 最小验证
 
 DeepSeek 单次生成只发送一次请求，不自动重试。鉴权、限流、传输、协议、提前断流、请求或空闲超时和调用方取消分别归类；明确的输入上下文超限使用 `CONTEXT_WINDOW_EXCEEDED`，输出达到上限仍为 `max-tokens`。请求超时累计到首个有效 SSE 事件，之后使用空闲超时；下游暂停不消耗等待预算。取消、超时或提前停止消费会中止请求并释放本地资源，不保证远端或不合作的取消回调已完成。
@@ -43,7 +69,7 @@ pnpm --filter @mharness/server exec node "--env-file=$mharnessEnvFile" --import 
 ```powershell
 $api = 'http://127.0.0.1:3000/api'
 $session = Invoke-RestMethod -Method Post -Uri "$api/sessions" -ContentType 'application/json' -Body '{}'
-$body = @{ requestId = [guid]::NewGuid().ToString(); content = @(@{ type = 'text'; text = '请用一句话打招呼。' }) } | ConvertTo-Json -Depth 5
+$body = @{ requestId = [guid]::NewGuid().ToString(); content = @(@{ type = 'text'; text = '请只回复两个字：你好' }) } | ConvertTo-Json -Depth 5
 Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/messages" -ContentType 'application/json' -Body $body
 Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)" | ConvertTo-Json -Depth 30
 ```
@@ -114,7 +140,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。默认模型为模拟 Adapter；可按 DeepSeek 最小验证说明显式启用真实 Provider。会话压缩按 OpenSpec 后续任务交付。
+- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。默认模型为模拟 Adapter，可按 DeepSeek 最小验证说明显式启用真实 Provider。手动压缩可在空闲会话中通过 `/compact` 发起。
 
 ## 审批答复接口
 

@@ -15,6 +15,84 @@ import { AgentManager } from "./manager.ts";
 import { createModelTurnDriver } from "./model-turn.ts";
 import { rebuildRequestContext } from "./request-context.ts";
 
+test("同一 SQLite 会话混存旧分片和统一内容块，重开后按正式消息重建模型历史", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mixed-stream-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "sessions.sqlite");
+  const legacyStream = [
+    { chunks: [{ time: 1, chunk: { type: "text", delta: "先" } }, { time: 3, chunk: { type: "text", delta: "查询" } }] },
+    { time: 5, chunk: { type: "tool_call", index: 0, callId: "legacy-call", name: "lookup", argumentsDelta: '{"n":1}' } },
+    { time: 8, chunk: { type: "finish", reason: { kind: "tool_calls" } } },
+  ] as const;
+  const route = { provider: "mock", model: "m" };
+  const session = new Session({ sessionId: "mixed", createdAt: 1 });
+  session.append({ type: "turn/start", data: { turn: 1 } });
+  session.append({ type: "user/message", surfaceOp: "append", data: {
+    turn: 1, requestId: "old", id: "old-user", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "旧问题" }],
+  } });
+  session.append({ type: "step/start", data: { turn: 1, step: 1 } });
+  session.append({ type: "assistant/message", surfaceOp: "append", data: {
+    turn: 1, step: 1, stream: legacyStream, finishReason: { kind: "tool_calls" }, includeInModelContext: true,
+    message: { id: "old-assistant", role: "assistant", source: route, content: [
+      { type: "text", text: "先查询" }, { type: "tool-call", id: "legacy-call", name: "lookup", arguments: '{"n":1}' },
+    ] },
+  } });
+  const call = session.append({ type: "tool/call", data: { turn: 1, step: 1, callId: "legacy-call", name: "lookup", arguments: '{"n":1}' } });
+  session.append({ type: "tool/result", surfaceOp: "append", sourceEventSeqs: [call.seq], data: {
+    turn: 1, step: 1, message: {
+      id: "old-result", role: "user", source: { kind: "tool", callId: "legacy-call" },
+      content: [{ type: "tool-result", toolCallId: "legacy-call", isError: false, content: [{ type: "text", text: "查询结果" }] }],
+    },
+  } });
+  session.append({ type: "step/end", data: { turn: 1, step: 1 } });
+  session.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  const runtime = new LlmRuntime({ mock: createMockAdapter(() => [
+    { chunk: { type: "text", delta: "新回答" } },
+    { chunk: { type: "finish", reason: { kind: "stop" } } },
+  ]) });
+  const drive = createModelTurnDriver({ runtime, config: () => route, systemPrompt: () => "" });
+  const store = new SqliteSessionPersistence(path);
+  let expectedEvents: ReturnType<Session["snapshot"]>["events"];
+  const manager = new AgentManager(store, drive);
+  try {
+    const writer = await store.create(session.header);
+    await writer.append(session.snapshot().events);
+    await writer.close();
+    await new SessionCommandController(manager).prompt({
+      sessionId: session.header.sessionId, requestId: "new", content: [{ type: "text", text: "新问题" }],
+    });
+    const agent = manager.get(session.header.sessionId);
+    assert.ok(agent);
+    await agent.waitForIdle();
+    expectedEvents = agent.session.snapshot().events;
+  } finally {
+    try { await manager.close(); } finally { await store.close(); }
+  }
+
+  const reopened = new SqliteSessionPersistence(path, { readOnly: true });
+  try {
+    const reader = await reopened.open(session.header.sessionId, "read");
+    assert.ok(reader);
+    const events = await reader.read();
+    assert.deepEqual(events, expectedEvents);
+    const settlements = events.filter((event) => event.type === "assistant/message");
+    assert.equal(settlements.length, 2);
+    assert.deepEqual(settlements[0]?.data.stream, legacyStream);
+    assert.ok(settlements[1]?.data.stream.some((entry) =>
+      entry !== null && typeof entry === "object" && "chunk" in entry &&
+      typeof entry.chunk === "object" && entry.chunk !== null && "type" in entry.chunk && entry.chunk.type === "block-start"));
+    const restored = new Session(reader.header, { seed: { kind: "restore", events, inheritedEventCount: 0 } });
+    assert.deepEqual(rebuildRequestContext(restored).input.messages, [
+      { role: "user", text: "旧问题" },
+      { role: "assistant", text: "先查询", toolCalls: [{ callId: "legacy-call", name: "lookup", arguments: '{"n":1}' }] },
+      { role: "tool", callId: "legacy-call", text: JSON.stringify([{ type: "text", text: "查询结果" }]) },
+      { role: "user", text: "新问题" },
+      { role: "assistant", text: "新回答" },
+    ]);
+    await reader.close();
+  } finally { await reopened.close(); }
+});
+
 test("SQLite 重开后按每个结算前缀重建真实请求", async () => {
   const dir = await mkdtemp(join(tmpdir(), "model-replay-"));
   const path = join(dir, "sessions.sqlite");

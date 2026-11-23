@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import Fastify from "fastify";
+import { z } from "zod";
 import { SqliteSessionPersistence } from "@mharness/session/server";
 import { AgentManager } from "../agent/manager.ts";
+import { ApprovalService } from "../approval/service.ts";
 import { LlmRuntime } from "../model/runtime.ts";
 import { ReActAgent } from "../agent/react-agent.ts";
 import { createEventSessionApp } from "../app.ts";
@@ -13,6 +15,8 @@ import { injectCompactionSqliteFault } from "./compaction-settlement-sqlite-fixt
 import { compactResponseSchema, rawSessionHistorySchema } from "@mharness/session/contracts";
 import { Session } from "@mharness/session/server";
 import { SessionCommandController } from "../commands.ts";
+import { defineLocalTool, ToolRegistry } from "../tools/registry.ts";
+import { defineLocalToolOutput } from "../tools/result.ts";
 import { registerSessionRoutes } from "./routes.ts";
 
 test("维护任务占用期间会话取消传递信号并等待任务退出", { timeout: 8000 }, async () => {
@@ -448,6 +452,151 @@ function deferred() {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 }
+
+test("同一会话按需加载并跨轮复用，关闭等待活动退出后释放写入权", { timeout: 12_000 }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "session-lifecycle-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  const load = t.mock.method(AgentManager.prototype, "load");
+  const asking = deferred();
+  const toolStarted = deferred();
+  const toolCancelled = deferred();
+  const releaseTool = deferred();
+  const secondStarted = deferred();
+  const secondCancelled = deferred();
+  const releaseSecond = deferred();
+  let approvalId: string | undefined;
+  const approvals = new ApprovalService((asked) => {
+    approvalId = asked.data.id;
+    asking.resolve();
+    return new Promise(() => {});
+  });
+  const registry = new ToolRegistry();
+  const input = z.strictObject({});
+  registry.register(defineLocalTool<typeof input, Promise<number>>({
+    name: "write", version: "1", description: "write", input,
+    sideEffect: "side-effect", approvalPolicy: "ask", cancellationGuarantee: "cooperative-exit", timeoutMs: 15_000,
+    output: defineLocalToolOutput({ schema: z.number(), render: (_args, value) => [{ type: "text", text: String(value) }] }),
+    async handler(_args, signal) {
+      signal.addEventListener("abort", toolCancelled.resolve, { once: true });
+      toolStarted.resolve();
+      await releaseTool.promise;
+      return 7;
+    },
+  }));
+  const { createModelTurnDriver } = await import("../agent/model-turn.ts");
+  const { createMockAdapter } = await import("../model/providers/mock.ts");
+  const drive = createModelTurnDriver({
+    runtime: new LlmRuntime({ mock: createMockAdapter(() => [
+      { chunk: { type: "tool_call", index: 0, callId: "write", name: "write", argumentsDelta: "{}" } },
+      { chunk: { type: "finish", reason: { kind: "tool_calls" } } },
+    ]) }),
+    config: () => ({ provider: "mock", model: "m" }),
+    systemPrompt: () => "",
+    toolRegistry: registry,
+    approvalService: approvals,
+    async preStep({ turn, signal }) {
+      if (turn !== 2) return;
+      signal.addEventListener("abort", secondCancelled.resolve, { once: true });
+      secondStarted.resolve();
+      await releaseSecond.promise;
+    },
+  });
+  const app = await createEventSessionApp(path, false, drive, { approvalService: approvals });
+  const follow = new AbortController();
+  let closing: Promise<unknown> | undefined;
+  try {
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const created = await app.inject({ method: "POST", url: "/api/sessions" });
+    assert.equal(created.statusCode, 201);
+    const { sessionId } = created.json<{ sessionId: string }>();
+    const url = `/api/sessions/${sessionId}`;
+    const request = (requestId: string) => ({ requestId, content: [{ type: "text" as const, text: requestId }] });
+    const prompt = (requestId: string) => app.inject({ method: "POST", url: `${url}/messages`, payload: request(requestId) });
+    const cancel = () => app.inject({ method: "POST", url: `${url}/cancel` });
+    const history = async () => rawSessionHistorySchema.parse((await app.inject({ method: "GET", url })).json()).records.map(({ event }) => event);
+
+    assert.deepEqual(await history(), []);
+    const subscription = await followReader(origin, url, follow.signal);
+    assert.deepEqual(await subscription.next(), {
+      type: "snapshot", sessionId, inheritedEventCount: 0, cursor: -1, records: [], assistantStream: { revision: 0 },
+    });
+    await subscription.reader.cancel();
+    const unmounted = await cancel();
+    assert.equal(unmounted.statusCode, 404);
+    assert.deepEqual(unmounted.json(), { code: "session/not-found" });
+    assert.equal(load.mock.callCount(), 0);
+
+    const first = await prompt("first");
+    assert.equal(first.statusCode, 202);
+    assert.deepEqual(first.json(), { accepted: true });
+    assert.equal(load.mock.callCount(), 1);
+    const agent = await load.mock.calls[0]?.result;
+    assert.ok(agent);
+    await asking.promise;
+    assert.ok(approvalId);
+    const waiting = await prompt("while-approval");
+    assert.equal(waiting.statusCode, 409);
+    assert.deepEqual(waiting.json(), { code: "agent_busy" });
+    const allowed = await app.inject({
+      method: "POST", url: `${url}/approvals/${approvalId}/decision`, payload: { outcome: "allowed-once" },
+    });
+    assert.equal(allowed.statusCode, 200);
+    await toolStarted.promise;
+    const cancelled = await cancel();
+    assert.equal(cancelled.statusCode, 202);
+    assert.deepEqual(cancelled.json(), { accept: true });
+    await toolCancelled.promise;
+    const settling = await prompt("while-cancelling");
+    assert.equal(settling.statusCode, 409);
+    assert.deepEqual(settling.json(), { code: "agent_busy" });
+    releaseTool.resolve();
+    await agent.waitForIdle();
+    const idle = await cancel();
+    assert.equal(idle.statusCode, 202);
+    assert.deepEqual(idle.json(), { accept: true });
+    const firstHistory = agent.session.snapshot().events;
+
+    const second = await prompt("second");
+    assert.equal(second.statusCode, 202);
+    assert.deepEqual(second.json(), { accepted: true });
+    assert.equal(await load.mock.calls.at(-1)?.result, agent);
+    await secondStarted.promise;
+    assert.deepEqual(agent.session.snapshot().events.slice(0, firstHistory.length), firstHistory);
+
+    const commands = app.getDecorator<SessionCommandController>("sessionCommands");
+    let closed = false;
+    closing = app.close().then(() => { closed = true; });
+    void closing.catch(() => {});
+    await secondCancelled.promise;
+    await assert.rejects(commands.prompt({ sessionId, ...request("while-closing") }), { code: "agent_closed" });
+    const storage = new SqliteSessionPersistence(path);
+    try {
+      await assert.rejects(storage.open(sessionId, "write"), { name: "OwnershipConflictError" });
+      assert.equal(closed, false);
+      releaseSecond.resolve();
+      await closing;
+      await assert.rejects(commands.cancel(sessionId), { code: "session/not-found" });
+      const handle = await storage.open(sessionId, "write");
+      assert.ok(handle);
+      const events = await handle.read();
+      assert.deepEqual(events, agent.session.snapshot().events);
+      assert.deepEqual(events.slice(0, firstHistory.length), firstHistory);
+      assert.deepEqual(events.flatMap((event) =>
+        event.type === "user/message" && "requestId" in event.data ? [event.data.requestId] : []), ["first", "second"]);
+      assert.deepEqual(events.filter((event) => event.type === "turn/end").map((event) => event.data), [
+        { turn: 1, reason: { kind: "aborted", reason: "user" } },
+        { turn: 2, reason: { kind: "aborted", reason: "user" } },
+      ]);
+      await handle.close();
+    } finally { await storage.close(); }
+  } finally {
+    follow.abort();
+    releaseTool.resolve();
+    releaseSecond.resolve();
+    await (closing ?? app.close());
+  }
+});
 
 const compactProviderResponse = (content = "简短摘要") => new Response(
   `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,

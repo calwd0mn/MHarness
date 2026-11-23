@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createSessionResponseSchema, rawSessionEventFrameSchema, rawSessionHistorySchema, type RawSessionEventFrame } from "@mharness/session/contracts";
 import { Session, SqliteSessionPersistence } from "@mharness/session/server";
+import { AgentManager } from "./agent/manager.ts";
 import { createEventSessionApp } from "./app.ts";
 import { makeCompactionRecoveryFixtures } from "../../../packages/session/src/compaction-recovery-fixtures.ts";
 
@@ -168,6 +169,7 @@ test("启动修复事务回滚后释放写入权，后续启动只修复一次",
 });
 
 test("新版 HTTP 创建提交空 header，启动修复后按原始事件读取", async (t) => {
+  const load = t.mock.method(AgentManager.prototype, "load");
   const dir = await mkdtemp(join(tmpdir(), "mharness-online-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, "events.sqlite");
@@ -182,12 +184,18 @@ test("新版 HTTP 创建提交空 header，启动修复后按原始事件读取"
 
   const app = await createEventSessionApp(path);
   try {
+    await app.ready();
+    assert.equal(load.mock.callCount(), 0);
     const history = await app.inject({ method: "GET", url: "/api/sessions/interrupted" });
     assert.equal(history.statusCode, 200);
     const recovered = rawSessionHistorySchema.parse(history.json());
     assert.equal(recovered.cursor, 1);
     assert.deepEqual(recovered.records[0]?.event, { type: "turn/start", seq: 0, time: 10, data: { turn: 1 } });
     assert.deepEqual(recovered.records[1]?.event.data, { turn: 1, reason: { kind: "interrupted" } });
+    const cancelled = await app.inject({ method: "POST", url: "/api/sessions/interrupted/cancel" });
+    assert.equal(cancelled.statusCode, 404);
+    assert.deepEqual(cancelled.json(), { code: "session/not-found" });
+    assert.equal(load.mock.callCount(), 0);
 
     const creation = await app.inject({ method: "POST", url: "/api/sessions" });
     assert.equal(creation.statusCode, 201);
