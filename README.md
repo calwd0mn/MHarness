@@ -7,7 +7,9 @@ pnpm install
 pnpm dev
 ```
 
-打开 `http://127.0.0.1:5173`，新建会话即可使用进程内模拟模型进行纯文本问答。页面支持会话切换、按会话取消、刷新恢复，以及发送结果未知时使用原编号重试。开发服务将 HTTP 和 SSE 的 `/api` 请求转发到 Fastify。
+打开 `http://127.0.0.1:5173`，新建会话即可开始问答。页面支持会话切换、按会话取消、刷新恢复，以及发送结果未知时使用原编号重试。开发服务将 HTTP 和 SSE 的 `/api` 请求转发到 Fastify。
+
+后端启动时会读取仓库根目录的 `.env`，已设置的进程环境变量优先。未指定模型 Provider 时使用 Mock。要在页面使用 DeepSeek，参照 `.env.example` 填写根目录的 `.env`，设置 `MHARNESS_MODEL_PROVIDER=deepseek` 和 `DEEPSEEK_API_KEY`，然后启动或重启 `pnpm dev`。
 
 在空闲会话中单独输入 `/compact` 可压缩旧上下文。命令使用维护接口，并在结果落盘后返回。摘要替换只影响后续模型上下文，原始聊天和工具记录仍可查看。可从同一会话取消压缩。关闭页面或断开订阅不会取消，重新连接后可从共享命令卡片查看结果。
 
@@ -47,7 +49,7 @@ DeepSeek 单次生成只发送一次请求，不自动重试。鉴权、限流�
 
 可选环境变量 `MHARNESS_MODEL_CONTEXT_WINDOW` 与 `MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS` 分别声明本地上下文窗口及默认输出预留，单位均为 token，须使用十进制正安全整数表示（允许前后空白和前导零）。缺少窗口，或既没有生效的生成上限也没有声明默认输出预留时，无法进行自动压力判断。它们不改变发送参数；`MHARNESS_MODEL_MAX_TOKENS` 仍控制实际显式输出上限。
 
-默认仍使用 Mock。要手动验证 DeepSeek，在 PowerShell 7 中配置凭据、临时数据库与低输出上限，然后启动后端：
+要用临时数据库和较低的输出上限手动验证 DeepSeek，可在 PowerShell 7 中设置进程环境变量并启动后端。
 
 ```powershell
 $env:MHARNESS_MODEL_PROVIDER = 'deepseek'
@@ -55,13 +57,6 @@ $env:DEEPSEEK_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'Deep
 $env:MHARNESS_MODEL_MAX_TOKENS = '64'
 $env:MHARNESS_SESSION_DB_PATH = Join-Path $env:TEMP ("mharness-deepseek-" + [guid]::NewGuid() + '.sqlite')
 pnpm --filter @mharness/server dev
-```
-
-也可参考 `@.env.example` 在仓库根目录填写本地 `.env`，再显式加载它启动后端。
-
-```powershell
-$mharnessEnvFile = (Resolve-Path -LiteralPath '.env').Path
-pnpm --filter @mharness/server exec node "--env-file=$mharnessEnvFile" --import tsx src/index.ts
 ```
 
 在另一个 PowerShell 7 窗口提交一次纯文本并查询历史：
@@ -76,11 +71,12 @@ Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)" | ConvertTo-Json -D
 
 受理返回后可能需要稍后重新查询历史。预期看到 `request/header` 中的实际模型名、Assistant 正式回答及 `turn/end` 的 `completed`。`max-tokens` 表示输出上限截断。真实请求会使用相应 Provider 账户，自动测试使用受控传输。
 
-可选配置 `MHARNESS_MODEL_REASONING_EFFORT` 为 `none`、`low`、`high` 或 `max`，以及 `MHARNESS_MODEL_TEMPERATURE`、`MHARNESS_MODEL_STOP`（JSON 字符串数组）。推理模式不接受显式温度。退出后端后，在原窗口清除模型配置和凭据即可恢复 Mock：
+可选配置 `MHARNESS_MODEL_REASONING_EFFORT` 为 `none`、`low`、`high` 或 `max`，以及 `MHARNESS_MODEL_TEMPERATURE`、`MHARNESS_MODEL_STOP`（JSON 字符串数组）。推理模式不接受显式温度。退出后端后，在原窗口清除临时配置，并将进程的 Provider 设为 `mock` 即可切回 Mock。
 
 ```powershell
-Remove-Item Env:MHARNESS_MODEL_PROVIDER, Env:MHARNESS_MODEL_NAME, Env:MHarness_BASE_URL, Env:DEEPSEEK_API_KEY, Env:MHARNESS_MODEL_MAX_TOKENS, Env:MHARNESS_MODEL_CONTEXT_WINDOW, Env:MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS, Env:MHARNESS_SESSION_DB_PATH -ErrorAction SilentlyContinue
+Remove-Item Env:MHARNESS_MODEL_NAME, Env:MHarness_BASE_URL, Env:DEEPSEEK_API_KEY, Env:MHARNESS_MODEL_MAX_TOKENS, Env:MHARNESS_MODEL_CONTEXT_WINDOW, Env:MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS, Env:MHARNESS_SESSION_DB_PATH -ErrorAction SilentlyContinue
 Remove-Item Env:MHARNESS_MODEL_REASONING_EFFORT, Env:MHARNESS_MODEL_TEMPERATURE, Env:MHARNESS_MODEL_STOP -ErrorAction SilentlyContinue
+$env:MHARNESS_MODEL_PROVIDER = 'mock'
 pnpm --filter @mharness/server dev
 ```
 
@@ -140,7 +136,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。默认模型为模拟 Adapter，可按 DeepSeek 最小验证说明显式启用真实 Provider。手动压缩可在空闲会话中通过 `/compact` 发起。
+- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。手动压缩可在空闲会话中通过 `/compact` 发起。
 
 ## 审批答复接口
 

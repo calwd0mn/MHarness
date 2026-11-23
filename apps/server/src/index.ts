@@ -1,5 +1,7 @@
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { localConfig } from "../../../config/local.ts";
 import { createEventSessionApp } from "./app.ts";
@@ -7,6 +9,10 @@ import { ToolRegistry } from "./tools/registry.ts";
 import { connectMcpTools } from "./tools/mcp.ts";
 
 const repository = fileURLToPath(new URL("../../../", import.meta.url));
+const envPath = resolve(repository, ".env");
+if (existsSync(envPath)) {
+  loadEnvFile(envPath);
+}
 const configuredPath = process.env[localConfig.sessionDatabasePathVariable];
 if (configuredPath !== undefined && !configuredPath.trim()) {
   throw new Error(`${localConfig.sessionDatabasePathVariable} 需要非空的新版数据库路径`);
