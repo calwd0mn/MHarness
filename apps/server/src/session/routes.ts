@@ -107,6 +107,7 @@ export function registerSessionRoutes(
     } catch (error: unknown) {
       if (!(error instanceof AgentError)) return reply.code(500).send({ code: "compaction_internal_error" });
       if (error.code === "session/not-found") return reply.code(404).send({ code: error.code });
+      if (error.code === "agent_busy") return reply.code(409).send({ code: error.code });
       if (error.code === "storage_blocked" || error.code === "agent_closed") return reply.code(503).send({ code: error.code });
       return reply.code(500).send({ code: "compaction_internal_error" });
     }

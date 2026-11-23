@@ -21,6 +21,7 @@ import { ToolRegistry, defineLocalTool } from "../tools/registry.ts";
 import { defineLocalToolOutput } from "../tools/result.ts";
 import { runToolBatch } from "../tools/batch.ts";
 import { ApprovalService } from "../approval/service.ts";
+import { injectCompactionSqliteFault } from "./compaction-settlement-sqlite-fixture.ts";
 
 function sessionWithResult() {
   const session = new Session({ sessionId: "s", createdAt: 1 });
@@ -270,7 +271,7 @@ test("多节点同批提交并保留调用关联；回滚和预取消不改变 s
   assert.equal(session.replaceGeneration, 2);
 });
 
-test("多块原结果按真实投影计量，修剪不重执工具或审批，重开保留原始事实", async () => {
+for (const outcome of ["failed", "cancelled", "rolled-back"] as const) test(`已提交修剪在摘要 ${outcome} 后保留，恢复不重执工具或审批`, async t => {
   const dir = await mkdtemp(join(tmpdir(), "prune-reopen-"));
   const path = join(dir, "db.sqlite");
   let store = new SqliteSessionPersistence(path);
@@ -302,21 +303,85 @@ test("多块原结果按真实投影计量，修剪不重执工具或审批，�
     const marker = after.events[before.events.length];
     assert.equal(marker?.type, "compaction/prune");
     if (marker?.type === "compaction/prune") assert.deepEqual(marker.data, { shadowedSeq: original.seq, beforeTokens: 3121 });
-    const messages = session.deriveMessages();
     const visible = session.deriveSurfaceNodes().find((node) => node.type === "tool/result"); assert.ok(visible);
     assert.deepEqual({ ...visible.data, message: { ...visible.data.message, content: [{ ...visible.data.message.content[0], content: [] }] } },
       { ...original.data, message: { ...original.data.message, content: [{ ...original.data.message.content[0], content: [] }] } });
     assert.equal(session.replaceGeneration, 1);
+    session.append({ type: "user/message", surfaceOp: "append", data: {
+      id: "tail", role: "user", source: { kind: "user" }, turn: 1, requestId: "tail",
+      content: [{ type: "text", text: "保留尾部" }],
+    } });
+    session.append({ type: "command/run", data: { commandId: "summary-command", name: "compact", source: { kind: "user" } } });
+    await session.flush();
+    const pruned = session.snapshot().events;
+    const prunedMessages = session.deriveMessages();
+    const agent = new ReActAgent(session, async () => assert.fail("恢复不执行 Turn"), handle);
+    const summary = new LlmRuntime({ mock: { async *generate() {
+      modelCalls++;
+      if (outcome === "failed") {
+        yield { type: "finish", reason: { kind: "error", failure: { code: "UNKNOWN", message: "模拟摘要失败" } } };
+        return;
+      }
+      if (outcome === "cancelled") {
+        agent.cancel();
+        yield { type: "finish", reason: { kind: "aborted" } };
+        return;
+      }
+      yield { type: "block-start", index: 0, blockType: "text" };
+      yield { type: "block-end", index: 0, block: { type: "text", text: "工具查询已完成" } };
+      yield { type: "finish", reason: { kind: "stop" } };
+    } } });
+    const fault = outcome === "rolled-back" ? injectCompactionSqliteFault(t, {
+      path, sessionId: session.header.sessionId, firstSeq: pruned.length + 1, compactionId: "summary", kind: "success", mode: "rolled-back",
+    }) : undefined;
+    try {
+      const result = await agent.runMaintenance(signal => agent.settleCompaction({
+        session, signal, turn: null, identity: { compactionId: "summary", sourceCommandId: "summary-command" },
+        storageOpen: () => agent.storageOpen, blockStorage: error => agent.blockStorage(error),
+      }, { runtime: summary, businessModel: summary.prepare({ provider: "mock", model: "m" }), businessTools: registry.definitions(), retainTokens: 0 }));
+      const observer = new SqliteSessionPersistence(path, { readOnly: true });
+      try {
+        const reader = await observer.open(session.header.sessionId, "read"); assert.ok(reader);
+        const persisted = await reader.read();
+        assert.deepEqual(persisted.slice(0, pruned.length), pruned);
+        const disk = new Session(session.header, { seed: { kind: "restore", events: persisted, inheritedEventCount: 0 } });
+        assert.deepEqual(disk.deriveMessages(), prunedMessages);
+        assert.equal(disk.replaceGeneration, 1);
+        if (outcome === "rolled-back") {
+          assert.equal(result.status, "unsettled");
+          assert.equal(result.source.status, "commit-checkpoint-failed");
+          assert.equal(agent.storageOpen, false);
+          assert.deepEqual(persisted.slice(pruned.length).map(event => event.type), ["compaction/start"]);
+          fault?.release();
+        } else {
+          assert.equal(result.status, "settled");
+          assert.equal(result.outcome, outcome);
+          assert.deepEqual(persisted.slice(pruned.length).map(event => event.type), ["compaction/start", "compaction/end"]);
+        }
+        await agent.recoverStorage();
+        const recovered = await reader.read();
+        assert.deepEqual(recovered.slice(0, pruned.length), pruned);
+        await agent.recoverStorage();
+        assert.deepEqual(await reader.read(), recovered);
+        if (fault) assert.equal(fault.targetCommits, 2);
+        await reader.close();
+      } finally { await observer.close(); }
+    } finally {
+      fault?.restore();
+      await agent.stop();
+    }
+    const settled = session.snapshot();
+    const messages = session.deriveMessages();
     await handle.close(); await store.close();
     store = new SqliteSessionPersistence(path);
     const reopened = await store.open("persisted", "read"); assert.ok(reopened);
     const records = await reopened.read();
     const restored = new Session(reopened.header, { seed: { kind: "restore", events: records, inheritedEventCount: 0 } });
-    assert.deepEqual(records, after.events);
+    assert.deepEqual(records, settled.events);
     assert.deepEqual(restored.deriveMessages(), messages);
-    assert.equal(restored.replaceGeneration, 1);
+    assert.equal(restored.replaceGeneration, outcome === "rolled-back" ? 2 : 1);
     assert.deepEqual(records[original.seq], original);
-    assert.deepEqual([executions, renders, approvals, modelCalls], [1, 1, 1, 0]);
+    assert.deepEqual([executions, renders, approvals, modelCalls], [1, 1, 1, 1]);
     await reopened.close();
   } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
 });

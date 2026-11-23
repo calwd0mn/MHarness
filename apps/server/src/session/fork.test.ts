@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { Session, type SessionHandle, type SessionHeader, type SessionPersistenceCreateOptions } from "@mharness/session/server";
 import { AgentManager } from "../agent/manager.ts";
 import type { AgentObservation } from "../agent/react-agent.ts";
@@ -371,4 +371,243 @@ test("SQLite 独立恢复比父持久历史更长的 seed 和嵌套谱系", asyn
     await storage.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+import { rawSessionHistorySchema } from "@mharness/session/contracts";
+import { createEventSessionApp } from "../app.ts";
+import { makeCompactionRecoveryFixtures } from "../../../../packages/session/src/compaction-recovery-fixtures.ts";
+
+function forkTestCleanups(t: TestContext, dir: string) {
+  const cleanups: Array<() => Promise<void>> = [() => rm(dir, { recursive: true, force: true })];
+  t.after(async () => {
+    const errors: unknown[] = [];
+    for (const cleanup of cleanups.reverse()) {
+      try {
+        await cleanup();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, "清理 fork 测试资源失败");
+  });
+  return cleanups;
+}
+
+test("成功压缩缺少命令终态时 fork 的子会话跨在线恢复与重开保持稳定", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-fork-compaction-"));
+  const cleanups = forkTestCleanups(t, dir);
+  const path = join(dir, "events.sqlite");
+  const fixture = makeCompactionRecoveryFixtures().settledWithoutDone.succeeded;
+  const storage = new SqliteSessionPersistence(path);
+  cleanups.push(() => storage.close());
+  const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  cleanups.push(() => observer.close());
+  let turns = 0;
+  const driver = async () => { turns++; assert.fail("恢复与 fork 不应执行 Turn"); };
+  const agents = new AgentManager(storage, driver);
+  cleanups.push(() => agents.close());
+  const writer = await storage.create(fixture.header);
+  await writer.append(fixture.events); await writer.close();
+  const parentReader = await observer.open(fixture.header.sessionId, "read"); assert.ok(parentReader);
+  const prefix = await parentReader.read();
+  assert.deepEqual(prefix, fixture.events);
+  assert.deepEqual(prefix.slice(7).map(event => [event.seq, event.type]), [[7, "command/run"], [8, "compaction/start"], [9, "compaction/summary"], [10, "user/message"], [11, "compaction/end"]]);
+  const summary = prefix[9]; const checkpoint = prefix[10]; const end = prefix[11];
+  assert.ok(summary?.type === "compaction/summary" && checkpoint?.type === "user/message" && end?.type === "compaction/end");
+  assert.equal(summary.data.compactionId, end.data.compactionId);
+  assert.equal(end.data.status, "succeeded");
+  assert.deepEqual(summary.data.shadowedRange, { start: 1, end: 1 });
+  assert.deepEqual(checkpoint.surfaceOp, { op: "replace", start: 1, end: 1 });
+  assert.deepEqual(checkpoint.sourceEventSeqs, [9, 1]);
+  assert.equal(prefix[1]?.type, "user/message");
+  assert.equal(prefix.filter(event => event.type === "command/done").length, 0);
+  assert.equal(agents.get(fixture.header.sessionId), undefined);
+  const { sessionId: childId } = await new SessionCommandController(agents).fork({ sessionId: fixture.header.sessionId });
+  const child = agents.get(childId); assert.ok(child);
+  assert.equal(child.session.header.parentSession, fixture.header.sessionId);
+  assert.equal(child.session.header.isSeeded, true);
+  assert.equal(child.session.inheritedEventCount, 12);
+  const expectedChildEvents: readonly Event[] = [
+    ...prefix,
+    { type: "session/end-seed", seq: 12, time: child.session.header.createdAt, data: { inherited: true } },
+  ];
+  assert.deepEqual(child.session.snapshot().events, expectedChildEvents);
+  assert.deepEqual(await parentReader.read(), prefix);
+  const childReader = await observer.open(childId, "read"); assert.ok(childReader);
+  assert.equal(childReader.inheritedEventCount, 12);
+  assert.deepEqual(await childReader.read(), expectedChildEvents);
+  const surface = child.session.deriveSurfaceNodes();
+  const assistant = prefix[4];
+  assert.ok(assistant?.type === "assistant/message");
+  const expectedMessages = [checkpoint.data, assistant.data.message];
+  assert.deepEqual(child.session.deriveMessages(), expectedMessages);
+  assert.deepEqual(surface.map(node => node.seq), [10, 4]);
+  assert.equal(child.session.replaceGeneration, 1);
+  for (let i = 0; i < 2; i++) {
+    await child.recoverStorage();
+    assert.deepEqual(child.session.snapshot().events, expectedChildEvents);
+    assert.deepEqual(await childReader.read(), expectedChildEvents);
+    assert.deepEqual(child.session.deriveMessages(), expectedMessages);
+  }
+  const parent = await agents.load(fixture.header.sessionId);
+  const parentEvents = parent.session.snapshot().events;
+  const done = parentEvents.filter(event => event.type === "command/done");
+  assert.equal(done.length, 1);
+  assert.equal(done[0]?.data.kind, "success");
+  assert.equal(done[0]?.data.sourceEventSeq, 9);
+  assert.deepEqual(await parentReader.read(), parentEvents);
+  assert.deepEqual(await childReader.read(), expectedChildEvents);
+  assert.deepEqual(child.session.deriveSurfaceNodes(), surface);
+  assert.deepEqual(child.session.deriveMessages(), expectedMessages);
+  await childReader.close(); await parentReader.close(); await observer.close();
+  await agents.close(); await storage.close();
+
+  const app = await createEventSessionApp(path, false, driver);
+  try {
+    await app.ready();
+    const response = await app.inject({ method: "GET", url: `/api/sessions/${childId}` });
+    assert.equal(response.statusCode, 200);
+    const history = rawSessionHistorySchema.parse(response.json());
+    assert.equal(history.inheritedEventCount, 12);
+    assert.deepEqual(history.records.map(record => record.event), expectedChildEvents);
+    const parentResponse = await app.inject({ method: "GET", url: `/api/sessions/${fixture.header.sessionId}` });
+    assert.equal(parentResponse.statusCode, 200);
+    assert.deepEqual(rawSessionHistorySchema.parse(parentResponse.json()).records.map(record => record.event), parentEvents);
+  } finally { await app.close(); }
+
+  const reopened = new SqliteSessionPersistence(path);
+  cleanups.push(() => reopened.close());
+  const after = new AgentManager(reopened, driver);
+  cleanups.push(() => after.close());
+  const recovered = await after.load(childId);
+  assert.deepEqual(recovered.session.header, child.session.header);
+  assert.equal(recovered.session.inheritedEventCount, 12);
+  assert.deepEqual(recovered.session.snapshot().events, expectedChildEvents);
+  assert.deepEqual(recovered.session.deriveSurfaceNodes(), surface);
+  assert.deepEqual(recovered.session.deriveMessages(), expectedMessages);
+  assert.equal(recovered.session.replaceGeneration, 1);
+  for (let i = 0; i < 2; i++) await recovered.recoverStorage();
+  const reader = await reopened.open(childId, "read"); assert.ok(reader);
+  try { assert.deepEqual(await reader.read(), expectedChildEvents); } finally { await reader.close(); }
+  assert.deepEqual(recovered.session.snapshot().events, expectedChildEvents);
+  assert.equal(turns, 0);
+});
+
+test("命令及压缩终态的 fork 边界在恢复和重开后稳定", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-fork-boundaries-"));
+  const cleanups = forkTestCleanups(t, dir);
+  const path = join(dir, "events.sqlite");
+  const fixtures = makeCompactionRecoveryFixtures();
+  const cases = [
+    { fixture: fixtures.roundGapRunOnly, cut: 10, atSeq: undefined, parentTail: [{ type: "command/done", data: { commandId: "G1", kind: "error", text: "进程中断" } }] },
+    { fixture: fixtures.crossTurnBusy, cut: 8, atSeq: 4, parentTail: [] },
+    { fixture: fixtures.independentInterrupted, cut: 8, atSeq: undefined, parentTail: [
+      { type: "compaction/end", data: { compactionId: "I1", turn: null, sourceCommandId: "I", status: "interrupted", reason: { kind: "process_interrupted" } } },
+      { type: "command/done", data: { commandId: "I", kind: "error", text: "进程中断" } },
+    ] },
+    { fixture: fixtures.settledWithoutDone.failed, cut: 10, atSeq: undefined, parentTail: [{ type: "command/done", data: { commandId: "K-failed", kind: "error", text: "压缩失败" } }] },
+    { fixture: fixtures.settledWithoutDone.cancelled, cut: 10, atSeq: undefined, parentTail: [{ type: "command/done", data: { commandId: "K-cancelled", kind: "error", text: "压缩已取消" } }] },
+  ] as const;
+  assert.deepEqual(fixtures.roundGapRunOnly.events.slice(7).map(event => ({ type: event.type, data: event.data })), [
+    { type: "command/run", data: { commandId: "G2", name: "compact", source: { kind: "user" } } },
+    { type: "command/done", data: { commandId: "G2", kind: "error", text: "busy" } },
+    { type: "command/run", data: { commandId: "G1", name: "compact", source: { kind: "user" } } },
+  ]);
+  assert.deepEqual(fixtures.crossTurnBusy.events.slice(6, 11).map(event => event.type), ["command/run", "turn/end", "turn/start", "user/message", "command/done"]);
+  assert.deepEqual(fixtures.crossTurnBusy.events[6]?.data, { commandId: "B", name: "compact", source: { kind: "user" } });
+  assert.deepEqual(fixtures.crossTurnBusy.events[10]?.data, { commandId: "B", kind: "error", text: "busy" });
+  assert.deepEqual(fixtures.independentInterrupted.events.slice(7).map(event => event.type), ["command/run", "compaction/start"]);
+  assert.deepEqual(fixtures.independentInterrupted.events[7]?.data, { commandId: "I", name: "compact", source: { kind: "user" } });
+  for (const status of ["failed", "cancelled"] as const) {
+    const events = fixtures.settledWithoutDone[status].events;
+    assert.deepEqual(events.slice(7).map(event => event.type), ["command/run", "compaction/start", "compaction/end"]);
+    assert.deepEqual(events[9]?.data, { compactionId: `K1-${status}`, sourceCommandId: `K-${status}`, turn: null, status, reason: { kind: status, message: `fixture ${status}` } });
+  }
+  const expectedMessages = [
+    { id: "user-1", role: "user", source: { kind: "user" }, turn: 1, requestId: "request-1", content: [{ type: "text", text: "用户请求 ".repeat(150) }] },
+    { id: "assistant-1", role: "assistant", source: { provider: "mock", model: "fixture" }, content: [{ type: "text", text: "助手回答 ".repeat(150) }] },
+  ];
+  let turns = 0;
+  const driver = async () => { turns++; assert.fail("恢复与 fork 不应执行 Turn"); };
+  const storage = new SqliteSessionPersistence(path);
+  cleanups.push(() => storage.close());
+  const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  cleanups.push(() => observer.close());
+  const agents = new AgentManager(storage, driver);
+  cleanups.push(() => agents.close());
+  const children: { id: string; parentId: string; inherited: number; expected: readonly Event[]; parentTail: readonly { type: string; data: object }[]; parentEvents: readonly Event[] }[] = [];
+  for (const { fixture, cut, atSeq, parentTail } of cases) {
+    const writer = await storage.create(fixture.header);
+    await writer.append(fixture.events); await writer.close();
+    const parentReader = await observer.open(fixture.header.sessionId, "read"); assert.ok(parentReader);
+    try {
+      assert.deepEqual(await parentReader.read(), fixture.events);
+      assert.equal(agents.get(fixture.header.sessionId), undefined);
+      const { sessionId: id } = await new SessionCommandController(agents).fork({ sessionId: fixture.header.sessionId, atSeq });
+      const child = agents.get(id); assert.ok(child);
+      assert.equal(child.session.header.parentSession, fixture.header.sessionId);
+      assert.equal(child.session.header.isSeeded, true);
+      assert.equal(child.session.inheritedEventCount, cut);
+      const expected: readonly Event[] = [...fixture.events.slice(0, cut), { type: "session/end-seed", seq: cut, time: child.session.header.createdAt, data: { inherited: true } }];
+      assert.deepEqual(child.session.snapshot().events, expected);
+      assert.deepEqual(child.session.deriveSurfaceNodes().map(node => node.seq), [1, 4]);
+      assert.deepEqual(child.session.deriveMessages(), expectedMessages);
+      assert.equal(child.session.replaceGeneration, 0);
+      const reader = await observer.open(id, "read"); assert.ok(reader);
+      try {
+        assert.equal(reader.inheritedEventCount, cut);
+        assert.deepEqual(await reader.read(), expected);
+        for (let i = 0; i < 2; i++) {
+          await child.recoverStorage();
+          assert.deepEqual(child.session.snapshot().events, expected);
+          assert.deepEqual(await reader.read(), expected);
+          assert.deepEqual(child.session.deriveMessages(), expectedMessages);
+        }
+        assert.deepEqual(await parentReader.read(), fixture.events);
+      } finally { await reader.close(); }
+      children.push({ id, parentId: fixture.header.sessionId, inherited: cut, expected, parentTail, parentEvents: fixture.events });
+    } finally { await parentReader.close(); }
+  }
+  await observer.close(); await agents.close(); await storage.close();
+
+  const app = await createEventSessionApp(path, false, driver);
+  try {
+    await app.ready();
+    for (const child of children) {
+      const response = await app.inject({ method: "GET", url: `/api/sessions/${child.id}` });
+      assert.equal(response.statusCode, 200);
+      const history = rawSessionHistorySchema.parse(response.json());
+      assert.equal(history.inheritedEventCount, child.inherited);
+      assert.deepEqual(history.records.map(record => record.event), child.expected);
+      const parentResponse = await app.inject({ method: "GET", url: `/api/sessions/${child.parentId}` });
+      assert.equal(parentResponse.statusCode, 200);
+      const parentEvents = rawSessionHistorySchema.parse(parentResponse.json()).records.map(record => record.event);
+      assert.deepEqual(parentEvents.slice(0, child.parentEvents.length), child.parentEvents);
+      assert.deepEqual(parentEvents.slice(child.parentEvents.length).map(({ type, data }) => ({ type, data })), child.parentTail);
+      assert.deepEqual(parentEvents.slice(child.parentEvents.length).map(event => event.seq), child.parentTail.map((_, index) => child.parentEvents.length + index));
+    }
+  } finally { await app.close(); }
+
+  const reopened = new SqliteSessionPersistence(path);
+  cleanups.push(() => reopened.close());
+  const after = new AgentManager(reopened, driver);
+  cleanups.push(() => after.close());
+  for (const child of children) {
+    const recovered = await after.load(child.id);
+    assert.equal(recovered.session.header.parentSession, child.parentId);
+    assert.equal(recovered.session.header.isSeeded, true);
+    assert.equal(recovered.session.inheritedEventCount, child.inherited);
+    assert.deepEqual(recovered.session.snapshot().events, child.expected);
+    assert.deepEqual(recovered.session.deriveSurfaceNodes().map(node => node.seq), [1, 4]);
+    assert.deepEqual(recovered.session.deriveMessages(), expectedMessages);
+    assert.equal(recovered.session.replaceGeneration, 0);
+    for (let i = 0; i < 2; i++) {
+      await recovered.recoverStorage();
+      assert.deepEqual(recovered.session.deriveMessages(), expectedMessages);
+    }
+    assert.deepEqual(recovered.session.snapshot().events, child.expected);
+    const reader: SessionHandle | undefined = await reopened.open(child.id, "read"); assert.ok(reader);
+    try { assert.deepEqual(await reader.read(), child.expected); } finally { await reader.close(); }
+  }
+  assert.equal(turns, 0);
 });

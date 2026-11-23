@@ -6,6 +6,12 @@ import { test } from "node:test";
 import Fastify from "fastify";
 import { SqliteSessionPersistence } from "@mharness/session/server";
 import { AgentManager } from "../agent/manager.ts";
+import { LlmRuntime } from "../model/runtime.ts";
+import { ReActAgent } from "../agent/react-agent.ts";
+import { createEventSessionApp } from "../app.ts";
+import { injectCompactionSqliteFault } from "./compaction-settlement-sqlite-fixture.ts";
+import { compactResponseSchema, rawSessionHistorySchema } from "@mharness/session/contracts";
+import { Session } from "@mharness/session/server";
 import { SessionCommandController } from "../commands.ts";
 import { registerSessionRoutes } from "./routes.ts";
 
@@ -404,6 +410,441 @@ async function followReader(origin: string, url: string, signal: AbortSignal) {
     }
   } };
 }
+
+const compactSessionId = "manual";
+const compactId = "34f5deaf-ba47-4d75-8724-f8a717c8ffb4";
+const busyCompactId = "ffaa3758-5851-4e40-a47a-d03477d0a6fe";
+const nextCompactId = "5db0b004-cbc8-4dfe-93b1-c2f7a155fb9f";
+const compactUrl = `/api/sessions/${compactSessionId}`;
+
+async function seedCompactHistory(path: string) {
+  const storage = new SqliteSessionPersistence(path);
+  const session = new Session({ sessionId: compactSessionId, createdAt: 1 });
+  for (const [id, text] of [["old", "旧内容".repeat(2000)], ["tail", "保留尾部"]] as const) {
+    session.append({ type: "user/message", surfaceOp: "append", data: {
+      id, role: "user", source: { kind: "user" }, turn: 1, requestId: id, content: [{ type: "text", text }],
+    } });
+  }
+  try {
+    const handle = await storage.create(session.header);
+    await handle.append(session.snapshot().events);
+    await handle.close();
+  } finally { await storage.close(); }
+}
+
+function configureCompactTransport(t: import("node:test").TestContext) {
+  const oldProvider = process.env.MHARNESS_MODEL_PROVIDER;
+  const oldKey = process.env.DEEPSEEK_API_KEY;
+  process.env.MHARNESS_MODEL_PROVIDER = "deepseek";
+  process.env.DEEPSEEK_API_KEY = "test-manual-key";
+  t.after(() => {
+    if (oldProvider === undefined) delete process.env.MHARNESS_MODEL_PROVIDER; else process.env.MHARNESS_MODEL_PROVIDER = oldProvider;
+    if (oldKey === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = oldKey;
+  });
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+const compactProviderResponse = (content = "简短摘要") => new Response(
+  `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+);
+
+for (const withPrefix of [true, false]) test(
+  withPrefix ? "手动零预算只摘要末尾完整工具组之前的前缀" : "末尾工具组退到开头时手动压缩不调用摘要模型",
+  async t => {
+    const dir = await mkdtemp(join(tmpdir(), "mharness-compact-tool-tail-"));
+    configureCompactTransport(t);
+    const previousWindow = process.env.MHARNESS_MODEL_CONTEXT_WINDOW;
+    process.env.MHARNESS_MODEL_CONTEXT_WINDOW = "100000";
+    t.after(async () => {
+      if (previousWindow === undefined) delete process.env.MHARNESS_MODEL_CONTEXT_WINDOW;
+      else process.env.MHARNESS_MODEL_CONTEXT_WINDOW = previousWindow;
+      await rm(dir, { recursive: true, force: true });
+    });
+    const path = join(dir, "events.sqlite");
+    const seed = new Session({ sessionId: compactSessionId, createdAt: 1 });
+    const oldText = "可压缩的旧历史".repeat(160);
+    const prefix = withPrefix ? seed.append({ type: "user/message", surfaceOp: "append", data: {
+      id: "old", role: "user", source: { kind: "user" }, turn: 1, requestId: "old", content: [{ type: "text", text: oldText }],
+    } }) : undefined;
+    const turn = 2, step = 1;
+    const callIds = ["first", "second"];
+    const oversizedResult = "x".repeat(8193);
+    seed.append({ type: "turn/start", data: { turn } });
+    seed.append({ type: "step/start", data: { turn, step } });
+    seed.append({ type: "assistant/message", surfaceOp: "append", data: {
+      turn, step, finishReason: { kind: "tool_calls" }, stream: [], includeInModelContext: true,
+      message: { id: "tool-declaration", role: "assistant", source: { provider: "deepseek", model: "deepseek-v4-pro" },
+        content: callIds.map(id => ({ type: "tool-call" as const, id, name: "read", arguments: "{}" })) },
+    } });
+    for (const callId of callIds) {
+      const call = seed.append({ type: "tool/call", data: { turn, step, callId, name: "read", arguments: "{}" } });
+      seed.append({ type: "tool/result", surfaceOp: "append", sourceEventSeqs: [call.seq], data: {
+        turn, step, message: { id: `result-${callId}`, role: "user", source: { kind: "tool", callId },
+          content: [{ type: "tool-result", toolCallId: callId, isError: false, content: [{ type: "text", text: callId === "first" ? oversizedResult : callId }] }] },
+      } });
+    }
+    seed.append({ type: "step/end", data: { turn, step } });
+    seed.append({ type: "turn/end", data: { turn, reason: { kind: "completed" } } });
+    const events = seed.snapshot().events;
+    const store = new SqliteSessionPersistence(path);
+    try {
+      const handle = await store.create(seed.header);
+      try { await handle.append(events); } finally { await handle.close(); }
+    } finally { await store.close(); }
+
+    const requests: { messages: unknown[] }[] = [];
+    const app = await createEventSessionApp(path, false, undefined, { modelFetch: async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)) as { messages: unknown[] });
+      return compactProviderResponse();
+    } });
+    try {
+      const response = await app.inject({ method: "POST", url: `${compactUrl}/compact`, payload: { compactionId: compactId } });
+      assert.equal(response.statusCode, 200);
+      const result = compactResponseSchema.parse(response.json());
+      const history = await app.inject({ method: "GET", url: compactUrl });
+      assert.equal(history.statusCode, 200);
+      const persisted = rawSessionHistorySchema.parse(history.json()).records.map(({ event }) => event);
+      if (!prefix) {
+        assert.equal(result.status, "no_safe_range");
+        assert.equal(requests.length, 0);
+        assert.deepEqual(persisted.slice(events.length).map(event => event.type), ["command/run", "command/done"]);
+        return;
+      }
+      assert.equal(result.status, "succeeded");
+      assert.deepEqual(requests.map(request => request.messages.slice(1)), [[{ role: "user", content: oldText }]]);
+      assert.equal(persisted.some(event => event.type === "compaction/prune"), false);
+      const summary = persisted.find(event => event.type === "compaction/summary");
+      assert.ok(summary);
+      assert.deepEqual(summary.data.shadowedSeqs, [prefix.seq]);
+      const restored = new Session(seed.header, { seed: { kind: "restore", events: persisted, inheritedEventCount: 0 } });
+      assert.deepEqual(restored.deriveSurfaceNodes().slice(1), seed.deriveSurfaceNodes().slice(1));
+    } finally {
+      await app.close();
+    }
+  },
+);
+
+test("生产压缩成功与忙碌拒绝按相同顺序持久化并交付两个 follow", { timeout: 12000 }, async t => {
+  configureCompactTransport(t);
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compact-live-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  await seedCompactHistory(path);
+  const entered = deferred();
+  const release = deferred();
+  const busyEntered = deferred();
+  const abort = new AbortController();
+  const leftConnection = new AbortController();
+  const bodies: unknown[] = [];
+  const recordBusy = ReActAgent.prototype.recordBusyCommand;
+  t.mock.method(ReActAgent.prototype, "recordBusyCommand", function (this: ReActAgent, ...args: Parameters<typeof recordBusy>) {
+    const pending = recordBusy.apply(this, args);
+    busyEntered.resolve();
+    return pending;
+  });
+  const app = await createEventSessionApp(path, false, undefined, { modelFetch: async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)) as unknown);
+    if (bodies.length === 1) {
+      entered.resolve();
+      await release.promise;
+      return compactProviderResponse("第一段较长的历史摘要。".repeat(12));
+    }
+    return compactProviderResponse();
+  } });
+  try {
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const [left, right] = await Promise.all([followReader(origin, compactUrl, leftConnection.signal), followReader(origin, compactUrl, abort.signal)]);
+    const initial = await left.next();
+    assert.equal(initial.type, "snapshot");
+    assert.deepEqual(await right.next(), initial);
+    const post = (compactionId: string) => app.inject({ method: "POST", url: `${compactUrl}/compact`, payload: { compactionId } });
+    const current = post(compactId).then(response => response);
+    await entered.promise;
+    const pendingBusy = post(busyCompactId).then(response => response);
+    await busyEntered.promise;
+    const during = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: compactUrl })).json()).records;
+    assert.deepEqual(during.slice(2).map(record => record.event.type), ["command/run", "compaction/start"]);
+    release.resolve();
+    const [done, busy] = await Promise.all([current, pendingBusy]);
+    assert.equal(done.statusCode, 200);
+    assert.equal(busy.statusCode, 409);
+    const result = compactResponseSchema.parse(done.json());
+    const rejected = busy.json<{ commandId: string; result: { kind: string; text: string } }>();
+    assert.equal(result.compactionId, compactId);
+    assert.equal(result.status, "succeeded");
+    assert.notEqual(result.commandId, rejected.commandId);
+    assert.equal(rejected.result.kind, "error");
+    assert.equal(bodies.length, 1);
+    assert.match(JSON.stringify(bodies[0]), /"thinking":\{"type":"disabled"\}/);
+    assert.doesNotMatch(JSON.stringify(bodies[0]), /保留尾部/);
+    const history = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: compactUrl })).json());
+    const events = history.records.slice(2);
+    assert.deepEqual(events.map(record => record.event.type), ["command/run", "compaction/start", "compaction/summary", "user/message", "compaction/end", "command/done", "command/run", "command/done"]);
+    const [run, start, summary, checkpoint, end, complete, rejectedRun, rejectedDone] = events.map(record => record.event);
+    assert.ok(run?.type === "command/run" && start?.type === "compaction/start" && summary?.type === "compaction/summary" &&
+      checkpoint?.type === "user/message" && end?.type === "compaction/end" && complete?.type === "command/done" &&
+      rejectedRun?.type === "command/run" && rejectedDone?.type === "command/done");
+    assert.equal(run.data.commandId, result.commandId);
+    assert.deepEqual(start.data, { compactionId: compactId, turn: null, sourceCommandId: result.commandId });
+    assert.equal(summary.data.sourceCommandId, result.commandId);
+    assert.ok("sourceCommandId" in checkpoint.data && checkpoint.data.sourceCommandId === result.commandId);
+    assert.equal(end.data.sourceCommandId, result.commandId);
+    assert.deepEqual(complete.data, { commandId: result.commandId, kind: "success", sourceEventSeq: summary.seq });
+    assert.equal(rejectedRun.data.commandId, rejected.commandId);
+    assert.deepEqual(rejectedDone.data, { commandId: rejected.commandId, ...rejected.result });
+    for (const record of events) {
+      assert.deepEqual(await left.next(), record);
+      assert.deepEqual(await right.next(), record);
+    }
+    leftConnection.abort();
+    const reconnect = await followReader(origin, compactUrl, abort.signal);
+    const replay = await reconnect.next();
+    assert.ok(replay.type === "snapshot");
+    assert.deepEqual(replay.records, history.records);
+    assert.equal(replay.cursor, history.cursor);
+    const duplicate = await post(compactId);
+    assert.equal(duplicate.statusCode, 409);
+    assert.deepEqual(duplicate.json(), { code: "compaction_id_conflict" });
+    assert.equal(bodies.length, 1);
+    const second = await post(nextCompactId);
+    assert.equal(second.statusCode, 200);
+    const nextResult = compactResponseSchema.parse(second.json());
+    assert.equal(nextResult.status, "succeeded");
+    assert.notEqual(nextResult.commandId, result.commandId);
+    assert.notEqual(nextResult.commandId, rejected.commandId);
+    const finalHistory = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: compactUrl })).json());
+    assert.deepEqual(finalHistory.records.slice(0, history.records.length), history.records);
+    const nextRecords = finalHistory.records.slice(history.records.length);
+    assert.deepEqual(nextRecords.map(record => record.event.type), ["command/run", "compaction/start", "compaction/summary", "user/message", "compaction/end", "command/done"]);
+    for (const record of nextRecords) {
+      assert.deepEqual(await reconnect.next(), record);
+      assert.deepEqual(await right.next(), record);
+    }
+    assert.equal(bodies.length, 2);
+  } finally {
+    release.resolve();
+    leftConnection.abort();
+    abort.abort();
+    const closing = app.close();
+    app.server.closeAllConnections();
+    await closing;
+  }
+});
+
+test("生产压缩完成后可从共享日志恢复丢失的 HTTP 响应", { timeout: 12000 }, async t => {
+  configureCompactTransport(t);
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compact-disconnect-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  await seedCompactHistory(path);
+  const entered = deferred();
+  const release = deferred();
+  const requester = new AbortController();
+  const observation = new AbortController();
+  let calls = 0;
+  const app = await createEventSessionApp(path, false, undefined, { modelFetch: async (_url, init) => {
+    calls++;
+    entered.resolve();
+    await release.promise;
+    assert.equal(init?.signal?.aborted, false);
+    return compactProviderResponse();
+  } });
+  try {
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const follower = await followReader(origin, compactUrl, observation.signal);
+    assert.equal((await follower.next()).type, "snapshot");
+    const request = fetch(`${origin}${compactUrl}/compact`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ compactionId: compactId }), signal: requester.signal,
+    });
+    const lost = assert.rejects(request, { name: "AbortError" });
+    await entered.promise;
+    requester.abort();
+    await lost;
+    release.resolve();
+    for (;;) {
+      const frame = await follower.next();
+      assert.equal(frame.type, "event");
+      if (frame.type === "event" && frame.event.type === "command/done") {
+        assert.equal(frame.event.data.kind, "success");
+        break;
+      }
+    }
+    const history = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: compactUrl })).json());
+    const reconnected = await followReader(origin, compactUrl, observation.signal);
+    const replay = await reconnected.next();
+    assert.ok(replay.type === "snapshot");
+    assert.deepEqual(replay.records, history.records);
+    assert.equal(history.records.filter(record => record.event.type === "compaction/end").length, 1);
+    assert.equal(calls, 1);
+  } finally {
+    release.resolve();
+    requester.abort();
+    observation.abort();
+    const closing = app.close();
+    app.server.closeAllConnections();
+    await closing;
+  }
+});
+
+test("关闭应用先取消仍在等待 Provider 的生产压缩请求", { timeout: 10000 }, async t => {
+  configureCompactTransport(t);
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compact-close-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  await seedCompactHistory(path);
+  const entered = deferred();
+  const abortObserved = deferred();
+  const release = deferred();
+  const app = await createEventSessionApp(path, false, undefined, { modelFetch: async (_url, init) => {
+    const signal = init?.signal;
+    assert.ok(signal);
+    signal.addEventListener("abort", abortObserved.resolve, { once: true });
+    entered.resolve();
+    await Promise.race([abortObserved.promise, release.promise]);
+    signal.throwIfAborted();
+    return compactProviderResponse();
+  } });
+  let closing: Promise<unknown> | undefined;
+  try {
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const request = fetch(`${origin}${compactUrl}/compact`, {
+      method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ compactionId: compactId }),
+    }).then(async response => ({ status: response.status, body: await response.json() }));
+    await entered.promise;
+    closing = app.close();
+    const { setTimeout } = await import("node:timers/promises");
+    assert.equal(await Promise.race([abortObserved.promise.then(() => true), setTimeout(750, false, { ref: false })]), true);
+    const result = await request;
+    assert.equal(result.status, 200);
+    assert.equal(compactResponseSchema.parse(result.body).status, "cancelled");
+    await closing;
+  } finally {
+    release.resolve();
+    await (closing ?? app.close());
+  }
+});
+
+for (const scenario of ["cancel", "failed", "input-overflow", "unknown"] as const) test(`生产压缩在 ${scenario} 时准确交接 HTTP 与持久记录`, { timeout: 12000 }, async t => {
+  configureCompactTransport(t);
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compact-outcome-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  await seedCompactHistory(path);
+  let calls = 0;
+  const entered = deferred();
+  const release = deferred();
+  const app = await createEventSessionApp(path, false, undefined, { modelFetch: async (_url, init) => {
+    calls++;
+    entered.resolve();
+    if (scenario === "cancel") {
+      const signal = init?.signal;
+      assert.ok(signal);
+      await Promise.race([release.promise, new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))]);
+      signal.throwIfAborted();
+    }
+    if (scenario === "failed") return new Response("private failure", { status: 502 });
+    if (scenario === "input-overflow") {
+      return new Response(JSON.stringify({ error: { code: "context_length_exceeded" } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    }
+    return compactProviderResponse();
+  } });
+  let live: ReActAgent | undefined;
+  const settle = ReActAgent.prototype.settleCompaction;
+  t.mock.method(ReActAgent.prototype, "settleCompaction", function (this: ReActAgent, ...args: Parameters<ReActAgent["settleCompaction"]>) {
+    live = this;
+    return settle.apply(this, args);
+  });
+  const fault = scenario === "unknown" ? injectCompactionSqliteFault(t, { path, sessionId: compactSessionId, compactionId: compactId, kind: "success", firstSeq: 4, mode: "committed" }) : undefined;
+  const read = async () => rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: compactUrl })).json()).records.map(record => record.event);
+  try {
+    const post = app.inject({ method: "POST", url: `${compactUrl}/compact`, payload: { compactionId: compactId } }).then(response => response);
+    await entered.promise;
+    if (scenario === "cancel") assert.equal((await app.inject({ method: "POST", url: `${compactUrl}/cancel` })).statusCode, 202);
+    const response = await post;
+    const before = await read();
+    if (scenario !== "unknown") {
+      const outcome = scenario === "cancel" ? "cancelled" : "failed";
+      assert.equal(response.statusCode, 200);
+      assert.equal(compactResponseSchema.parse(response.json()).status, outcome);
+      assert.deepEqual(before.slice(2).map(e => e.type), ["command/run", "compaction/start", "compaction/end", "command/done"]);
+      const end = before.at(-2);
+      assert.ok(end?.type === "compaction/end" && end.data.status === outcome);
+      if (scenario === "input-overflow") {
+        const done = before.at(-1);
+        assert.ok(done?.type === "command/done" && done.data.kind === "error");
+      }
+      assert.doesNotMatch(JSON.stringify(before), /private failure|context_length_exceeded/);
+    } else {
+      assert.equal(response.statusCode, 503);
+      assert.deepEqual(response.json(), { code: "storage_blocked" });
+      assert.equal(before.some(event => event.type === "command/done"), false);
+      assert.ok(fault && live);
+      assert.equal(live.storageOpen, false);
+      fault.release();
+      await live.recoverStorage();
+      const after = await read();
+      const summary = after.find(event => event.type === "compaction/summary");
+      const command = after.find(event => event.type === "command/run");
+      assert.ok(summary && command);
+      assert.deepEqual(after.slice(before.length).map(event => event.data), [{ commandId: command.data.commandId, kind: "success", sourceEventSeq: summary.seq }]);
+      await live.recoverStorage();
+      assert.deepEqual(await read(), after);
+    }
+    assert.equal(calls, 1);
+  } finally {
+    release.resolve();
+    fault?.restore();
+    await app.close();
+  }
+});
+
+for (const phase of ["prepare", "adapter"] as const) test(`手动压缩 ${phase} 原错不被命令终态写入错误覆盖`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compact-original-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  await seedCompactHistory(path);
+  const store = new SqliteSessionPersistence(path);
+  const manager = new AgentManager(store, async () => assert.fail("手动压缩不运行 Turn"));
+  const original = phase === "prepare" ? new Error("原始准备错误") : undefined;
+  const storage = new Error("命令终态写入失败");
+  let calls = 0;
+  const runtime = new LlmRuntime({ mock: { async *generate(): AsyncGenerator<never> { calls++; throw original; } } });
+  const commands = new SessionCommandController(manager, () => {
+    if (phase === "prepare") throw original;
+    return { runtime, businessModel: runtime.prepare({ provider: "mock", model: "m" }), businessTools: [], retainTokens: 0 };
+  });
+  try {
+    const agent = await manager.load(compactSessionId);
+    const append = agent.session.append.bind(agent.session);
+    const failure = t.mock.method(agent.session, "append", (...args: Parameters<typeof append>) => {
+      if (args[0].type === "command/done") throw storage;
+      return append(...args);
+    });
+    assert.ok(commands.compact);
+    const result = await commands.compact({ sessionId: compactSessionId, compactionId: compactId }).then(
+      value => ({ resolved: true, value }),
+      (error: unknown) => ({ resolved: false, error }),
+    );
+    assert.deepEqual(result, { resolved: false, error: original });
+    assert.equal(agent.storageOpen, false);
+    assert.equal(agent.session.snapshot().events.some(event => event.type === "command/done"), false);
+    assert.equal(calls, phase === "prepare" ? 0 : 1);
+    failure.mock.restore();
+    await agent.recoverStorage();
+    const final = agent.session.snapshot().events.at(-1);
+    assert.ok(final?.type === "command/done" && final.data.kind === "error");
+    assert.equal(calls, phase === "prepare" ? 0 : 1);
+  } finally {
+    try { await manager.close(); } finally { await store.close(); }
+  }
+});
 
 test("真实启动应用的 fork 历史和 follow 保留原事件，继承编号可在子会话新受理", { timeout: 8000 }, async () => {
   const { rawSessionHistorySchema } = await import("@mharness/session/contracts");

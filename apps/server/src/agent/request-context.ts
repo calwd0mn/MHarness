@@ -60,7 +60,12 @@ export function rebuildRequestContext(session: Session): { header: Header; input
 }
 
 /** 本 Step 固定的生成入口与可记录配置；header 不包含凭据。 */
-export type StepSnapshot = { prepared: PreparedModel; header: Header };
+export type StepSnapshot = Readonly<{
+  prepared: PreparedModel;
+  header: Header;
+  /** 从冻结的请求头校验得到，供 Step 内计量和生成共用。 */
+  tools: readonly ModelTool[];
+}>;
 
 /**
  * 创建两阶段请求准备器：固定 Step 配置后，可用最新会话消息准备多次请求并按需记录请求头。
@@ -89,9 +94,9 @@ export function createRequestPreparer(options: RequestContextOptions):
       ...(prepared.adapterDefaults ? { adapterDefaults: prepared.adapterDefaults } : {}),
       system: options.systemPrompt(), tools,
     }) as Header;
-    modelTools(header);
+    const checkedTools = modelTools(header);
     freezeTree(header);
-    return { prepared, header };
+    return { prepared, header, tools: checkedTools };
   };
   const prepare = (session: Session, startsSeries = false, fixed = snapshot()) => {
     const { prepared, header } = fixed;

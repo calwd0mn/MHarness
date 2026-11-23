@@ -44,6 +44,14 @@ Session 核心 SHALL 独立定义事件的数据契约。持久化接口 SHALL �
 - **WHEN** 候选事件包含循环引用或不可无损保存的值，或违反历史替换约定
 - **THEN** 系统拒绝事件，不增加序号、不发布该事件，已有视图保持不变
 
+#### Scenario: 同步接受完整批次
+- **WHEN** 已绑定写入器的 Session 接收一批需要共同写入且校验全部通过的连续事件
+- **THEN** Session 一次接受整批并分配连续 seq，随后按 seq 通知。第一个监听器读取快照或发起检查点时，完整批次已安装和入队
+
+#### Scenario: 批量追加的任一记录校验失败
+- **WHEN** 批次内任一事件或事件间关联无效
+- **THEN** 整批被拒绝，日志、序号、surface、写入队列和通知均无变化
+
 #### Scenario: 按位置读取日志
 - **WHEN** 日志有 N 个事件并读取区间 [a, b)
 - **THEN** 返回该区间内的稳定有序事件，快照对应的完整前缀 `cursor` 为 `N - 1`，`session.seq` 为 `N`。例如 `[0,1,2]` 的 cursor 为 2，下一事件位置为 3。空日志的 cursor 为 -1，下一事件位置为 0
@@ -116,7 +124,7 @@ Session 核心 SHALL 独立定义事件的数据契约。持久化接口 SHALL �
 - **THEN** 检查点失败，不能因缓冲为空而返回持久化成功
 
 ### Requirement: 会话写入缓冲与排空
-写入器 SHALL 将所属 Session 新发布的事件复制到所属写入器的缓冲，并按序写入。首个待写事件启动固定批处理窗口，后续事件不重置期限。在途写入期间到达的事件进入下一批。显式 Session 检查点 SHALL 取消窗口等待，按序排空待写事件并确认持久位置覆盖目标。构造种子事件 SHALL 不发布追加通知。
+写入器 SHALL 缓冲所属 Session 新接受的事件并按序写入。`Session.append()` 同步接受和发布单条事件，批量追加 SHALL 在发布第一条通知前把完整批次交给同一写入器。首个待写事件启动固定窗口，后续事件不重置期限。在途写入期间新接受的事件进入后续批次。定时排空、显式 Session 检查点和写句柄关闭 SHALL 保持批量追加的边界，经一次 `handle.append(events)` 原子提交该批。`session.flush()` 排空会话缓冲并调用底层 `handle.flush()`，确认持久位置覆盖目标。句柄级 `flush()` 是存储屏障，也用于显式提交空 header。构造种子事件 SHALL 不发布追加通知。
 
 后端统一 `flush()` SHALL 捕获调用时的活跃写入器，逐个排空缓冲并执行持久性屏障。某个会话失败后 SHALL 继续处理其余会话，最后以一个 `AggregateError` 汇总各 `sessionId` 和错误。
 
@@ -430,16 +438,16 @@ system 存在时 SHALL 计 `ceil(length / 4) + 4`，不存在为 0；tools 非�
 - **WHEN** 已识别命令的处理器抛错或取消，且追加错误 `command/done` 失败
 - **THEN** 保留并向上传递原错误，不将追加错误替换为原错误，不声称错误终态已经持久化；不保证该异常调用留下 `done`
 
-#### Scenario: 暂存占位与 busy 竞争
-- **WHEN** 原活动的压缩暂存写入占用会话，另一个已识别命令发现 busy
+#### Scenario: 原活动接纳或排空事件批次时收到 busy 命令
+- **WHEN** 原活动正在追加或排空事件批次，另一个已识别命令发现 busy
 - **THEN** 只协调拒绝记录的安全写入，不重新判断并执行后到压缩，不破坏原活动及其原子提交；存储结论不可靠时不绕过准入或伪称记录已持久化
 
-#### Scenario: 活动任务在 busy 记录暂存期间准备继续写入
-- **WHEN** busy 记录正在安全的让渡点提交，原活动准备追加事件或启动下一批暂存写入
+#### Scenario: 活动任务在 busy 记录写入期间准备继续追加
+- **WHEN** busy 记录正在安全的让渡点提交，原活动准备追加下一条事件或完整批次
 - **THEN** 两方按同会话写入顺序协调，原活动不因 busy 记录占位而报写入竞争。正常提交时两条 busy 记录连续可见，原活动可继续结算。待核对或存储故障时依原存储规则阻塞
 
 ### Requirement: 压缩的开始与选区校验
-`compaction/start` SHALL 保存 `compactionId` 与 `turn`，独立压缩使用 `turn: null`，Turn 内压缩使用所属数字轮次。由手动命令产生的开始、摘要、终态及 checkpoint SHALL 关联原 `sourceCommandId`；自动压缩和既有历史不要求该字段。系统 SHALL 确认开始记录提交后才调用摘要模型。系统 SHALL 在生成前记录待替换节点序列，并在提交前回到串行区重新定位选区、比较完整节点序列及校验工具调用配对。
+`compaction/start` SHALL 保存 `compactionId` 与 `turn`，独立压缩使用 `turn: null`，Turn 内压缩使用所属数字轮次。由手动命令产生的开始、摘要、终态及 checkpoint SHALL 关联原 `sourceCommandId`；自动压缩和既有历史不要求该字段。系统 SHALL 追加开始记录并通过 `session.flush()` 确认后才调用摘要模型。系统 SHALL 在生成前记录待替换节点序列，并在同步批量追加前回到串行区，检查取消、重新定位选区、比较完整节点序列及校验工具调用配对。
 
 #### Scenario: 摘要生成期间选区变化
 - **WHEN** 摘要返回时，待替换的节点已变化，即使起止节点仍存在
@@ -450,64 +458,52 @@ system 存在时 SHALL 计 `ceil(length / 4) + 4`，不存在为 0；tools 非�
 - **THEN** 系统可以提交选区的摘要替换，保留选区之外的新节点
 
 ### Requirement: 压缩摘要与替换的原子提交
-成功批次 SHALL 按 `compaction/summary`、替换 `user/message`、成功的 `compaction/end` 顺序整体校验并原子提交。摘要事件 SHALL 保存 `compactionId`、`summary`、`shadowedRange: { start, end }`、按 surface 排列的 `shadowedSeqs`、摘要模型 `route` 及可用的 `usage`。摘要事件只记录事实。
+成功批次 SHALL 按 `compaction/summary`、替换 `user/message`、成功的 `compaction/end` 顺序整体校验、同步接受并在一次 SQLite 事务中提交。摘要事件 SHALL 保存 `compactionId`、`summary`、`shadowedRange: { start, end }`、按 surface 排列的 `shadowedSeqs`、摘要模型 `route` 及可用的 `usage`。摘要事件只记录事实。
 
-替换消息 SHALL 携带摘要文本块、新消息 ID 和 `role: "user"`、`data.source: { kind: "compact", compactionId }` 和 `surfaceOp: { op: "replace", start, end }`，`sourceEventSeqs` 至少引用摘要事件及全部被覆盖节点。只有该消息改变 surface。确认成功批次提交后，系统才可更新内存 surface 并发布成功结果。
+只有替换消息改变 surface。整批接受时 SHALL 立即更新内存 surface、推进一次替换代数并按 seq 发布事件。压缩持久化确认、使用替换的模型请求及 HTTP 成功响应 SHALL 等待覆盖该批次的会话检查点。
 
-#### Scenario: 成功批次提交
-- **WHEN** 摘要生成成功且替换校验通过
-- **THEN** 持久历史同时包含摘要、替换消息和成功终态。重放只从替换消息派生摘要节点，原始消息事件保留
+#### Scenario: 成功批次先在内存接受
+- **WHEN** 摘要生成成功且整批校验通过，写入器尚未确认落盘
+- **THEN** live Session 可读完整三条及替换后的 surface，follow 按 seq 交付。HTTP 持久历史仍读取旧前缀，依赖模型和 HTTP 成功响应等待检查点
+
+#### Scenario: 成功批次落盘
+- **WHEN** 显式 Session flush、定时排空或写句柄关闭提交已接受的成功批次
+- **THEN** 持久历史同时包含摘要、替换和成功终态，各路径只提交一次。重放只从替换消息派生摘要节点，原始事件保留
 
 ### Requirement: 合成 user 检查点的包装与尾部保留
-摘要替换 SHALL 是合成 user 消息，不是 system 或 assistant 消息。内容 SHALL 按顺序包含自动检查点说明及 `<compacted-summary>` 开标记、摘要正文、`</compacted-summary>` 闭标记，正文可有多个文本块，适配器可转换最终格式。说明 SHALL 要求将摘要当作既有背景、从后续消息直接继续而不确认该检查点。system、tools、保留消息的角色、内容和顺序 SHALL 不被改写。
+摘要替换 SHALL 携带新消息 ID、`role: "user"`、`data.source: { kind: "compact", compactionId }` 和 `surfaceOp: { op: "replace", start, end }`，`sourceEventSeqs` 引用摘要及全部被覆盖节点。内容 SHALL 按顺序包含自动检查点说明及 `<compacted-summary>` 开标记、摘要正文、`</compacted-summary>` 闭标记，正文可有多个文本块，适配器可转换最终格式。说明 SHALL 要求将摘要当作既有背景、从后续消息直接继续而不确认该检查点。system、tools、保留消息的角色、内容和顺序 SHALL 不被改写。
 
 #### Scenario: 摘要替代旧前缀但不重复发送原文
 - **WHEN** 安全前缀 A、B、C 被检查点 S 替换，尾部为 D、E
 - **THEN** 后续业务 messages 为合成 user S、原 D、原 E，不同时发送 A、B、C 原文；system 和 tools 保持本 Step 的固定值，原交互仍保留在日志中
 
-### Requirement: 压缩结算与提交核对
-`compaction/end` SHALL 保存 `compactionId`、与开始一致的 `turn`、`status` 以及非成功时的 `reason`。`status` 取 `succeeded`、`failed`、`cancelled` 或 `interrupted`。同一会话每个 `compactionId` 最多提交一个终态。取消与提交竞争时 SHALL 以已提交结果为准。
+### Requirement: 摘要结算与持久化核对
+`compaction/end` SHALL 保存 `compactionId`、与开始一致的 `turn`、`status` 以及非成功时的 `reason`。`status` 取 `succeeded`、`failed`、`cancelled` 或 `interrupted`。同一会话每个 `compactionId` 至多接受一条终态。已经接受的成功批次 SHALL 保持其替换及终态，迟到取消可停止后续业务执行。其持久化状态由检查点确认。
 
-提交结果未知时，系统 SHALL 保持任务阻塞，先确认原事务已终止，再可靠读取持久日志。若已有终态则采用该终态，只有确认原写入未提交且确实缺少终态时才可补写。无法核对或结算时 SHALL 保持阻塞或进入存储故障状态。
+已接受摘要事件 SHALL 走普通写入缓冲及检查点。结果未知时先确认原事务终止，再核对可靠持久前缀。确认已提交则采用原结果，确认回滚且仍有写入权时可重试原批，保留原序号、载荷及队列顺序。仍未知、写失败或前缀冲突时 SHALL 保持存储阻塞。在线恢复 SHALL 先处理原批并确认 live 与持久前缀一致，再处理确实缺少的终态并确认修复检查点，才开放准入。
 
-#### Scenario: 开始记录确认未提交
-- **WHEN** `compaction/start` 确认未提交
-- **THEN** 系统释放占用并报告失败，不调用摘要模型或补写结束记录
+#### Scenario: 开始记录的检查点失败
+- **WHEN** `compaction/start` 已接受，但本次运行未获得持久化确认
+- **THEN** 当前调用保留检查点错误并退出，摘要 Adapter 调用和立即补写 end 均为零。后续恢复先核对或重试原批，可靠前缀确有 start 且缺少 end 时按中断修复，原摘要请求不续跑
 
-#### Scenario: 摘要失败、取消或成功批次确认回滚
-- **WHEN** 摘要失败、取消阻止成功提交，或成功批次确认未提交
-- **THEN** 系统提交对应的失败或取消终态；独立维护在确认后释放占用，Turn 内由驱动决定继续或结算。该次摘要不产生替换，先前已提交的工具修剪或摘要不回滚
+#### Scenario: 摘要失败或成功批次接受前取消
+- **WHEN** 生成或校验失败，或取消在成功批次接受前生效
+- **THEN** 以原 ID 和 turn 追加对应失败或取消终态并等待检查点。此次摘要无替换，先前已提交的修剪或摘要保留。独立维护完成结算后释放占用，Turn 内由驱动继续或结算
 
-#### Scenario: 原事务仍可能提交
-- **WHEN** 暂时读不到压缩记录，且原事务尚未确认终止
-- **THEN** 系统继续阻塞新任务，不补写终态，不更新 surface 或发布成功结果
+#### Scenario: 已接受的成功批次确认回滚
+- **WHEN** 写入器确认 SQLite 事务已回滚
+- **THEN** 数据库不出现部分成功效果，同进程保留已接受的完整批次和 surface。批次留在队首，显式 Session flush、写入器关闭或在线恢复在持有写入权时可以重试原批。待持久化确认前，不调用依赖替换的模型、不返回持久化成功、不补写第二个压缩终态
 
-#### Scenario: 成功提交后收到取消
-- **WHEN** 成功批次已提交，随后收到取消或在核对时发现已提交的成功终态
-- **THEN** 采用已提交的成功结果，不追加第二条终态
+#### Scenario: 已接受的批次已提交或仍待核对
+- **WHEN** 检查点或关闭遇到原批次提交结果未知
+- **THEN** 可靠核对为已提交时采用原结果，避免再次追加、发布或推进替换代数。原事务未终止或读取持续不可靠时，保留已接受的 live 状态，阻止后续写入、依赖模型和成功响应。关闭仍失败时报告错误并释放资源
 
-### Requirement: 暂存批次在排空关闭与在线恢复中的隔离
-压缩暂存批次 SHALL 与普通已接受事件的待写重试分开。普通 flush、关闭排空或在线恢复 SHALL 不隐式重提已确认回滚的暂存批次，也不把它放入普通队列；普通已接受批次的既有重试语义 SHALL 保留。已确认提交的暂存结果 SHALL 至多安装和发布一次，不重复追加。原事务未终止或持久读取不可靠时 SHALL 保持相关存储准入和依赖模型阻塞。在线恢复 SHALL 先核对并采用暂存结果，再检查 live 与持久前缀及修复遗留范围；关闭失败 SHALL 按原关闭合约报告错误并释放资源，不伪称成功压缩。
+### Requirement: 工具修剪的暂存隔离
+工具修剪继续使用先提交再发布的暂存批次。普通 flush、关闭排空或在线恢复 SHALL 先核对待定的修剪批次，采用已提交结果一次。确认回滚的修剪批次 SHALL 保持在普通已接受队列之外；未核对时不开放准入或发布修剪替换。
 
-#### Scenario: 普通 flush 核对到暂存回滚
-- **WHEN** 摘要开始、成功摘要或工具修剪的暂存批次曾返回结果待核对，后续 Session、handle 或统一存储 flush 确认原批次未提交
-- **THEN** 不重新提交原暂存批次，不把它放入普通缓冲，不增加其事件、替换代数或成功通知；由原压缩流程按可靠结论处理失败，普通已接受批次仍按原约定排空或显式重试
-
-#### Scenario: 已提交暂存结果的重复排空与恢复
-- **WHEN** 原暂存提交的确认响应丢失，后续 flush 或在线恢复可靠读到整个原批次已提交
-- **THEN** 采用原持久结果，仍加载的 Session 只安装发布一次；重复 flush 或恢复不再次 append、分配序号或重复推进替换代数
-
-#### Scenario: 关闭时确认暂存回滚
-- **WHEN** writer、handle 或存储关闭引发最后排空，暂存批次被确认已经回滚
-- **THEN** 不因关闭重新写入该批次，不暴露半个摘要或修剪结果；按原关闭合约释放资源及报告必要错误，原已提交历史保持不变
-
-#### Scenario: 在线恢复前 live 尚未安装已提交暂存结果
-- **WHEN** 运行对象的存储准入关闭，原暂存批次实际已提交而 live 前缀尚未包含它，开始在线恢复
-- **THEN** 先核对并安装原提交，再比较前缀和修复遗留范围，不把该差异直接当作普通历史损坏；修复检查点成功前不开放 prompt 或手动维护准入
-
-#### Scenario: 排空关闭或在线恢复仍无法核对
-- **WHEN** 这些路径中原事务尚未终止或持久读取仍不可靠
-- **THEN** 不以暂时查不到当作回滚、不重提或补终态、不发布替换；未关闭的运行对象保持准入关闭且不调用依赖 Adapter，关闭路径报告失败并按关闭合约释放资源，不报告压缩完成
+#### Scenario: 在线恢复遇到尚未安装的已提交修剪
+- **WHEN** 修剪实际已提交但 live 尚未安装，开始在线恢复
+- **THEN** 先安装并发布原结果，再比较 live 和持久前缀。普通已接受的摘要批次沿原队列处理，确认回滚的修剪不因排空而重提
 
 ### Requirement: live Session 受理 prompt
 Session 命令入口 SHALL 明确各命令是否需要激活 Agent。`prompt` SHALL 在完成必要的恢复校验并取得写入权后，受理空闲 Agent 的输入。Turn 开始事件及用户消息依次进入内存日志且执行循环接管后，接口 SHALL 返回 `202 { accepted: true }`，不等待 pre-step 或 Step 开始。响应只确认受理，首次模型请求 SHALL 等待相应的持久化检查点。
@@ -783,9 +779,13 @@ Adapter 明确报告输入上下文超限时，系统 SHALL 先保存失败的 `
 - **WHEN** 已提交 Turn 和用户消息，或前一 Step 已关闭，pre-step 摘要开始后进程退出而下一 `step/start` 尚未追加
 - **THEN** 先结算未闭合摘要，再只关闭实际打开的 Turn；不补造下一 Step。已有修剪及前一次成功摘要保持原样，恢复不请求模型
 
-#### Scenario: 重启读到已结算的成功压缩
+#### Scenario: 重启读到完整的成功压缩
 - **WHEN** 成功批次在进程退出前已提交，或对已修复会话再次执行恢复
-- **THEN** 采用原终态及其持久日志，不重复追加结束事件或调用摘要模型
+- **THEN** 采用原终态及其持久日志，避免再次追加结束事件或调用摘要模型
+
+#### Scenario: 恢复遇到关联摘要批次不完整或有冲突
+- **WHEN** 自有压缩在可靠前缀中出现关联摘要、checkpoint 或成功 end，三者无法形成完整的成功批次
+- **THEN** 报告前缀完整性故障，保持准入关闭。既有不关联命令的孤立旧终态仍可回放，不能作为命令成功证据
 
 #### Scenario: 已提交压缩但命令终态缺失
 - **WHEN** 本会话自有手动命令的压缩成功批次已可靠提交，但 `command/done` 尚未提交

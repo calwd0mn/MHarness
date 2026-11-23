@@ -14,6 +14,7 @@ import { ApprovalService } from "../approval/service.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import { runToolBatch } from "../tools/batch.ts";
 import { appendToolResult } from "../tools/result-event.ts";
+import { createTurnCompactionOperations, type TurnCompactionOperations, type TurnCompactionSettlement } from "./turn-compaction.ts";
 
 /** 供会话观察层同步发布的内部模型帧和执行错误。 */
 export type ExecutionNotice = AssistantStreamFrame | { type: "agent/error"; turn: number; message: string };
@@ -34,6 +35,10 @@ export type ModelTurnContext = {
   blockStorage: (error: unknown) => void;
   /** 即时读取存储准入；省略时视为开放。 */
   storageOpen?: () => boolean;
+  /** 获取首次会话存储故障，盒装值可包含 undefined。 */
+  storageFailure?: () => { readonly value: unknown } | undefined;
+  /** 当前 Agent 在原 Turn 占用内执行的摘要结算。 */
+  settleCompaction?: TurnCompactionSettlement;
 };
 /** 等待点可见的本步上下文，不包含模型凭据。 */
 export type StepHookContext = Readonly<{
@@ -42,6 +47,8 @@ export type StepHookContext = Readonly<{
   storageOpen: () => boolean;
   /** 报告压缩写入待核对的原始错误；本轮保留首次报告并跳过普通持久收尾。 */
   blockStorage: (error: unknown) => void;
+  /** 获取本轮锁存或会话已知的首个存储故障，盒装值可包含 undefined。 */
+  storageFailure?: () => { readonly value: unknown } | undefined;
   /** 已固定并冻结的可记录路由、生成参数、system 和 tools。 */
   header: Readonly<StepSnapshot["header"]>;
 }>;
@@ -55,10 +62,10 @@ export type ModelTurnOptions = {
   systemPrompt: () => string;
   /** 每个 Step 读取的模型可见工具定义。 */
   tools?: () => readonly ModelTool[];
-  /** 开步前等待；AbortError 表示取消，其他拒绝终止本轮；取消信号作用于该等待。 */
-  preStep?: (context: StepHookContext) => Promise<void>;
-  /** 超限结算及实时结束后决定是否重试；存储开放时普通异常保留原失败，AbortError 表示取消，失败信息为独立只读副本。 */
-  recoverOverflow?: (context: StepHookContext & { readonly failure: Readonly<{ code: string; message: string }> }) => Promise<boolean>;
+  /** 开步前等待，可用本步固定的压缩操作。AbortError 表示取消，其他拒绝终止本轮。 */
+  preStep?: (context: StepHookContext, operations: TurnCompactionOperations) => Promise<void>;
+  /** 超限 Attempt 已实时结算并落盘后决定是否重试。存储开放时普通拒绝保留原失败，AbortError 表示取消。失败信息为独立只读副本，压缩操作绑定原 Step。 */
+  recoverOverflow?: (context: StepHookContext & { readonly failure: Readonly<{ code: string; message: string }> }, operations: TurnCompactionOperations) => Promise<boolean>;
   /** 每轮最多发起的模型步数，须为正安全整数；默认使用集中配置。 */
   maxSteps?: number;
   /** 每轮只读工具超时次数上限，须为正安全整数；达到上限时停止本轮，默认使用集中配置。 */
@@ -81,7 +88,7 @@ type Content = (
  * 副作用或未知工具超时以及只读超时预算耗尽时以对应错误码结束；只读预算跨 Step 累计，每轮重置。
  * 已取消时不进入下一步；否则先固定模型配置并等待 preStep，检查存储准入后开步。
  * 每次请求在检查点后重新检查准入和取消；检查点失败优先于同时发生的取消。
- * 超限恢复回调只在失败 Attempt 及实时结束交付后调用一次，获准后在同一步重建请求。
+ * 超限恢复回调等待失败 Attempt 落盘后才可运行，获准后在原 Step 重建请求并再次检查点。
  * 等待点报告压缩写入待核对后，以首次错误拒绝并保留未闭合的 Step 和 Turn。
  * @param options - Runtime、每步配置及可选等待和恢复回调。
  * @returns 可注入 Agent 的异步驱动；取消信号传给等待点、模型请求和工具批次。
@@ -106,6 +113,8 @@ export function createModelTurnDriver(
     publish,
     blockStorage,
     storageOpen = () => true,
+    storageFailure: getStorageFailure,
+    settleCompaction,
   }) => {
     let step = initialStep;
     let hookStorageFailure: { error: unknown } | undefined;
@@ -140,9 +149,14 @@ export function createModelTurnDriver(
         try {
           const fixed = prepareRequest.snapshot();
           if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
-          const hookContext: StepHookContext = Object.freeze({ session, turn, step, signal, header: fixed.header, storageOpen: () => hookStorageFailure === undefined && storageOpen(), blockStorage: blockHookStorage });
+          const hookContext: StepHookContext = Object.freeze({
+            session, turn, step, signal, header: fixed.header,
+            storageOpen: () => hookStorageFailure === undefined && storageOpen(), blockStorage: blockHookStorage,
+            storageFailure: () => hookStorageFailure ? { value: hookStorageFailure.error } : getStorageFailure?.(),
+          });
+          const operations = createTurnCompactionOperations(hookContext, fixed, options.runtime, settleCompaction);
           try {
-            await options.preStep?.(hookContext);
+            await options.preStep?.(hookContext, operations);
           } catch (error) {
             assertHookStorage();
             if (storageOpen() && error instanceof Error && error.name === "AbortError") {
@@ -156,7 +170,7 @@ export function createModelTurnDriver(
           if (!storageOpen()) throw new Error("存储准入已关闭");
           session.append({ type: "step/start", data: { turn, step } });
           stepOpen = true;
-          let retried = false;
+          let overflowRetries = 0;
           while (true) {
             const { prepared, input } = prepareRequest(session, false, fixed);
             try {
@@ -273,12 +287,26 @@ export function createModelTurnDriver(
                       ? { kind: "error", error: finish.failure }
                       : { kind: "completed" };
             }
-            if (!retried && finish.kind === "error" && finish.failure.code === "CONTEXT_WINDOW_EXCEEDED" && options.recoverOverflow) {
+            if (overflowRetries < localConfig.compaction.maxOverflowRetries &&
+              finish.kind === "error" && finish.failure.code === "CONTEXT_WINDOW_EXCEEDED" && options.recoverOverflow) {
               attempt.abandon();
               attempt = undefined;
+              try {
+                await session.flush();
+              } catch (error) {
+                storageFailure(error);
+                throw error;
+              }
+              if (!storageOpen()) {
+                const failure = getStorageFailure?.();
+                const error = failure ? failure.value : new Error("超限恢复检查点的存储准入已关闭");
+                storageFailure(error);
+                throw error;
+              }
+              if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
               let approved = false;
               try {
-                approved = await options.recoverOverflow(Object.freeze({ ...hookContext, failure: Object.freeze({ ...finish.failure }) }));
+                approved = await options.recoverOverflow(Object.freeze({ ...hookContext, failure: Object.freeze({ ...finish.failure }) }), operations);
               } catch (error) {
                 assertHookStorage();
                 if (!storageOpen()) throw error;
@@ -290,7 +318,7 @@ export function createModelTurnDriver(
               assertHookStorage();
               if (signal.aborted) { turnReason = { kind: "aborted", reason: "user" }; break; }
               if (!storageOpen()) throw new Error("存储准入已关闭");
-              if (approved) { retried = true; continue; }
+              if (approved) { overflowRetries++; continue; }
             }
             if (event.type === "assistant/message" && calls.length) {
               const toolCalls = content.filter((part): part is Extract<Content[number], { type: "tool-call" }> => part.type === "tool-call");

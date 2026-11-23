@@ -7,10 +7,11 @@ const compactionId = "2dfe7336-a43e-4fcb-9530-1880d94588ce";
 
 test("压缩契约严格区分请求、终态与错误", () => {
   assert.deepEqual(compactRequestSchema.parse({ compactionId }), { compactionId });
+  assert.deepEqual(compactRequestSchema.parse({ compactionId, args: "  参数  " }), { compactionId, args: "  参数  " });
   for (const status of ["succeeded", "no_safe_range", "cancelled", "failed"]) {
     assert.deepEqual(compactResponseSchema.parse({ compactionId, commandId: "cmd", status }), { compactionId, commandId: "cmd", status });
   }
-  for (const value of [{}, { compactionId: "bad" }, { compactionId, requestId: "x" }, { compactionId, content: [] }]) {
+  for (const value of [{}, { compactionId: "bad" }, { compactionId, requestId: "x" }, { compactionId, content: [] }, { compactionId, args: null }]) {
     assert.equal(compactRequestSchema.safeParse(value).success, false);
   }
   for (const value of [{ accepted: true }, { accept: true }, { compactionId, status: "unknown" }, { compactionId, status: "failed", extra: true }]) {

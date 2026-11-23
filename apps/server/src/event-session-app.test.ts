@@ -4,10 +4,168 @@ import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createSessionResponseSchema, rawSessionEventFrameSchema, rawSessionHistorySchema, type RawSessionEventFrame } from "@mharness/session/contracts";
 import { Session, SqliteSessionPersistence } from "@mharness/session/server";
 import { createEventSessionApp } from "./app.ts";
+import { makeCompactionRecoveryFixtures } from "../../../packages/session/src/compaction-recovery-fixtures.ts";
+
+test("启动恢复真实压缩夹具并在重开时保持幂等", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compaction-startup-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  const fixture = makeCompactionRecoveryFixtures().independentInterrupted;
+  const storage = new SqliteSessionPersistence(path);
+  try {
+    const handle = await storage.create(fixture.header, { inheritedEventCount: fixture.inheritedEventCount });
+    await handle.append(fixture.events);
+    await handle.close();
+  } finally { await storage.close(); }
+  let turns = 0;
+  for (let i = 0; i < 2; i++) {
+    const app = await createEventSessionApp(path, false, async () => { turns++; });
+    try {
+      await app.ready();
+      const response = await app.inject({ method: "GET", url: `/api/sessions/${fixture.header.sessionId}` });
+      const history = rawSessionHistorySchema.parse(response.json());
+      const events = history.records.map(record => record.event);
+      assert.deepEqual(events.slice(0, fixture.events.length), fixture.events);
+      assert.deepEqual(events.slice(fixture.events.length).map(event => event.type), ["compaction/end", "command/done"]);
+      assert.deepEqual(events.at(-2)?.data, { compactionId: "I1", turn: null, sourceCommandId: "I", status: "interrupted", reason: { kind: "process_interrupted" } });
+      assert.equal(turns, 0);
+    } finally { await app.close(); }
+  }
+});
+
+test("启动恢复只关闭压缩和实际打开的范围，并保留已确认的替换", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compaction-turn-startup-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  const fixtures = makeCompactionRecoveryFixtures();
+  const cases = [
+    { fixture: fixtures.preStepInterrupted, compactionId: "P1", step: undefined, surface: [1, 4, 8], generation: 0 },
+    { fixture: fixtures.prunedInterrupted, compactionId: "R1", step: 2, surface: [1, 4, 8, 10, 18], generation: 1 },
+    { fixture: fixtures.secondSummaryInterrupted, compactionId: "S2", step: undefined, surface: [11, 8], generation: 1 },
+  ] as const;
+  const storage = new SqliteSessionPersistence(path);
+  try {
+    for (const { fixture } of cases) {
+      const handle = await storage.create(fixture.header);
+      try {
+        await handle.append(fixture.events);
+      } finally {
+        await handle.close();
+      }
+    }
+  } finally {
+    await storage.close();
+  }
+
+  let turns = 0;
+  const runTurn = async () => { turns++; assert.fail("启动恢复不应执行 Turn"); };
+  const confirmed = new Map<string, RawSessionEventFrame["event"][]>();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const app = await createEventSessionApp(path, false, runTurn);
+    try {
+      await app.ready();
+      for (const { fixture, compactionId, step, surface, generation } of cases) {
+        const { sessionId } = fixture.header;
+        const response = await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` });
+        assert.equal(response.statusCode, 200, sessionId);
+        const history = rawSessionHistorySchema.parse(response.json());
+        const events = history.records.map(record => record.event);
+        assert.deepEqual(events.slice(0, fixture.events.length), fixture.events, sessionId);
+        const repaired = events.slice(fixture.events.length).map(({ type, data }) => ({ type, data }));
+        assert.deepEqual(repaired, [
+          { type: "compaction/end", data: { compactionId, turn: 2, status: "interrupted", reason: { kind: "process_interrupted" } } },
+          ...(step === undefined ? [] : [{ type: "step/end", data: { turn: 2, step } }]),
+          { type: "turn/end", data: { turn: 2, reason: { kind: "interrupted" } } },
+        ], sessionId);
+        const previous = confirmed.get(sessionId);
+        if (previous) assert.deepEqual(events, previous, sessionId);
+        else confirmed.set(sessionId, events);
+
+        const expectedMessages = surface.map(seq => {
+          const event = fixture.events[seq];
+          assert.ok(event?.type === "user/message" || event?.type === "assistant/message" || event?.type === "tool/result");
+          return event.type === "user/message" ? event.data : event.data.message;
+        });
+        const session = new Session(fixture.header, {
+          seed: { kind: "restore", events, inheritedEventCount: history.inheritedEventCount },
+        });
+        assert.deepEqual(session.deriveSurfaceNodes().map(node => node.seq), surface, sessionId);
+        assert.deepEqual(session.deriveMessages(), expectedMessages, sessionId);
+        assert.equal(session.replaceGeneration, generation, sessionId);
+      }
+    } finally {
+      await app.close();
+    }
+  }
+  assert.equal(turns, 0);
+});
+
+test("启动遇到压缩关联冲突时拒绝就绪并保留原前缀", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-compaction-invalid-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  const fixture = makeCompactionRecoveryFixtures().settledWithoutDone.succeeded;
+  const events = fixture.events.map(event => event.type === "compaction/end" ? { ...event, data: { ...event.data, turn: 1 } } : event);
+  const storage = new SqliteSessionPersistence(path);
+  try {
+    const handle = await storage.create(fixture.header);
+    await handle.append(events);
+    await handle.close();
+  } finally { await storage.close(); }
+  const app = await createEventSessionApp(path);
+  try { await assert.rejects(async () => { await app.ready(); }, /K1-succeeded/); } finally { await app.close(); }
+  const observer = new SqliteSessionPersistence(path, { readOnly: true });
+  try {
+    const reader = await observer.open(fixture.header.sessionId, "read");
+    assert.ok(reader);
+    assert.deepEqual(await reader.read(), events);
+    await reader.close();
+  } finally { await observer.close(); }
+});
+
+test("启动修复事务回滚后释放写入权，后续启动只修复一次", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-startup-rollback-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "events.sqlite");
+  const fixture = makeCompactionRecoveryFixtures().independentInterrupted;
+  const storage = new SqliteSessionPersistence(path);
+  try {
+    const handle = await storage.create(fixture.header);
+    await handle.append(fixture.events);
+    await handle.close();
+  } finally { await storage.close(); }
+  const db = new DatabaseSync(path);
+  try {
+    db.exec(`CREATE TRIGGER reject_startup BEFORE INSERT ON mh_events WHEN NEW.seq = ${fixture.events.length + 1} BEGIN SELECT RAISE(ABORT, 'startup failure'); END`);
+    let turns = 0;
+    const failed = await createEventSessionApp(path, false, async () => { turns++; });
+    try { await assert.rejects(async () => { await failed.ready(); }, /startup failure/); } finally { await failed.close(); }
+    const observer = new SqliteSessionPersistence(path, { readOnly: true });
+    try {
+      const reader = await observer.open(fixture.header.sessionId, "read");
+      assert.ok(reader);
+      assert.deepEqual(await reader.read(), fixture.events);
+      await reader.close();
+    } finally { await observer.close(); }
+    db.exec("DROP TRIGGER reject_startup");
+    for (let i = 0; i < 2; i++) {
+      const app = await createEventSessionApp(path, false, async () => { turns++; });
+      try {
+        await app.ready();
+        const response = await app.inject({ method: "GET", url: `/api/sessions/${fixture.header.sessionId}` });
+        const events = rawSessionHistorySchema.parse(response.json()).records.map(record => record.event);
+        assert.deepEqual(events.slice(0, fixture.events.length), fixture.events);
+        assert.deepEqual(events.slice(fixture.events.length).map(event => event.type), ["compaction/end", "command/done"]);
+        assert.equal(turns, 0);
+      } finally { await app.close(); }
+    }
+  } finally { db.close(); }
+});
 
 test("新版 HTTP 创建提交空 header，启动修复后按原始事件读取", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "mharness-online-"));

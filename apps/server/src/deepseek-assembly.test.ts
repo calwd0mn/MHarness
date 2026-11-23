@@ -4,7 +4,128 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
+import { Session, SqliteSessionPersistence } from "@mharness/session/server";
+import { rawSessionHistorySchema } from "@mharness/session/contracts";
 import { createEventSessionApp } from "./app.ts";
+
+for (const cancelled of [false, true]) test(
+  cancelled ? "正式 pre-step 摘要期间取消，结束 Turn 且不开启 Step"
+    : "正式会话装配在 pre-step 压力过高时先落盘摘要再启动业务请求",
+  { timeout: 8000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-pressure-entry-"));
+  const database = join(dir, "session.sqlite");
+  const header = { sessionId: "pressure-production", createdAt: 0 };
+  const path = `/api/sessions/${header.sessionId}`;
+  const keys = ["MHARNESS_MODEL_PROVIDER", "DEEPSEEK_API_KEY", "MHARNESS_MODEL_CONTEXT_WINDOW", "MHARNESS_MODEL_MAX_TOKENS", "MHARNESS_MODEL_DEFAULT_OUTPUT_TOKENS", "MHARNESS_MODEL_REASONING_EFFORT", "MHARNESS_MODEL_TEMPERATURE", "MHARNESS_MODEL_STOP"];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  Object.assign(process.env, {
+    MHARNESS_MODEL_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "original-test-key",
+    MHARNESS_MODEL_CONTEXT_WINDOW: "10000", MHARNESS_MODEL_MAX_TOKENS: "128",
+  });
+  t.after(async () => {
+    for (const key of keys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const source = new Session(header);
+  const oldQuestion = "历史".repeat(19000);
+  const oldAnswer = "旧答复".repeat(2250);
+  source.append({ type: "turn/start", data: { turn: 1 } });
+  const oldQuestionEvent = source.append({ type: "user/message", surfaceOp: "append", data: {
+    turn: 1, id: "old", requestId: "old", role: "user", source: { kind: "user" }, content: [{ type: "text", text: oldQuestion }],
+  } });
+  source.append({ type: "step/start", data: { turn: 1, step: 1 } });
+  source.append({ type: "assistant/message", surfaceOp: "append", data: {
+    turn: 1, step: 1, message: { id: "old-answer", role: "assistant", source: { provider: "deepseek", model: "deepseek-v4-pro" }, content: [{ type: "text", text: oldAnswer }] },
+    finishReason: { kind: "stop" }, stream: [], includeInModelContext: true,
+  } });
+  source.append({ type: "step/end", data: { turn: 1, step: 1 } });
+  source.append({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+  const seed = new SqliteSessionPersistence(database);
+  try {
+    const writer = await seed.create(header);
+    await writer.append(source.snapshot().events);
+  } finally {
+    await seed.close();
+  }
+
+  const observer = new SqliteSessionPersistence(database, { readOnly: true });
+  let markEntered!: (signal: AbortSignal | null | undefined) => void;
+  const entered = new Promise<AbortSignal | null | undefined>(resolve => { markEntered = resolve; });
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let app: Awaited<ReturnType<typeof createEventSessionApp>> | undefined;
+  try {
+    const reader = await observer.open(header.sessionId, "read");
+    assert.ok(reader);
+    const calls: { key: string | null; body: { max_tokens?: number; messages: { content: string }[] }; types: string[] }[] = [];
+    app = await createEventSessionApp(database, false, undefined, { modelFetch: async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { max_tokens?: number; messages: { content: string }[] };
+      calls.push({ key: new Headers(init?.headers).get("authorization"), body, types: (await reader.read()).map(record => record.type) });
+      process.env.DEEPSEEK_API_KEY = "changed-test-key";
+      if (cancelled && calls.length === 1) {
+        markEntered(init?.signal);
+        await released;
+        init?.signal?.throwIfAborted();
+      }
+      const content = body.max_tokens === 8192 ? "压缩后的历史" : "业务回复";
+      return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    } });
+    const accepted = await app.inject({ method: "POST", url: `${path}/messages`, payload: { requestId: "new", content: [{ type: "text", text: "当前问题" }] } });
+    assert.equal(accepted.statusCode, 202);
+    if (cancelled) {
+      const signal = await entered;
+      assert.equal((await app.inject({ method: "POST", url: `${path}/cancel` })).statusCode, 202);
+      assert.equal(signal?.aborted, true);
+      release();
+    }
+    let records = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: path })).json()).records;
+    for (let index = 0; index < 200 && !records.some(record => record.event.type === "turn/end" && record.event.data.turn === 2); index++) {
+      await setTimeout(10);
+      records = rawSessionHistorySchema.parse((await app.inject({ method: "GET", url: path })).json()).records;
+    }
+    assert.equal(records.at(-1)?.event.type, "turn/end");
+    if (cancelled) {
+      const events = records.map(record => record.event);
+      const original = source.snapshot().events;
+      const tail = events.slice(original.length);
+      assert.deepEqual(events.slice(0, original.length), original);
+      assert.deepEqual(tail.map(event => event.type), ["turn/start", "user/message", "compaction/start", "compaction/end", "turn/end"]);
+      const start = tail[2];
+      const end = tail[3];
+      assert.ok(start?.type === "compaction/start" && end?.type === "compaction/end");
+      assert.equal(end.data.compactionId, start.data.compactionId);
+      assert.equal(end.data.turn, 2);
+      assert.equal(end.data.status, "cancelled");
+      assert.deepEqual(tail.at(-1)?.data, { turn: 2, reason: { kind: "aborted", reason: "user" } });
+      assert.deepEqual(calls.map(call => call.body.max_tokens), [8192]);
+      assert.equal(calls[0]?.types.at(-1), "compaction/start");
+      assert.deepEqual(await reader.read(), events);
+      return;
+    }
+    assert.deepEqual(records.at(-1)?.event.data, { turn: 2, reason: { kind: "completed" } });
+    assert.deepEqual(calls.map(call => [call.key, call.body.max_tokens]), [["Bearer original-test-key", 8192], ["Bearer original-test-key", 128]]);
+    assert.equal(calls[0]?.types.at(-1), "compaction/start");
+    assert.equal(calls[0]?.types.filter(type => type === "step/start").length, 1);
+    assert.deepEqual(calls[1]?.types.slice(-5), ["compaction/summary", "user/message", "compaction/end", "step/start", "request/header"]);
+    const summary = records.find(({ event }) => event.type === "compaction/summary")?.event;
+    assert.ok(summary?.type === "compaction/summary");
+    assert.deepEqual(summary.data.shadowedSeqs, [oldQuestionEvent.seq]);
+    assert.deepEqual(calls[0]?.body.messages.slice(1).map(({ content }) => content), [oldQuestion]);
+    assert.match(calls[1]?.body.messages[1]?.content ?? "", /压缩后的历史/);
+    assert.deepEqual(calls[1]?.body.messages.slice(2).map(({ content }) => content), [oldAnswer, "当前问题"]);
+  } finally {
+    release();
+    try {
+      await app?.close();
+    } finally {
+      await observer.close();
+    }
+  }
+});
 
 test("正式会话装配通过受控 DeepSeek 传输保存请求头与回答", async () => {
   const dir = await mkdtemp(join(tmpdir(), "mharness-deepseek-"));

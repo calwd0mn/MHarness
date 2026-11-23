@@ -21,6 +21,37 @@ async function collect(stream: AsyncIterable<StreamChunk>) {
   return chunks;
 }
 
+test("同路由派生请求保留原 Adapter 并独立准备摘要参数", async () => {
+  const captured: { adapter: string; request: ModelRequest }[] = [];
+  let selected = "original";
+  let factories = 0;
+  const runtime = new LlmRuntime({ mock: () => {
+    factories++;
+    const adapter = selected;
+    return {
+      ...createMockAdapter(request => {
+        captured.push({ adapter, request });
+        return [{ chunk: stopChunk }];
+      }),
+      modelInfo: { supportedReasoningEfforts: ["high", "none"] },
+    };
+  } });
+  const config = { ...route, endpointId: "fixed" };
+  const business = runtime.prepare({ ...config, params: { reasoningEffort: "high", maxOutputTokens: 2048 } });
+  selected = "changed";
+  assert.equal(business.disableReasoningEffort, "none");
+  assert.throws(() => runtime.prepareForSameRoute(business, { ...config, endpointId: "changed" }), /路由/);
+  assert.throws(() => new LlmRuntime({}).prepareForSameRoute(business, config), /路由/);
+  const summary = runtime.prepareForSameRoute(business, { ...config, params: { reasoningEffort: business.disableReasoningEffort, maxOutputTokens: 8192 } });
+  const signal = new AbortController().signal;
+  await collect(business.generate(input, signal));
+  await collect(summary.generate({ ...input, tools: [] }, signal));
+  assert.equal(factories, 1);
+  assert.deepEqual(captured.map(({ adapter, request }) => [adapter, request.route, request.effectiveParams.reasoningEffort, request.effectiveParams.maxOutputTokens, request.tools.length]), [
+    ["original", config, "high", 2048, 1], ["original", config, "none", 8192, 0],
+  ]);
+});
+
 test("按已准备的配置选择 Adapter，并保留文本、工具分片、usage 和正常结束的顺序", async () => {
   const chunks: StreamChunk[] = [
     textChunk,

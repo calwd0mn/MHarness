@@ -1,7 +1,7 @@
 import { z } from "zod";
 
-/** 每次显式提交使用新的 UUID；该标识用于关联日志，不表示请求幂等。 */
-export const compactRequestSchema = z.strictObject({ compactionId: z.uuid() });
+/** 每次显式提交使用新的 UUID；该标识用于关联日志，不表示请求幂等。可选 args 原样记入命令。 */
+export const compactRequestSchema = z.strictObject({ compactionId: z.uuid(), args: z.string().optional() });
 /** 已知业务终态；成功表示服务端已确认批次并等待 flush，不包含摘要正文。 */
 export const compactResponseSchema = z.strictObject({
   compactionId: z.uuid(),

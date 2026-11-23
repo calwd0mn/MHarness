@@ -23,6 +23,8 @@ export type ModelConfig = ModelRoute & Readonly<{
 export interface PreparedModel {
   /** 当前模型的本地容量快照，缺省表示没有声明。 */
   readonly modelBudget?: ModelBudget;
+  /** Adapter 明确支持关闭推理时，可作为摘要推理设置使用的值。 */
+  readonly disableReasoningEffort?: "none";
   /** 按本次固定参数判断工具列表下是否发送助手推理；缺省表示发送。 */
   includesAssistantReasoning?(tools: readonly ModelTool[]): boolean;
   /** 可记录的实际路由。 */
@@ -37,9 +39,10 @@ export interface PreparedModel {
    * 提前退出迭代时关闭 Adapter 流，不交付额外事件。
    * @param input - 已准备的上下文，消费完成前应保持不变。
    * @param signal - 调用方取消信号，可用于用户取消或 Turn 预算耗尽。调用方负责区分来源。
+   * @param options - 可选的摘要观察回调；已交付的失败或取消终态在检查迟到取消及 Adapter 清理前通知，取消检查回调只在本运行时检查触发时通知；尚无失败终态且非本地取消检查时，Adapter 抛出的原值通过 onAdapterError 同步通知，该回调不得抛错。原值无法归一化时交付安全 UNKNOWN 终态。
    * @returns 统一异步流，Adapter 失败或取消通过终止事件交付。
    */
-  generate(input: ModelInput, signal: AbortSignal): AsyncIterable<StreamChunk>;
+  generate(input: ModelInput, signal: AbortSignal, options?: { readonly onFailureTerminal?: (reason: Extract<LlmFinishReason, { kind: "error" | "aborted" }>, cancellation: { readonly present: boolean; readonly value: unknown }) => void; readonly onCancellationGuard?: (reason: unknown) => void; readonly onAdapterError?: (error: unknown) => void }): AsyncIterable<StreamChunk>;
 }
 
 function requiredId(value: string, field: string): string {
@@ -85,6 +88,7 @@ function timeoutMs(value: number): number {
 /** 解析模型配置并统一流终态。每次生成只调用一次选定的 Adapter。 */
 export class LlmRuntime {
   readonly #adapters: ReadonlyMap<string, ModelAdapter | (() => ModelAdapter)>;
+  readonly #preparedAdapters = new WeakMap<PreparedModel, ModelAdapter>();
 
   /**
    * 固定此实例可选择的 Provider 及其 Adapter。
@@ -106,9 +110,26 @@ export class LlmRuntime {
     const registration = this.#adapters.get(provider);
     if (!registration) throw new TypeError("Model provider is not registered");
     const adapter = typeof registration === "function" ? registration() : registration;
+    return this.#prepareWithAdapter(config, adapter, options);
+  }
 
+  /**
+   * 在同一路由上准备派生请求，沿用已选的 Adapter 及其连接配置。
+   * @param snapshot - 由本 Runtime 固定的业务模型。
+   * @param config - 相同路由上的独立请求参数与超时。
+   * @returns 独立的请求快照，准备期间不会再次调用 Provider 工厂。
+   * @throws 快照不属于本 Runtime、路由不一致或新参数无效时抛出。
+   */
+  prepareForSameRoute(snapshot: PreparedModel, config: ModelConfig): PreparedModel {
+    const adapter = this.#preparedAdapters.get(snapshot);
+    if (!adapter || config.provider !== snapshot.route.provider || config.model !== snapshot.route.model ||
+      config.endpointId !== snapshot.route.endpointId) throw new TypeError("派生请求须使用本次已准备的模型路由");
+    return this.#prepareWithAdapter(config, adapter);
+  }
+
+  #prepareWithAdapter(config: ModelConfig, adapter: ModelAdapter, options: { recordable?: boolean } = {}): PreparedModel {
     const route = Object.freeze({
-      provider,
+      provider: requiredId(config.provider, "provider"),
       model: requiredId(config.model, "model"),
       ...(config.endpointId === undefined ? {} : { endpointId: requiredId(config.endpointId, "endpointId") }),
     });
@@ -153,15 +174,18 @@ export class LlmRuntime {
     });
 
     const includesAssistantReasoning = adapter.includesAssistantReasoning?.bind(adapter);
-    return Object.freeze({
+    const snapshot: PreparedModel = Object.freeze({
       route,
       effectiveParams,
       ...(modelBudget ? { modelBudget } : {}),
+      ...(info?.supportedReasoningEfforts?.includes("none") ? { disableReasoningEffort: "none" as const } : {}),
       ...(includesAssistantReasoning ? { includesAssistantReasoning: (tools: readonly ModelTool[]) => includesAssistantReasoning(effectiveParams, tools) } : {}),
       ...(adapterDefaults ? { adapterDefaults } : {}),
-      generate: (input: ModelInput, signal: AbortSignal) =>
-        generate(adapter, { ...input, route, effectiveParams, timeouts }, signal),
+      generate: (input: ModelInput, signal: AbortSignal, options?: { readonly onFailureTerminal?: (reason: Extract<LlmFinishReason, { kind: "error" | "aborted" }>, cancellation: { readonly present: boolean; readonly value: unknown }) => void; readonly onCancellationGuard?: (reason: unknown) => void; readonly onAdapterError?: (error: unknown) => void }) =>
+        generate(adapter, { ...input, route, effectiveParams, timeouts }, signal, options),
     });
+    this.#preparedAdapters.set(snapshot, adapter);
+    return snapshot;
   }
 }
 
@@ -169,26 +193,52 @@ async function* generate(
   adapter: ModelAdapter,
   request: ModelRequest,
   signal: AbortSignal,
+  options?: { readonly onFailureTerminal?: (reason: Extract<LlmFinishReason, { kind: "error" | "aborted" }>, cancellation: { readonly present: boolean; readonly value: unknown }) => void; readonly onCancellationGuard?: (reason: unknown) => void; readonly onAdapterError?: (error: unknown) => void },
 ): AsyncGenerator<StreamChunk> {
   let reason: LlmFinishReason | undefined;
+  let observed: Extract<LlmFinishReason, { kind: "error" | "aborted" }> | undefined;
+  let guardCancelled = false;
+  const checkCancellation = () => { if (signal.aborted) { guardCancelled = true; options?.onCancellationGuard?.(signal.reason); signal.throwIfAborted(); } };
   try {
-    signal.throwIfAborted();
+    checkCancellation();
     for await (const chunk of adapter.generate(request, signal)) {
-      signal.throwIfAborted();
+      if (options?.onFailureTerminal && chunk.type === "finish" &&
+        (chunk.reason.kind === "error" || chunk.reason.kind === "aborted")) {
+        observed = chunk.reason;
+        options.onFailureTerminal(observed, { present: signal.aborted, value: signal.aborted ? signal.reason : undefined });
+        break;
+      }
+      checkCancellation();
       if (chunk.type === "finish") {
         reason = chunk.reason;
         break;
       }
       yield chunk;
-      signal.throwIfAborted();
+      checkCancellation();
     }
   } catch (error: unknown) {
-    reason = (error instanceof LlmError ? error : new LlmError("UNKNOWN")).toFinishReason();
+    if (!observed) {
+      if (guardCancelled && options?.onCancellationGuard) {
+        reason = { kind: "aborted" };
+      } else {
+        const capture = !guardCancelled ? options?.onAdapterError : undefined;
+        capture?.(error);
+        const normalize = () => options?.onFailureTerminal && error instanceof Error && error.name === "AbortError"
+          ? { kind: "aborted" } as const
+          : (error instanceof LlmError ? error : new LlmError("UNKNOWN")).toFinishReason();
+        if (capture) {
+          try { reason = normalize(); } catch { reason = new LlmError("UNKNOWN").toFinishReason(); }
+        } else {
+          reason = normalize();
+        }
+        if (options?.onFailureTerminal && !guardCancelled) observed = reason;
+      }
+    }
   }
 
   // 先关闭 Adapter 迭代器，避免清理失败在已经交付 finish 后形成第二个终态。
   yield {
     type: "finish",
-    reason: signal.aborted ? { kind: "aborted" } : reason ?? new LlmError("STREAM_CLOSED").toFinishReason(),
+    reason: observed ?? (signal.aborted ? { kind: "aborted" } : reason ?? new LlmError("STREAM_CLOSED").toFinishReason()),
   };
 }

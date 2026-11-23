@@ -108,10 +108,9 @@ export class Session {
   readonly #events: SessionEvent[] = [];
   #toolCalls = new SessionToolCalls();
   readonly #notifications: { "session/event": Notifications<SessionEvent> };
-  #checkpoint?: { readonly flush: (eventCount: number) => Promise<void>; readonly staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void) => Promise<StagedPersistenceResult> };
+  #checkpoint?: { readonly flush: (eventCount: number) => Promise<void>; readonly staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void, beforeSubmit?: () => void) => Promise<StagedPersistenceResult>; readonly enqueue?: (events: readonly SessionEvent[], atomic: boolean) => void };
   #appending = false;
   #staged = false;
-  #publishingStaged = false;
   #surface: SurfaceNode[] = [];
   #messages: SessionMessage[] | undefined = [];
   #replaceGeneration = 0;
@@ -171,7 +170,7 @@ export class Session {
    * 接受一条记录并向当前监听器同步发布。
    * @param candidate - 载荷的字段须符合事件类别。调用方不得传入序号，省略时间时使用当前 Unix 毫秒。
    * @returns 已接受的不可变事件，与日志和通知共享同一快照。单一事件类别可直接读取该类别的载荷，联合输入返回对应类别的联合。
-   * @throws 事件载荷或日志关联无效、尝试普通追加修剪标记或自行写入分支标记，或在当前追加中重入时抛出。
+   * @throws 事件载荷或日志关联无效、压缩终态 ID 已存在、尝试普通追加修剪标记或自行写入分支标记，或在当前追加中重入时抛出。
    */
   append<const Input extends SessionAppendInput>(
     candidate: Input & ([UnexpectedAppendFields<NoInfer<Input>>] extends [never] ? unknown : never),
@@ -182,7 +181,11 @@ export class Session {
       const event = snapshotSessionEvent(candidate, this.seq, "append");
       if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
       if (event.type === "compaction/prune") throw new Error("修剪标记必须在暂存批次中提交");
+      if (event.type === "compaction/end" && this.#events.some((entry) => entry.type === "compaction/end" && entry.data.compactionId === event.data.compactionId)) {
+        throw new Error("压缩终态标识已存在");
+      }
       this.#accept(event);
+      this.#checkpoint?.enqueue?.([event], false);
       this.#notifications["session/event"].emit(event);
       // 快照沿用输入的事件类别，经过共享 Schema 校验后可以按该类别收窄。
       return event as AppendedEvent<Input>;
@@ -194,56 +197,98 @@ export class Session {
   /** 当前是否由暂存批次占用写入位置。 */
   get stagedOccupied(): boolean { return this.#staged; }
 
-  /** 写入器用此标记识别已持久化的通知，避免再次入队。 */
-  get publishingStaged(): boolean { return this.#publishingStaged; }
+  /**
+   * 同步校验并接受整个批次，在发布第一条通知前交给绑定的写入器，保留整批落盘边界。
+   * @param build - 用首序号同步构建连续候选，可引用同批中较早的记录。
+   * @returns 已接受的不可变批次。需要持久化确认时由调用方等待 `flush()`。
+   * @throws 空批次、记录或关联无效、修剪标记、追加重入或暂存占用时抛出。
+   */
+  appendBatch(build: (firstSeq: number) => readonly SessionAppendInput[]): readonly SessionEvent[] {
+    if (this.#appending || this.#staged) throw new Error("会话写入已被占用");
+    this.#appending = true;
+    try {
+      const { draft, events } = this.#prepareBatch(build, false);
+      this.#installBatch(draft, events);
+      this.#checkpoint?.enqueue?.(events, true);
+      for (const event of events) this.#notifications["session/event"].emit(event);
+      return events;
+    } finally {
+      this.#appending = false;
+    }
+  }
 
   /**
    * 同步构建并校验完整候选，再等待持久化结论；待核对时保留占用直到检查点处理。
    * @param build - 接收批次首序号并返回候选；不得在其中执行异步工作。
+   * @param options - 可选的同步提交前检查与暂存侧异常通知；检查在普通检查点后、暂存端口调用前执行，抛错不视为存储故障。通知仅针对进入暂存交接后的其他抛错，须同步且不抛错。
    * @returns 已提交事件、确认回滚的原因或待核对原因。
-   * @throws 未绑定暂存写入器、写入竞争、构建或校验失败时拒绝。
+   * @throws 未绑定暂存写入器、写入竞争、构建、校验（包括前缀或批次中重复的压缩终态 ID）、提交前检查或暂存侧抛错时以原值拒绝。
    */
-  async commitStaged(build: (firstSeq: number) => readonly SessionAppendInput[]): Promise<StagedCommitResult> {
+  async commitStaged(build: (firstSeq: number) => readonly SessionAppendInput[], options?: { readonly beforeSubmit?: () => void; readonly onPersistenceError?: (error: unknown) => void }): Promise<StagedCommitResult> {
     if (this.#appending || this.#staged) throw new Error("会话写入已被占用");
     const staged = this.#checkpoint?.staged;
     if (!staged) throw new Error("会话未绑定暂存写入器");
     this.#staged = true;
     try {
-      const draft = new Session({ sessionId: this.header.sessionId, createdAt: this.header.createdAt });
-      for (const event of this.#events) draft.#events.push(event);
-      draft.#toolCalls = this.#toolCalls.clone();
-      draft.#surface = this.#surface.slice();
-      draft.#messages = this.#messages?.slice();
-      draft.#replaceGeneration = this.#replaceGeneration;
-      const candidates = build(this.seq);
-      if (!Array.isArray(candidates as unknown) || candidates.length === 0) throw new Error("暂存批次不能为空");
-      for (const candidate of candidates) {
-        const event = snapshotSessionEvent(candidate, draft.seq, "append");
-        if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
-        draft.#accept(event);
-      }
-      draft.#assertPruneComplete();
-      const events = Object.freeze(draft.#events.slice(this.seq));
+      const { draft, events } = this.#prepareBatch(build, true);
       const finish = (result: StagedPersistenceResult) => {
         if (result.status === "pending-reconciliation") return;
         if (result.status === "committed") {
-          for (const event of events) this.#events.push(event);
-          this.#toolCalls = draft.#toolCalls;
-          this.#surface = draft.#surface;
-          this.#messages = draft.#messages;
-          this.#replaceGeneration = draft.#replaceGeneration;
-          this.#publishingStaged = true;
-          try { for (const event of events) this.#notifications["session/event"].emit(event); }
-          finally { this.#publishingStaged = false; }
+          this.#installBatch(draft, events);
+          for (const event of events) this.#notifications["session/event"].emit(event);
         }
         this.#staged = false;
       };
-      const result = await staged(events, finish);
+      let guardFailed = false;
+      const beforeSubmit = options?.beforeSubmit && (() => {
+        try { options.beforeSubmit!(); } catch (error) { guardFailed = true; throw error; }
+      });
+      let result: StagedPersistenceResult;
+      try { result = await staged(events, finish, beforeSubmit); }
+      catch (error) {
+        if (!guardFailed) {
+          try { options?.onPersistenceError?.(error); } finally { throw error; }
+        }
+        throw error;
+      }
       return result.status === "committed" ? { status: "committed", events } : result;
     } catch (error) {
       this.#staged = false;
       throw error;
     }
+  }
+
+  #prepareBatch(build: (firstSeq: number) => readonly SessionAppendInput[], allowPrune: boolean) {
+    const draft = new Session({ sessionId: this.header.sessionId, createdAt: this.header.createdAt });
+    for (const event of this.#events) draft.#events.push(event);
+    draft.#toolCalls = this.#toolCalls.clone();
+    draft.#surface = this.#surface.slice();
+    draft.#messages = this.#messages?.slice();
+    draft.#replaceGeneration = this.#replaceGeneration;
+    const candidates = build(this.seq);
+    if (!Array.isArray(candidates as unknown) || candidates.length === 0) throw new Error("写入批次不能为空");
+    let endIds: Set<string> | undefined;
+    for (const candidate of candidates) {
+      const event = snapshotSessionEvent(candidate, draft.seq, "append");
+      if (event.type === "session/end-seed") throw new Error("继承标记只在准备分支时分配");
+      if (!allowPrune && event.type === "compaction/prune") throw new Error("修剪标记必须在暂存批次中提交");
+      if (event.type === "compaction/end") {
+        endIds ??= new Set(this.#events.flatMap((entry) => entry.type === "compaction/end" ? [entry.data.compactionId] : []));
+        if (endIds.has(event.data.compactionId)) throw new Error("压缩终态标识已存在");
+        endIds.add(event.data.compactionId);
+      }
+      draft.#accept(event);
+    }
+    draft.#assertPruneComplete();
+    return { draft, events: Object.freeze(draft.#events.slice(this.seq)) };
+  }
+
+  #installBatch(draft: Session, events: readonly SessionEvent[]): void {
+    for (const event of events) this.#events.push(event);
+    this.#toolCalls = draft.#toolCalls;
+    this.#surface = draft.#surface;
+    this.#messages = draft.#messages;
+    this.#replaceGeneration = draft.#replaceGeneration;
   }
 
   #accept(event: SessionEvent): void {
@@ -361,13 +406,14 @@ export class Session {
   /**
    * 绑定此 Session 的持久化检查点，调用方须在接收新事件前完成绑定。
    * @param checkpoint - 负责确认调用时传入的事件数已提交。
-   * @param staged - 可选的暂存提交能力；结果确认或后续核对后须同步调用 finish，待核对时保留该回调。
+   * @param staged - 可选的暂存提交能力；结果确认或后续核对后须同步调用 finish，待核对时保留该回调。提供提交前检查时，须在普通检查点后、调用持久化端口前同步执行，中间不得等待，也不得将检查异常报告为存储故障。
+   * @param enqueue - 已接受事件须在此同步完整入队，不得抛错；atomic 为 true 时须保留原批次边界。
    * @returns 解除本次绑定的函数。
    * @throws 已有绑定时抛出。
    */
-  bindCheckpoint(checkpoint: (eventCount: number) => Promise<void>, staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void) => Promise<StagedPersistenceResult>): () => void {
+  bindCheckpoint(checkpoint: (eventCount: number) => Promise<void>, staged?: (events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void, beforeSubmit?: () => void) => Promise<StagedPersistenceResult>, enqueue?: (events: readonly SessionEvent[], atomic: boolean) => void): () => void {
     if (this.#checkpoint) throw new Error("会话已绑定持久化检查点");
-    const binding = { flush: checkpoint, staged };
+    const binding = { flush: checkpoint, staged, enqueue };
     this.#checkpoint = binding;
     return () => {
       if (this.#checkpoint === binding) this.#checkpoint = undefined;

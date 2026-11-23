@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { PromptRequest } from "@mharness/session/contracts";
 import { isDeepStrictEqual } from "node:util";
 import { projectInterruptedSession, type Session, type SessionHandle } from "@mharness/session/server";
-import type { ExecutionNotice } from "./model-turn.ts";
+import type { ExecutionNotice, ModelTurnContext } from "./model-turn.ts";
+import type { CompactionAttemptContext } from "./compaction-lifecycle.ts";
+import type { CommitCompactionSummaryOptions } from "./commit-compaction-summary.ts";
+import { settleCompactionSummary, type CompactionSettlementIntent, type CompactionSettlementResult } from "./settle-compaction-summary.ts";
 
 type Event = ReturnType<Session["snapshot"]>["events"][number];
 type Chunk =
@@ -17,10 +20,7 @@ export type AgentObservation = { type: "event"; event: Event } | { type: "assist
   | Extract<ExecutionNotice, { type: "agent/error" }>;
 type ActiveAttempt = { attemptId: string; turn: number; step: number; chunks: Chunk[]; nextIndex: number };
 /** 驱动一次已受理 Turn；驱动负责开启并结算执行范围，压缩写入待核对时保留未闭合范围。 */
-export type RunTurn = (context: {
-  session: Session; turn: number; step: number; signal: AbortSignal;
-  publish: (notice: ExecutionNotice) => void; blockStorage: (error: unknown) => void; storageOpen: () => boolean;
-}) => Promise<void>;
+export type RunTurn = (context: ModelTurnContext & { storageOpen: () => boolean }) => Promise<void>;
 
 /** 可由 HTTP 层映射的命令失败代码。 */
 export class AgentError extends Error {
@@ -35,7 +35,12 @@ export class ReActAgent {
   #storageGeneration = 0;
   #closing = false;
   #controller?: AbortController;
+  #turn: number | null = null;
+  #settling = false;
+  readonly #intents = new Map<string, CompactionSettlementIntent>();
   #running: Promise<void> = Promise.resolve();
+  #busyWrites: Promise<void> = Promise.resolve();
+  #pendingBusyWrites = 0;
   #recovering?: Promise<void>;
   #revision = 0;
   #active?: ActiveAttempt;
@@ -48,6 +53,8 @@ export class ReActAgent {
   }
   /** 当前进程内占用；不代表持久化 Turn 的终态。 */
   get state(): "idle" | "running" | "maintenance" { return this.#state; }
+  /** 活动任务及其忙碌拒绝日志尚未交接完成时，保持新任务忙碌。 */
+  get busy(): boolean { return this.#state !== "idle" || this.#pendingBusyWrites > 0; }
   /** 是否允许新任务进入存储检查点。 */
   get storageOpen(): boolean { return !this.#storageBlocked; }
   /**
@@ -55,9 +62,39 @@ export class ReActAgent {
    * @param error - 用于保留故障原因的原始错误。
    */
   blockStorage(error: unknown): void {
+    if (!this.#storageBlocked) this.#storageError = error;
     this.#storageBlocked = true;
-    this.#storageError = error;
     this.#storageGeneration++;
+  }
+  /**
+   * 在当前维护或 Turn 占用内执行摘要结算，并在返回前保留待恢复的原始终态意图。调用方须在原占用内等待返回。
+   * @param context - 当前占用的真实信号和轮次；Turn 调用须传入 StepHookContext 的存储回调，以锁存本轮故障。
+   * @param options - 摘要模型快照和选区参数。
+   * @returns 带原值和检查点结果的结算；未能追加的终态意图由 Agent 保存，供在线恢复使用。
+   * @throws 上下文不属于当前占用、同时结算或摘要在 start 前拒绝时抛出。
+   */
+  async settleCompaction(context: CompactionAttemptContext, options: CommitCompactionSummaryOptions): Promise<CompactionSettlementResult> {
+    if (this.#closing || this.#state === "idle" || this.#settling || context.session !== this.session ||
+      context.signal !== this.#controller?.signal || context.turn !== this.#turn) throw new Error("摘要上下文不属于当前占用");
+    this.#settling = true;
+    try {
+      const result = await settleCompactionSummary({
+        ...context,
+        storageOpen: () => this.storageOpen && context.storageOpen(),
+        storageFailure: () => this.#storageBlocked ? { value: this.#storageError } : context.storageFailure?.(),
+        blockStorage: error => {
+          try {
+            if (this.storageOpen || this.#state === "running") context.blockStorage(error);
+          } finally {
+            if (this.storageOpen) this.blockStorage(error);
+          }
+        },
+      }, options);
+      if (result.status === "unsettled" && result.intent) {
+        this.#intents.set(result.attempt.compactionId, result.intent);
+      }
+      return result;
+    } finally { this.#settling = false; }
   }
   /**
    * 空闲时核验已提交前缀并修复遗留范围，修复检查点成功后才开放准入。
@@ -65,7 +102,7 @@ export class ReActAgent {
    * @throws 活动尚未退出、会话关闭或核验和检查点失败时拒绝，准入保持关闭。
    */
   recoverStorage(): Promise<void> {
-    if (this.#state !== "idle" || this.#closing) {
+    if (this.busy || this.#closing) {
       return Promise.reject(new Error("会话活动或关闭期间无法恢复存储"));
     }
     if (this.#recovering) return this.#recovering;
@@ -77,25 +114,41 @@ export class ReActAgent {
   }
   async #repairStorage(generation: number): Promise<void> {
     await this.session.flush();
-    const projection = await projectInterruptedSession(this.handle);
     const live = this.session.snapshot().events;
+    const projection = await projectInterruptedSession(this.handle, { expectedLivePrefix: live,
+      terminalIntents: [...this.#intents.values()].map(intent => ({ ...intent.attempt, status: intent.outcome, reason: intent.reason })) });
     const repaired = projection.session.snapshot().events;
     if (projection.cursor !== live.length - 1 || !isDeepStrictEqual(repaired.slice(0, live.length), live)) {
       throw new Error("已提交前缀与当前会话不一致");
     }
+    const guard = () => {
+      if (this.#closing || this.#state !== "idle" || generation !== this.#storageGeneration || this.session.seq !== live.length) {
+        throw new Error("恢复期间会话状态已变更");
+      }
+    };
+    guard();
+    const closers = repaired.slice(live.length);
     if (this.#active) {
       const { attemptId, turn, step, nextIndex } = this.#active;
       this.#publish({ type: "assistant/end", attemptId, turn, step, index: nextIndex, outcome: { kind: "abandoned" } });
+      guard();
     }
-    for (const event of repaired.slice(live.length)) {
-      const { seq: _seq, ...input } = event;
-      if (input.type !== "session/end-seed") this.session.append(input);
+    if (closers.length) {
+      this.session.appendBatch(firstSeq => {
+        guard();
+        if (firstSeq !== live.length) throw new Error("恢复序号已变更");
+        return closers.flatMap(({ seq: _seq, ...input }) => input.type === "session/end-seed" ? [] : [input]);
+      });
     }
+    const confirmed = this.session.snapshot().events;
     await this.session.flush();
-    if (generation === this.#storageGeneration) {
-      this.#storageBlocked = false;
-      this.#storageError = undefined;
+    if (!isDeepStrictEqual(await this.handle.read(), confirmed) || this.#closing || this.#state !== "idle" ||
+      generation !== this.#storageGeneration || this.session.seq !== confirmed.length) {
+      throw new Error("恢复最终前缀或状态不一致");
     }
+    this.#intents.clear();
+    this.#storageBlocked = false;
+    this.#storageError = undefined;
   }
   /**
    * 同步捕获已接受前缀与实时草稿，调用方可先订阅再取得截点。
@@ -167,20 +220,25 @@ export class ReActAgent {
     this.#assertAdmission();
     const turn = events.reduce((max, event) => event.type === "turn/start" ? Math.max(max, event.data.turn) : max, 0) + 1;
     this.#state = "running";
+    this.#turn = turn;
     this.#controller = new AbortController();
     try {
       this.session.append({ type: "turn/start", data: { turn } });
       this.session.append({ type: "user/message", surfaceOp: "append", data: { turn, requestId: request.requestId,
         id: randomUUID(), role: "user", source: { kind: "user" }, content: request.content } });
-    } catch (error) { this.blockStorage(error); this.#state = "idle"; this.#controller = undefined; throw error; }
+    } catch (error) { this.blockStorage(error); this.#state = "idle"; this.#controller = undefined; this.#turn = null; throw error; }
     const signal = this.#controller.signal;
-    this.#running = Promise.resolve().then(() => this.runTurn({ session: this.session, turn, step: 1, signal,
-      publish: (notice) => this.#publish(notice), blockStorage: (error) => this.blockStorage(error), storageOpen: () => this.storageOpen }))
+    this.#running = Promise.resolve().then(() => this.runTurn({
+      session: this.session, turn, step: 1, signal,
+      publish: notice => this.#publish(notice), blockStorage: error => this.blockStorage(error),
+      storageOpen: () => this.storageOpen, storageFailure: () => this.#storageBlocked ? { value: this.#storageError } : undefined,
+      settleCompaction: (context, options) => this.settleCompaction(context, options),
+    }))
       .catch((error: unknown) => {
         if (this.storageOpen) this.blockStorage(error);
         console.error("Turn 驱动失败", error);
       })
-      .finally(() => { this.#state = "idle"; this.#controller = undefined; });
+      .finally(() => { this.#state = "idle"; this.#controller = undefined; this.#turn = null; });
     return { accepted: true };
   }
   /**
@@ -201,15 +259,43 @@ export class ReActAgent {
     this.#running = task.then(() => {}, () => {});
     return task;
   }
+  /**
+   * 等待当前活动交出写入权，再原子接受并确认同一条命令的 busy 记录。
+   * @param run - 已识别且在到达时判为忙碌的命令事件数据。
+   * @param text - 可保存和返回的忙碌原因。
+   * @throws 准入关闭或检查点失败时拒绝；调用方不能据此承诺记录已持久化。
+   */
+  async recordBusyCommand(run: Extract<Event, { type: "command/run" }>["data"], text: string): Promise<void> {
+    if (this.#closing) throw new AgentError("agent_closed");
+    if (!this.storageOpen) throw new AgentError("storage_blocked", { cause: this.#storageError });
+    this.#pendingBusyWrites++;
+    // 原活动仍可同步追加，须在退出后交接；交接期间的新任务同样看见 busy。
+    const work = Promise.all([this.#running, this.#busyWrites]).then(async () => {
+      if (!this.storageOpen) throw new AgentError("storage_blocked", { cause: this.#storageError });
+      try {
+        this.session.appendBatch(() => [
+          { type: "command/run", data: run },
+          { type: "command/done", data: { commandId: run.commandId, kind: "error", text } },
+        ]);
+        await this.session.flush();
+        if (!this.storageOpen) throw new AgentError("storage_blocked", { cause: this.#storageError });
+      } catch (error) {
+        if (this.storageOpen) this.blockStorage(error);
+        throw error;
+      }
+    }).finally(() => { this.#pendingBusyWrites--; });
+    this.#busyWrites = work.then(() => {}, () => {});
+    await work;
+  }
   #assertAdmission(): void {
     if (this.#closing) throw new AgentError("agent_closed");
-    if (this.#state !== "idle") throw new AgentError("agent_busy");
+    if (this.busy) throw new AgentError("agent_busy");
     if (this.#storageBlocked) throw new AgentError("storage_blocked", { cause: this.#storageError });
   }
   /** 请求取消当前活动；完成仍需等待运行退出。空闲时不产生影响。 */
   cancel(): void { this.#controller?.abort(); }
   /** 等待当前活动退出，不取消活动。 */
-  async waitForIdle(): Promise<void> { await this.#running; }
+  async waitForIdle(): Promise<void> { await this.#running; await this.#busyWrites; }
   /** 同步停止接收新输入并请求取消当前活动；活动退出和观察解绑仍须等待 stop。 */
   beginStop(): void {
     this.#closing = true;
@@ -219,7 +305,7 @@ export class ReActAgent {
   async stop(): Promise<void> {
     this.beginStop();
     try {
-      await this.#running;
+      await this.waitForIdle();
       await this.#recovering;
     } finally {
       this.#unsubscribe();

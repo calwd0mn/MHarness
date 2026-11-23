@@ -13,9 +13,9 @@ type WriterPort = Pick<SessionHandle, "append" | "flush" | "read"> & {
 /** 把会话新接受的事件按固定窗口串行提交。绑定前的初始前缀由调用方提交。 */
 export class SessionWriter {
   readonly #unbind: () => void;
-  readonly #unsubscribe: () => void;
   readonly #batches: SessionEvent[][] = [];
-  #pending: SessionEvent[] = [];
+  #pending: SessionEvent[][] = [];
+  #singles?: SessionEvent[];
   #timer?: ReturnType<typeof setTimeout>;
   #tail = Promise.resolve();
   #closing?: Promise<void>;
@@ -27,7 +27,7 @@ export class SessionWriter {
   get stagedReconciliationPending(): boolean { return this.#stagedFinish !== undefined; }
 
   /**
-   * 订阅一个会话并绑定其检查点，已有前缀不进入缓冲。
+   * 绑定所属会话的追加队列和检查点，已有前缀不进入缓冲。
    * @param session - 已建立初始持久前缀并准备接收新事件的会话。
    * @param port - 同一会话的写入端口，端口的资源仍由调用方管理。
    * @param reportError - 后台排空失败时的告警入口，默认输出诊断。
@@ -39,21 +39,23 @@ export class SessionWriter {
     private readonly reportError: (error: unknown) => void = (error) => console.error("会话后台写入失败", error),
   ) {
     this.#unbind = session.bindCheckpoint((eventCount) => this.flush(eventCount), port.commitStaged && port.reconcileStaged
-      ? (events, finish) => this.#commitStaged(events, finish) : undefined);
-    this.#unsubscribe = session.on("session/event", (event) => {
-      if (session.publishingStaged) return;
-      this.#pending.push(event);
-      this.#startWindow();
-    });
+      ? (events, finish, beforeSubmit) => this.#commitStaged(events, finish, beforeSubmit) : undefined,
+    (events, atomic) => this.#enqueue(events, atomic));
   }
 
-  async #commitStaged(events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void): Promise<StagedPersistenceResult> {
+  async #commitStaged(events: readonly SessionEvent[], finish: (result: StagedPersistenceResult) => void, beforeSubmit?: () => void): Promise<StagedPersistenceResult> {
     if (this.#closing || !this.port.commitStaged) throw new Error("会话写入器已关闭或不支持暂存");
     this.#sealWindow();
     let result: StagedPersistenceResult | undefined;
     await this.#serialize(async () => {
       try {
         await this.#checkpoint(events[0]!.seq);
+      } catch (error) {
+        this.#report(error);
+        throw error;
+      }
+      beforeSubmit?.();
+      try {
         result = await this.port.commitStaged!(events);
         if (result.status === "pending-reconciliation") {
           this.#stagedFinish = finish;
@@ -85,18 +87,44 @@ export class SessionWriter {
   }
 
   /**
-   * 停止订阅并最后排空一次，重复关闭共享本次结果。
+   * 确认端口已接收但结局未知的普通批次，保留尚未提交的后续缓冲。
+   * @param firstSeq - 端口待核对批次的起始序号；已由并行检查点处理时无需再次提交。
+   * @throws 写入器已开始关闭或原批次仍无法确认时拒绝。
+   */
+  async confirmPendingBatch(firstSeq: number): Promise<void> {
+    if (this.#closing) throw new Error("会话写入器已开始关闭");
+    await this.#serialize(async () => {
+      const batch = this.#batches[0];
+      if (batch?.[0]?.seq === firstSeq) await this.#submitLiveBatch(batch);
+    });
+  }
+
+  /**
+   * 解除会话绑定并最后排空一次，重复关闭共享本次结果。
    * @returns 已接收的尾部完成持久化后兑现。写入失败时拒绝，调用方仍须释放底层句柄。
    */
   close(): Promise<void> {
     if (!this.#closing) {
-      this.#unsubscribe();
       this.#unbind();
       this.#sealWindow();
       const target = this.session.seq;
       this.#closing = this.#serialize(() => this.#checkpoint(target));
     }
     return this.#closing;
+  }
+
+  #enqueue(events: readonly SessionEvent[], atomic: boolean): void {
+    if (atomic) {
+      this.#singles = undefined;
+      this.#pending.push([...events]);
+    } else {
+      if (!this.#singles) {
+        this.#singles = [];
+        this.#pending.push(this.#singles);
+      }
+      this.#singles.push(events[0]!);
+    }
+    this.#startWindow();
   }
 
   #startWindow(): void {
@@ -112,10 +140,9 @@ export class SessionWriter {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    if (this.#pending.length) {
-      this.#batches.push(this.#pending);
-      this.#pending = [];
-    }
+    for (const batch of this.#pending) this.#batches.push(batch);
+    this.#pending = [];
+    this.#singles = undefined;
   }
 
   #scheduleBackground(): void {
@@ -141,9 +168,13 @@ export class SessionWriter {
 
   async #drainLive(): Promise<void> {
     for (let batch = this.#batches[0]; batch; batch = this.#batches[0]) {
-      await this.port.append(batch);
-      this.#batches.shift();
+      await this.#submitLiveBatch(batch);
     }
+  }
+
+  async #submitLiveBatch(batch: readonly SessionEvent[]): Promise<void> {
+    await this.port.append(batch);
+    this.#batches.shift();
   }
 
   async #checkpoint(eventCount: number): Promise<void> {

@@ -33,6 +33,49 @@ function setup() {
   return { session, committed, batches, port };
 }
 
+for (const trigger of ["notification", "window", "close"] as const) {
+  test(`同步批量追加经 ${trigger} 保留批次边界`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { session, committed, batches, port } = setup();
+    let checkpoint: Promise<void> | undefined;
+    const observed: number[] = [];
+    session.on("session/event", (event) => {
+      if (event.seq !== 1) return;
+      observed.push(session.seq);
+      if (trigger === "notification") checkpoint = session.flush();
+    });
+    const writer = new SessionWriter(session, port);
+    session.append({ type: "turn/start", data: { turn: 1 } });
+    const draft = session.snapshot();
+    assert.throws(() => session.appendBatch(() => [
+      { type: "step/start", data: { turn: 1, step: 1 } },
+      { type: "command/done", data: { commandId: "missing", kind: "error" } },
+    ]), /命令运行记录/);
+    assert.deepEqual(session.snapshot(), draft);
+    assert.deepEqual(observed, []);
+    const accepted = session.appendBatch(() => [
+      { type: "step/start", data: { turn: 1, step: 1 } },
+      { type: "step/end", data: { turn: 1, step: 1 } },
+      { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } },
+    ]);
+    assert.deepEqual(accepted.map(event => event.seq), [1, 2, 3]);
+    assert.deepEqual(observed, [4]);
+    assert.equal(committed.length, 0);
+    if (trigger === "notification") {
+      assert.ok(checkpoint);
+      await checkpoint;
+    } else if (trigger === "window") {
+      t.mock.timers.tick(200);
+      await setImmediate();
+    } else {
+      await writer.close();
+    }
+    assert.deepEqual(batches, [[0], [1, 2, 3]]);
+    assert.deepEqual(committed, session.snapshot().events);
+    await writer.close();
+  });
+}
+
 test("首事件启动固定写入窗口，在途写入的新事件保留到下一批", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { session, committed, batches, port } = setup();

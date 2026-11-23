@@ -10,7 +10,7 @@ import { SessionWriter } from "../writer.ts";
 import { acquireSessionOwnership, type Ownership } from "./ownership.ts";
 
 type Row = Record<string, unknown>;
-type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; staged?: boolean; preflightFailed?: boolean };
+type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; fromWriter?: boolean; staged?: boolean; preflightFailed?: boolean };
 class StagedPrefixError extends Error {}
 
 interface HandleStorage {
@@ -269,7 +269,7 @@ class SqliteHandle implements SessionHandle {
       throw new Error("会话写入器要求已提交的同一会话及未绑定的句柄");
     }
     this.#writer = new SessionWriter(session, {
-      append: async (events) => this.#append(events),
+      append: async (events) => this.#append(events, true),
       flush: async () => this.#flush(),
       read: async (offset, length) => this.#read(offset, length),
       commitStaged: async (events) => this.#commitStaged(events),
@@ -316,10 +316,11 @@ class SqliteHandle implements SessionHandle {
   async append(events: readonly SessionEvent[]): Promise<void> {
     this.#check(true);
     if (this.#session?.stagedOccupied) throw new Error("会话暂存写入占用中");
+    if (this.#pending?.fromWriter) throw new Error("须先经会话写入器核对待定批次");
     this.#append(events);
   }
 
-  #append(events: readonly SessionEvent[]): void {
+  #append(events: readonly SessionEvent[], fromWriter = false): void {
     if (this.#pending) {
       const same = isDeepStrictEqual(events, this.#pending.events);
       if (!same) throw new Error("须先完成原待核对批次");
@@ -336,13 +337,17 @@ class SqliteHandle implements SessionHandle {
     const marker = batch.findLast((event) => event.type === "session/end-seed");
     const expectedMarker = !this.published && this.header.isSeeded === true ? this.inheritedEventCount : undefined;
     if (marker?.seq !== expectedMarker) throw new Error("持久批次没有匹配的继承标记");
-    this.#commit({ events: batch, start, first: !this.published });
+    this.#commit({ events: batch, start, first: !this.published, fromWriter });
   }
   async flush(): Promise<void> {
     this.#check(true);
     if (this.#session?.stagedOccupied) {
       if (!this.#writer?.stagedReconciliationPending) throw new Error("会话暂存写入占用中");
       await this.#writer.flush();
+      return;
+    }
+    if (this.#pending?.fromWriter) {
+      await this.#writer!.confirmPendingBatch(this.#pending.start);
       return;
     }
     this.#flush();

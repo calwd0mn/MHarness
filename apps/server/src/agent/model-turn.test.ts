@@ -1191,13 +1191,54 @@ test("真实 Agent 的存储门在等待点及检查点后阻止模型", async (
   }
 });
 
+test("首次超限 Attempt 的普通检查点失败保留实时结算和安全 Turn 终态", async () => {
+  const session = new Session({ sessionId: "overflow-checkpoint", createdAt: 0 });
+  const controller = new AbortController();
+  const failure = Object.assign(new Error("private checkpoint failure"), { code: "SQLITE_IOERR" });
+  let checkpoints = 0;
+  let calls = 0;
+  let recoveries = 0;
+  const notices: ExecutionNotice[] = [];
+  const blocked: unknown[] = [];
+  session.bindCheckpoint(async () => {
+    checkpoints++;
+    if (checkpoints === 2) {
+      const attempt = session.snapshot().events.at(-1);
+      assert.equal(attempt?.type, "assistant/attempt");
+      const end = notices.at(-1);
+      assert.ok(end?.type === "assistant/end" && end.outcome.kind === "committed");
+      assert.equal(end.outcome.seq, attempt.seq);
+      controller.abort();
+      throw failure;
+    }
+  });
+  const runtime = new LlmRuntime({ mock: createMockAdapter(() => {
+    calls++;
+    throw new LlmError("CONTEXT_WINDOW_EXCEEDED");
+  }) });
+  await createModelTurnDriver({
+    runtime, config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "",
+    recoverOverflow: async () => { recoveries++; return true; },
+  })({
+    session, turn: 1, step: 1, signal: controller.signal,
+    publish: notice => notices.push(notice), blockStorage: error => blocked.push(error),
+  });
+  assert.deepEqual([calls, recoveries, checkpoints], [1, 0, 2]);
+  assert.equal(blocked[0], failure);
+  const records = session.snapshot().events;
+  assert.deepEqual(records.map(record => record.type), ["step/start", "request/header", "assistant/attempt", "step/end", "turn/end"]);
+  assert.deepEqual(records.at(-1)?.data, { turn: 1, reason: { kind: "error", error: { code: "SQLITE_IOERR", message: "本轮执行失败" } } });
+  assert.deepEqual(notices.filter(notice => notice.type !== "assistant/chunk").map(notice => notice.type), ["assistant/start", "assistant/end", "agent/error"]);
+  assert.deepEqual(notices.at(-1), { type: "agent/error", turn: 1, message: "本轮执行失败" });
+});
+
 test("恢复等待后及重试检查点后关闭存储门均不发起第二次请求", async () => {
   for (const boundary of ["recover", "flush"] as const) {
     const session = new Session({ sessionId: boundary, createdAt: 0 });
     let release!: () => void; let entered!: () => void; let checkpoints = 0;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const waiting = new Promise<void>((resolve) => { entered = resolve; });
-    session.bindCheckpoint(async () => { if (++checkpoints === 2 && boundary === "flush") { entered(); await gate; } });
+    session.bindCheckpoint(async () => { if (++checkpoints === 3 && boundary === "flush") { entered(); await gate; } });
     let calls = 0;
     const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; throw new LlmError("CONTEXT_WINDOW_EXCEEDED"); }) }),
       config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", maxSteps: 1,
@@ -1217,7 +1258,7 @@ test("恢复等待后及重试检查点后关闭存储门均不发起第二次�
     const events = session.snapshot().events;
     assert.equal(events.filter((e) => e.type === "assistant/attempt").length, 1);
     assert.deepEqual(events.filter((e) => e.type === "request/header").map((e) => e.data.reason), boundary === "flush" ? ["initial", "series"] : ["initial"]);
-    assert.equal(checkpoints, boundary === "flush" ? 2 : 1);
+    assert.equal(checkpoints, boundary === "flush" ? 3 : 2);
     await agent.stop();
   }
 });

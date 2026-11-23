@@ -100,7 +100,7 @@ test("压缩路由等待处理器完成", async () => {
   } finally { release?.(); await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test("生产装配未接线时不加载会话或生成记录", async () => {
+test("生产压缩无安全范围时持久结算命令且不运行 Turn", async () => {
   const dir = await mkdtemp(join(tmpdir(), "mharness-compact-unavailable-"));
   let calls = 0;
   const app = await createEventSessionApp(join(dir, "events.sqlite"), false, async () => { calls++; });
@@ -108,12 +108,19 @@ test("生产装配未接线时不加载会话或生成记录", async () => {
     const created = await app.inject({ method: "POST", url: "/api/sessions" });
     const { sessionId } = created.json() as { sessionId: string };
     const url = `/api/sessions/${sessionId}`;
-    const response = await app.inject({ method: "POST", url: `${url}/compact`, payload: { compactionId } });
-    assert.equal(response.statusCode, 503);
-    assert.deepEqual(response.json(), { code: "compaction_unavailable" });
+    const args = " \t备注  ";
+    const response = await app.inject({ method: "POST", url: `${url}/compact`, payload: { compactionId, args } });
+    assert.equal(response.statusCode, 200);
+    const { commandId } = response.json<{ commandId: string }>();
+    assert.ok(commandId);
+    assert.notEqual(commandId, compactionId);
+    assert.deepEqual(response.json(), { compactionId, commandId, status: "no_safe_range" });
     const history = await app.inject({ method: "GET", url });
-    assert.deepEqual(history.json().records, []);
-    assert.equal((await app.inject({ method: "POST", url: `${url}/cancel` })).statusCode, 404);
+    assert.deepEqual(history.json().records.map(({ event }: { event: { type: string; data: unknown } }) => [event.type, event.data]), [
+      ["command/run", { commandId, name: "compact", source: { kind: "user" }, args }],
+      ["command/done", { commandId, kind: "success", text: "No compactable history yet." }],
+    ]);
+    assert.equal((await app.inject({ method: "POST", url: `${url}/cancel` })).statusCode, 202);
     assert.equal(calls, 0);
   } finally { await app.close(); await rm(dir, { recursive: true, force: true }); }
 });
@@ -270,7 +277,7 @@ for (const id of ["%FF", "x".repeat(101)]) test(`绝对请求目标对异常 ID 
       req.on("error", reject); req.end(JSON.stringify({ compactionId }));
     });
     const valid = await post(address, "/api/%73essions/s/co%6Dpact");
-    assert.deepEqual(valid, { status: 503, body: { code: "compaction_unavailable" } });
+    assert.deepEqual(valid, { status: 404, body: { code: "session/not-found" } });
     const response = await post(address, `/api/%73essions/${id}/co%6Dpact`);
     assert.deepEqual(response, { status: 400, body: { commandId: null, result: { kind: "error", text: "压缩请求无效" } } });
     const path = `/api/sessions/${id}/messages`;

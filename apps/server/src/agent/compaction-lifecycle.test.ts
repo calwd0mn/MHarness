@@ -13,6 +13,7 @@ import { AgentManager } from "./manager.ts";
 import { createModelTurnDriver, type StepHookContext } from "./model-turn.ts";
 import { followSession } from "../session/follow.ts";
 import { AgentError, type RunTurn } from "./react-agent.ts";
+import { SessionWriter } from "../../../../packages/session/src/writer.ts";
 
 const summaryInput = { systemPrompt: "摘要", messages: [], tools: [] } as const;
 function summaryModel(onCall: () => void = () => {}) {
@@ -31,6 +32,70 @@ function deferred<TResult>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+for (const stage of ["checkpoint", "port"] as const) {
+  test(`真实写入器的 ${stage} 错误携带已接受 start 的身份并关闭准入`, async () => {
+    const session = new Session({ sessionId: stage, createdAt: 1 });
+    const fault = new Error(stage);
+    let blocked: unknown;
+    let calls = 0;
+    const persisted: ReturnType<Session["snapshot"]>["events"][number][] = [];
+    const writer = new SessionWriter(session, {
+      append: async events => {
+        if (stage === "port") throw fault;
+        persisted.push(...events);
+      },
+      read: async () => persisted,
+      flush: async () => { if (stage === "checkpoint") throw fault; },
+    });
+    const result = await runCompactionAttempt({
+      session, turn: null, signal: new AbortController().signal,
+      storageOpen: () => blocked === undefined, blockStorage: error => { blocked = error; },
+    }, () => ({ kind: "ready", input: summaryInput, model: summaryModel(() => { calls++; }) }));
+    assert.equal(result.status, "start-not-confirmed");
+    assert.equal(result.error, fault);
+    assert.equal(blocked, fault);
+    assert.equal(calls, 0);
+    assert.equal(session.seq, 1);
+    assert.deepEqual(session.snapshot().events[0]?.data, result.attempt);
+    await assert.rejects(writer.close(), (error: unknown) => error === fault);
+  });
+}
+
+for (const status of ["committed", "rolled-back", "pending-reconciliation"] as const) {
+  test(`暂存端口已接收后取消不覆盖 ${status} 结果`, async () => {
+    const session = new Session({ sessionId: `late-${status}`, createdAt: 1 });
+    const controller = new AbortController();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const fault = new Error(status);
+    const records: ReturnType<typeof session.snapshot>["events"][number][] = [];
+    let open = true;
+    const writer = new SessionWriter(session, {
+      append: async (events) => { records.push(...events); },
+      flush: async () => {},
+      read: async () => records,
+      commitStaged: async (events) => {
+        entered.resolve();
+        await release.promise;
+        if (status === "committed") { records.push(...events); return { status }; }
+        return { status, error: fault };
+      },
+      reconcileStaged: async () => ({ status: "rolled-back", error: fault }),
+    }, () => {});
+    const context = { session, storageOpen: () => open, blockStorage: () => { open = false; } };
+    const operation = commitCompactionBatch(context, () => [{ type: "compaction/start", data: { compactionId: "late", turn: null } }], { beforeSubmit: () => controller.signal.throwIfAborted() });
+    await entered.promise;
+    controller.abort(new Error("late cancellation"));
+    release.resolve();
+    const result = await operation;
+    assert.equal(result.status, status);
+    if (result.status !== "committed") assert.equal(result.error, fault);
+    assert.equal(open, status !== "pending-reconciliation");
+    assert.equal(session.snapshot().events.length, status === "committed" ? 1 : 0);
+    await writer.close();
+  });
 }
 
 async function persistedAgent(testContext: TestContext, runTurn: RunTurn) {
@@ -119,10 +184,10 @@ for (const scope of ["独立维护", "Turn 内"] as const) {
           assert.equal(result.status, "generated");
           assert.deepEqual(result.value.finishReason, { kind: "stop" });
         }
-        const committed = await commitCompactionBatch(context, (firstSeq) => cancel
+        context.session.appendBatch((firstSeq) => cancel
           ? [{ type: "compaction/end", data: { ...result.attempt, status: "cancelled", reason: "user" } }]
           : batch(firstSeq, result.attempt, { start: 1, end: 1 }));
-        assert.equal(committed.status, "committed");
+         await context.session.flush();
       };
       const { path, manager, agent, read } = await persistedAgent(testContext, createModelTurnDriver({
         runtime, config: () => ({ provider: "business", model: "m" }), systemPrompt: () => "业务",
@@ -138,10 +203,9 @@ for (const scope of ["独立维护", "Turn 内"] as const) {
       let startCommitChecked = false;
       const exec = DatabaseSync.prototype.exec;
       const monitor = testContext.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
-        if (sql === "COMMIT" && this.isTransaction && agent.session.stagedOccupied && readCount() === expectedStart) {
+        if (sql === "COMMIT" && this.isTransaction && observed.includes("compaction/start") && readCount() === 3) {
           startCommitChecked = true;
-          assert.equal(agent.session.seq, expectedStart);
-          assert.ok(!observed.includes("compaction/start"));
+          assert.equal(agent.session.seq, expectedStart + 1);
           assert.equal(summaryCalls, 0);
         }
         exec.call(this, sql);
@@ -231,12 +295,7 @@ for (const scope of ["独立维护", "Turn 内"] as const) {
 test("同步捕获后抢占 start，确认后 Adapter 仅使用已捕获值", async () => {
   const session = new Session({ sessionId: "s", createdAt: 1 });
   const commit = deferred<void>();
-  session.bindCheckpoint(async () => {}, async (_events, finish) => {
-    await commit.promise;
-    const result = { status: "committed" } as const;
-    finish(result);
-    return result;
-  });
+  session.bindCheckpoint(async () => { await commit.promise; });
   let system = "captured";
   let captures = 0;
   let atCaptureMicrotask: { occupied: boolean; seq: number } | undefined;
@@ -261,7 +320,7 @@ test("同步捕获后抢占 start，确认后 Adapter 仅使用已捕获值", as
   try {
     await Promise.resolve();
     assert.equal(system, "changed");
-    assert.deepEqual(atCaptureMicrotask, { occupied: true, seq: 0 });
+    assert.deepEqual(atCaptureMicrotask, { occupied: false, seq: 1 });
     assert.deepEqual(sent, []);
   } finally { commit.resolve(); }
   const result = await operation;
@@ -300,13 +359,7 @@ test("等待 start 确认期间关闭准入，确认后不消费模型流", asyn
   let open = true;
   let adapterCalls = 0;
   const prepared = summaryModel(() => { adapterCalls++; });
-  session.bindCheckpoint(async () => {}, async (_events, finish) => {
-    entered.resolve();
-    await commit.promise;
-    const result = { status: "committed" } as const;
-    finish(result);
-    return result;
-  });
+  session.bindCheckpoint(async () => { entered.resolve(); await commit.promise; });
   const operation = runCompactionAttempt(
     { session, turn: null, signal: new AbortController().signal, storageOpen: () => open, blockStorage: () => { open = false; } },
     () => ({ kind: "ready", input: summaryInput, model: prepared }),
@@ -316,7 +369,7 @@ test("等待 start 确认期间关闭准入，确认后不消费模型流", asyn
   open = false;
   commit.resolve();
   const result = await operation;
-  assert.equal(result.status, "generation-failed");
+  assert.equal(result.status, "start-not-confirmed");
   assert.ok(result.error instanceof Error && "code" in result.error && result.error.code === "storage_blocked");
   assert.equal(adapterCalls, 0);
   assert.deepEqual(session.snapshot().events.map((event) => event.type), ["compaction/start"]);
@@ -353,18 +406,13 @@ test("等待确认期间取消，保留提交的 start 且不启动生成", asyn
   const controller = new AbortController();
   const commit = deferred<void>();
   let calls = 0;
-  session.bindCheckpoint(async () => {}, async (_events, finish) => {
-    await commit.promise;
-    const result = { status: "committed" } as const;
-    finish(result);
-    return result;
-  });
+  session.bindCheckpoint(async () => { await commit.promise; });
   const operation = runCompactionAttempt(
     { session, turn: null, signal: controller.signal, storageOpen: () => true, blockStorage: () => assert.fail() },
     () => ({ kind: "ready", input: summaryInput, model: summaryModel(() => { calls++; }) }),
   );
   try {
-    assert.equal(session.stagedOccupied, true);
+    assert.equal(session.seq, 1);
     controller.abort();
   } finally { commit.resolve(); }
   const result = await operation;
@@ -376,7 +424,7 @@ test("等待确认期间取消，保留提交的 start 且不启动生成", asyn
   assert.deepEqual(events[0]?.data, result.attempt);
 });
 
-test("SQLite 确认 start 后关闭存储门，Adapter 不启动", async (testContext) => {
+test("SQLite 接受 start 通知期间关门，Adapter 不启动", async (testContext) => {
   const { agent, read } = await persistedAgent(testContext, async () => {});
   const original = new Error("gate closed on publish");
   const starts: unknown[] = [];
@@ -399,12 +447,12 @@ test("SQLite 确认 start 后关闭存储门，Adapter 不启动", async (testCo
     assert.equal(signal.aborted, false);
     return result;
   });
-  assert.equal(result.status, "generation-failed");
+  assert.equal(result.status, "start-not-confirmed");
   assert.ok(result.error instanceof Error && "code" in result.error && result.error.code === "storage_blocked");
-  const persisted = (await read())?.records.slice(3).map(({ event }) => event);
-  assert.equal(persisted?.length, 1);
-  assert.deepEqual(starts, persisted);
-  assert.deepEqual(persisted[0]?.data, result.attempt);
+  assert.equal((await read())?.records.length, 3);
+  assert.equal(starts.length, 1);
+  await agent.session.flush();
+  assert.deepEqual(starts, (await read())?.records.slice(3).map(({ event }) => event));
   assert.equal(agent.storageOpen, false);
   assert.equal(adapterCalls, 0);
 });
@@ -434,24 +482,20 @@ for (const mode of ["回滚", "待核对"] as const) {
         () => ({ kind: "ready", input: summaryInput, model: summaryModel(() => { calls++; }) }),
       ));
       assert.equal(result.status, "start-not-confirmed");
-      assert.equal(result.commit.status, mode === "回滚" ? "rolled-back" : "pending-reconciliation");
       assert.equal(agent.state, "idle");
       assert.equal(calls, 0);
-      if (mode === "回滚") {
-        assert.equal(agent.storageOpen, true);
-        db.exec("DROP TRIGGER fail_start");
-        await agent.session.flush();
-      } else {
-        assert.equal(result.commit.error, failure);
-        assert.equal(agent.session.stagedOccupied, true);
-        assert.equal(agent.storageOpen, false);
-        assert.throws(() => agent.prompt(prompt("new")), { code: "storage_blocked", cause: failure });
-        await assert.rejects(agent.runMaintenance(async () => {}), { code: "storage_blocked", cause: failure });
-        assert.deepEqual(agent.prompt(prompt("old")), { accepted: true });
-      }
+      assert.equal(agent.storageOpen, false);
+      assert.equal(agent.session.stagedOccupied, false);
+      if (mode === "待核对") assert.equal(result.error, failure);
+      assert.throws(() => agent.prompt(prompt("new")), { code: "storage_blocked" });
+      assert.deepEqual(agent.prompt(prompt("old")), { accepted: true });
       assert.deepEqual(await read(), prefix);
-      assert.deepEqual(observe, []);
-      assert.deepEqual(agent.snapshot().records, prefix?.records);
+      assert.deepEqual(observe, ["compaction/start"]);
+      assert.equal(agent.snapshot().records.length, (prefix?.records.length ?? 0) + 1);
+      enabled = false;
+      if (mode === "回滚") db.exec("DROP TRIGGER fail_start");
+      await agent.session.flush();
+      assert.deepEqual(agent.snapshot().records, (await read())?.records);
     } finally {
       enabled = false;
       fault.mock.restore();
@@ -536,8 +580,7 @@ for (const mode of ["仍占位", "普通 flush 已确认"] as const) {
       faultEnabled = true;
       const result = await runCompactionAttempt(context, () => ({ kind: "ready", input: summaryInput, model: summaryModel(() => { summaryCalls++; }) }));
       assert.equal(result.status, "start-not-confirmed");
-      assert.equal(result.commit.status, "pending-reconciliation");
-      pending.resolve(result.commit.error);
+      pending.resolve(result.error);
       await release.promise;
       context.blockStorage(secondFault);
     };
@@ -567,11 +610,11 @@ for (const mode of ["仍占位", "普通 flush 已确认"] as const) {
     const read = () => readPersistedSessionHistory(store, "s");
     agent.prompt(request);
     assert.equal(await pending.promise, fault);
-    assert.equal(agent.session.stagedOccupied, true);
+    assert.equal(agent.session.stagedOccupied, false);
     assert.equal(agent.storageOpen, false);
     const before = agent.session.snapshot().events.map((event) => event.type);
     const persisted = (await read())?.records.map(({ event }) => event.type);
-    assert.deepEqual(persisted, openStep ? before : [...before, "compaction/start"]);
+    assert.deepEqual(persisted, openStep ? before.slice(0, -1) : before);
     assert.deepEqual(observed, before);
     const follow = followSession(manager, read, "s", new AbortController().signal);
     testContext.after(async () => { await follow.return(undefined); });
@@ -582,8 +625,7 @@ for (const mode of ["仍占位", "普通 flush 已确认"] as const) {
       await agent.session.flush();
       assert.equal(agent.session.stagedOccupied, false);
       assert.equal(agent.storageOpen, false);
-      assert.deepEqual(observed, [...before, "compaction/start"]);
-      assert.deepEqual(followFrame(await follow.next()), agent.snapshot().records.at(-1));
+      assert.deepEqual(observed, before);
     }
     release.resolve();
     const error = await rejected.promise;
@@ -595,14 +637,14 @@ for (const mode of ["仍占位", "普通 flush 已确认"] as const) {
     assert.deepEqual(agent.prompt(request), { accepted: true });
     assert.equal(summaryCalls, 0);
     assert.equal(businessCalls, openStep ? 1 : 0);
-    assert.deepEqual(agent.session.snapshot().events.map((event) => event.type), persisted);
-    assert.deepEqual(observed, persisted);
+    assert.deepEqual(agent.session.snapshot().events.map((event) => event.type), before);
+    assert.deepEqual(observed, before);
     assert.deepEqual((await read())?.records.map(({ event }) => event.type), persisted);
     const lastFollow = followSession(manager, read, "s", new AbortController().signal);
     try {
       const reconnect = followFrame(await lastFollow.next());
       assert.equal(reconnect.type, "snapshot");
-      assert.deepEqual(reconnect.records.map(({ event }) => event.type), persisted);
+      assert.deepEqual(reconnect.records.map(({ event }) => event.type), before);
       assert.deepEqual(reconnect.assistantStream, first.assistantStream);
     } finally { await lastFollow.return(undefined); }
   });
@@ -850,7 +892,6 @@ for (const hookName of ["preStep", "recoverOverflow"] as const) {
   test(`Turn ${hookName} 待核对经 flush 释放后仍拒绝第二次压缩`, async () => {
     const session = new Session({ sessionId: "s", createdAt: 1 });
     const fault = new Error("pending");
-    let finishPending: (() => void) | undefined;
     let writes = 0;
     let summaryCalls = 0;
     let first: Awaited<ReturnType<typeof runCompactionAttempt>> | undefined;
@@ -858,15 +899,9 @@ for (const hookName of ["preStep", "recoverOverflow"] as const) {
     let occupiedAfterFlush: boolean | undefined;
     let second: { status: "resolved" } | { status: "rejected"; error: unknown } | undefined;
     const reports: unknown[] = [];
-    session.bindCheckpoint(async () => { finishPending?.(); finishPending = undefined; }, async (_events, finish) => {
-      writes++;
-      if (writes > 1) {
-        const result = { status: "committed" } as const;
-        finish(result);
-        return result;
-      }
-      finishPending = () => finish({ status: "committed" });
-      return { status: "pending-reconciliation", error: fault };
+
+    session.bindCheckpoint(async () => {
+      if (session.snapshot().events.at(-1)?.type === "compaction/start" && ++writes === 1) throw fault;
     });
     const hook = async (context: StepHookContext) => {
       first = await runCompactionAttempt(context, () => ({ kind: "ready", input: summaryInput, model: summaryModel(() => { summaryCalls++; }) }));
@@ -886,9 +921,8 @@ for (const hookName of ["preStep", "recoverOverflow"] as const) {
     session.append({ type: "turn/start", data: { turn: 1 } });
     await assert.rejects(driver({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: (error) => reports.push(error) }), (error) => error === fault);
     assert.equal(first?.status, "start-not-confirmed");
-    assert.equal(first.commit.status, "pending-reconciliation");
-    assert.equal(first.commit.error, fault);
-    assert.equal(occupiedBeforeFlush, true);
+    assert.equal(first.error, fault);
+    assert.equal(occupiedBeforeFlush, false);
     assert.equal(occupiedAfterFlush, false);
     assert.deepEqual(reports, [fault]);
     const types = session.snapshot().events.map((event) => event.type);
@@ -896,7 +930,7 @@ for (const hookName of ["preStep", "recoverOverflow"] as const) {
       second: second?.status,
       code: second?.status === "rejected" && second.error instanceof AgentError ? second.error.code : undefined,
       writes, summaryCalls, starts: types.filter((type) => type === "compaction/start").length,
-    }, { second: "rejected", code: "storage_blocked", writes: 1, summaryCalls: 0, starts: 1 });
+    }, { second: "rejected", code: "storage_blocked", writes: 2, summaryCalls: 0, starts: 1 });
     assert.equal(types.includes("step/end"), false);
     assert.equal(types.includes("turn/end"), false);
     assert.equal(types.includes("step/start"), hookName === "recoverOverflow");
@@ -932,7 +966,7 @@ test("同一 preStep 内压缩结算后仍允许再次压缩", async () => {
   session.append({ type: "turn/start", data: { turn: 1 } });
   session.append({ type: "user/message", surfaceOp: "append", data: { id: "u", role: "user", turn: 1, requestId: "r", source: { kind: "user" }, content: [{ type: "text", text: "消息" }] } });
   await driver({ session, turn: 1, step: 1, signal: new AbortController().signal, publish: () => {}, blockStorage: () => assert.fail() });
-  assert.equal(writes, 4);
+  assert.equal(writes, 2);
   assert.equal(summaryCalls, 2);
   const events = session.snapshot().events;
   const starts = events.flatMap((event) => event.type === "compaction/start" ? [event.data] : []);

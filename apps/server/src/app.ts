@@ -18,7 +18,9 @@ import type { Server } from "node:http";
 import { healthPath, healthResponseSchema } from "../../../config/health.ts";
 import { localConfig } from "../../../config/local.ts";
 import { AgentManager } from "./agent/manager.ts";
-import { createModelTurnDriver } from "./agent/model-turn.ts";
+import { createModelTurnDriver, type StepHookContext } from "./agent/model-turn.ts";
+import { runPreStepPressure } from "./agent/pre-step-pressure.ts";
+import { recoverContextOverflow } from "./agent/context-overflow-recovery.ts";
 import { ToolRegistry } from "./tools/registry.ts";
 import type { RunTurn } from "./agent/react-agent.ts";
 import { SessionCommandController } from "./commands.ts";
@@ -195,9 +197,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
   }
   const app = createHttpApp(logger, true);
   const approvalService = options.approvalService ?? new ApprovalService();
-  const driver = runTurn ?? createModelTurnDriver({
-    toolRegistry: options.toolRegistry, approvalService,
-    runtime: new LlmRuntime({ mock: { ...createMockAdapter((request) => {
+  const runtime = new LlmRuntime({ mock: { ...createMockAdapter((request) => {
       const text = request.messages.findLast((message) => message.role === "user")?.text ?? "";
       return [
         { delayMs: 100, chunk: { type: "text", delta: "模拟回答：" } },
@@ -212,12 +212,27 @@ export async function createEventSessionApp(path: string, logger = false, runTur
       return { ...createDeepSeekAdapter({ apiKey, ...(options.modelFetch ? { fetch: options.modelFetch } : {}) }),
         modelBudgets: { [deepseekModel]: { ...(contextWindow === undefined ? {} : { contextWindow }),
           ...(defaultOutputTokens === undefined ? {} : { defaultOutputTokens }) } } };
-    } }),
+    } });
+  const warnCompaction = (context: StepHookContext, entry: "pressure" | "context-overflow", reason: string) => {
+    const { provider, model } = context.header.config;
+    app.log.warn({ entry, reason, provider, model, turn: context.turn, step: context.step }, "自动压缩诊断");
+  };
+  const driver = runTurn ?? createModelTurnDriver({
+    toolRegistry: options.toolRegistry, approvalService, runtime,
     config: configuredModel,
     systemPrompt: () => "你是一个中文助手。",
+    preStep: (context, operations) => runPreStepPressure(context, operations,
+      reason => warnCompaction(context, "pressure", reason), localConfig.compaction.compactionRetries),
+    recoverOverflow: (context, operations) => recoverContextOverflow(context, operations,
+      reason => warnCompaction(context, "context-overflow", reason)),
   });
   const agents = new AgentManager(persistence, driver);
-  const commands = new SessionCommandController(agents);
+  const commands = new SessionCommandController(agents, () => {
+    const businessModel = runtime.prepare(configuredModel(), { recordable: true });
+    const businessTools = options.toolRegistry?.definitions() ?? [];
+    return { runtime, businessModel, businessTools, retainTokens: 0,
+      ...(businessModel.route.provider === "deepseek" ? { disableReasoningEffort: "none" } : {}) };
+  });
   let recovered = false;
   app.decorate("sessionCommands", { getter: () => {
     if (!recovered) throw new Error("会话恢复尚未完成");
@@ -234,6 +249,10 @@ export async function createEventSessionApp(path: string, logger = false, runTur
       }
     }
     recovered = true;
+  });
+  app.addHook("preClose", async () => {
+    // 活动 /compact 要先收到取消才能结束 HTTP 请求，关闭错误由 onClose 汇总。
+    void agents.close().catch(() => {});
   });
   app.addHook("onClose", async () => {
     try {
