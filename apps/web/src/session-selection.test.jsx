@@ -267,9 +267,11 @@ test("双窗口创建空会话后按首次 Turn 与活动时间同步侧栏", as
     expect(localStorage.getItem(key)).toBe('{"sessionId":"x"}');
     const write = vi.spyOn(Storage.prototype, "setItem");
     try {
-      await act(async () => sources[0].frame({ type: "api-session/updated", revision: 2, sessionId: "x", blank: false, seq: 0 }));
+      await act(async () => sources[0].frame({ type: "api-session/status", revision: 2, sessionId: "x", running: true }));
+      expect(ids(containers[0])).toEqual(["a", "b"]);
+      await act(async () => sources[0].frame({ type: "api-session/updated", revision: 3, sessionId: "x", blank: false, seq: 0 }));
       expect(ids(containers[0])).toEqual(["x", "a", "b"]);
-      await act(async () => sources[0].frame({ type: "api-session/activity", revision: 3, sessionId: "b", updatedAt: 3 }));
+      await act(async () => sources[0].frame({ type: "api-session/activity", revision: 4, sessionId: "b", updatedAt: 3 }));
       expect(ids(containers[0])).toEqual(["b", "x", "a"]);
       expect(containers[0].querySelector('[aria-current="page"]').textContent).toContain("a");
       expect(localStorage.getItem(key)).toBe('{"sessionId":"x"}'); expect(write).not.toHaveBeenCalled();

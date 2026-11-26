@@ -127,6 +127,16 @@ pnpm dev
 
 以下 PowerShell 示例直接请求本机 Fastify。
 
+`GET /api/sessions` 返回当前后端的完整目录快照 `{ revision, sessions }`，包含已提交会话、兼容的在线状态和正在创建的会话。查询不加载 Agent、不读取事件正文，也不会推进目录版本或广播通知。旧会话没有可用目录检查点时，使用 `blank: false`、`updatedAt: createdAt` 的冷摘要，目录重建无需扫描历史正文。
+
+`GET /api/session-directory/events` 提供独立的目录 SSE。服务端注册监听后先发送 `api-session/ready`，随后发送本进程内的实时目录通知；Web 每次收到 ready 后读取全量快照，重连也重新读取快照以补齐断线期间的变化。`revision` 只属于当前后端进程，重启后从零开始。单会话聊天历史与实时内容仍由对应的 follow 接口提供。
+
+首版目录的实时通知限于单个后端实例，目录快照为全量返回。不同环境应通过 `MHARNESS_SESSION_DB_PATH` 使用各自的 SQLite 数据库；共用同一文件不会隔离环境。部署升级时先部署提供目录 GET 和 SSE 的后端，再部署 Web。
+
+部署时，浏览器侧代理应通过 HTTPS 协商 HTTP/2，让同源的目录 SSE、会话 follow 和普通 API 请求可以共享连接。HTTP/1.1 下，三个各自打开会话的标签页就可能占满浏览器的六条同源连接。代理到本地 Fastify 可继续使用 HTTP/1.1，并应流式转发 SSE。
+
+启动时，新选择键缺失才会读取旧选中提示。目录确认提示中的会话后，支持 Web Locks 的浏览器会在同源锁内复核提示并尝试保存到新键，写入成功后再尝试清理旧目录键。持久化未成功时，本页仍可使用已确认的选择。回退到旧版 Web 后，旧侧栏会从浏览器重新积累目录。
+
 ```powershell
 $api = 'http://127.0.0.1:3000/api'
 $session = Invoke-RestMethod -Method Post -Uri "$api/sessions" -ContentType 'application/json' -Body '{}'
