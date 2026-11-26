@@ -4,7 +4,6 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   createSessionResponseSchema,
   promptResponseSchema,
-  rawSessionHistorySchema,
   sessionCreationPendingSchema,
 } from "@mharness/session/contracts";
 import { localConfig } from "../../../../config/local.ts";
@@ -19,8 +18,9 @@ import {
 } from "./submission.ts";
 import {
   browserStorage,
-  loadDirectory,
-  saveDirectory,
+  loadSelection,
+  saveSelection,
+  confirmInitialSelection,
 } from "./directory.ts";
 import { lastTurn, messages } from "./view.ts";
 import { compareDirectoryEntries, DirectoryController, type DirectoryEntry, type DirectoryState } from "./directory-controller.ts";
@@ -39,24 +39,34 @@ const initialState: FollowState = {
 };
 
 /**
- * 管理会话目录、选中会话及草稿。目录同步失败时保留已展示目录和恢复提示，卸载时释放两条订阅。
- * @returns 页面状态和动作。目录重试独立于选中会话的 follow，草稿在页面存活期间按会话保存。
+ * 管理会话目录、选中会话及草稿。关闭会话仅清空本页选择并释放 follow，不取消后台任务。
+ * 本页选择需要保存时，follow 等待该次保存完成或失败后再打开。清空共享提示尚未完成时提供等待状态。
+ * 目录同步失败时保留已展示目录和恢复提示，卸载时释放两条订阅。
+ * 创建返回 503 时仅通过目录撤回或完整快照对账；目录出现该 ID 不代表已确认保存。
+ * @returns 页面状态和动作。pendingCreations 为本页尚未对账的未知创建 ID，creationWithdrawn 表示本页未知创建已被撤回或被在途对账确认为缺失；目录重试独立于选中会话的 follow，草稿在页面存活期间按会话保存。
  */
 export function useConversation() {
   const approvals = useApprovals();
-  const [initialDirectory] = useState(() => loadDirectory(browserStorage()));
-  const [directory, setDirectory] = useState<{ entries: DirectoryEntry[]; selected: string | null; protectedIds: Record<string, number> }>({ entries: [], selected: null, protectedIds: {} });
+  const [initialHint] = useState(() => loadSelection(browserStorage()));
+  const [directory, setDirectory] = useState<{
+    entries: DirectoryEntry[];
+    selected: string | null;
+    protectedIds: Record<string, number>;
+    selectionWrite?: Promise<void>;
+  }>({ entries: [], selected: null, protectedIds: {} });
   const directoryRef = useRef(directory);
-  const hint = useRef(initialDirectory.selected);
   const initialized = useRef(false);
   const creationSequence = useRef(0);
   const removedIds = useRef(new Set<string>());
+  const snapshotKnownIds = useRef(new Set<string>());
+  const completedSnapshot = useRef(0);
+  const directoryMembers = useRef(new Set<string>());
   const creationInFlight = useRef(false);
   const [directoryFailed, setDirectoryFailed] = useState(false);
   const directoryController = useRef<DirectoryController | null>(null);
   function updateDirectory(next: typeof directory) { directoryRef.current = next; setDirectory(next); }
-  const selected = directory.selected;
-  const sessions = directory.entries.filter((entry) => !entry.blank || entry.sessionId === selected || Object.hasOwn(directory.protectedIds, entry.sessionId)).map((entry) => entry.sessionId);
+  const { selected, selectionWrite } = directory;
+  const sessions = directory.entries.filter((entry) => !entry.blank || entry.sessionId === selected).map((entry) => entry.sessionId);
   const selectionRevision = useRef(0);
   const mounted = useRef(false);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -64,9 +74,9 @@ export function useConversation() {
     const current = directoryRef.current;
     if (id !== null && !current.entries.some((entry) => entry.sessionId === id)) return;
     selectionRevision.current++;
-    hint.current = id;
-    updateDirectory({ ...current, selected: id });
-    saveDirectory(browserStorage(), { sessions: current.entries.map((entry) => entry.sessionId), selected: id });
+    if (current.selected === id) return;
+    const selectionWrite = saveSelection(browserStorage(), id) ?? undefined;
+    updateDirectory({ ...current, selected: id, selectionWrite });
   }
   const [state, setState] = useState<FollowState>(initialState);
   const compaction = useCompaction(selected, state, sessionPath);
@@ -86,9 +96,12 @@ export function useConversation() {
   const [notice, setNotice] = useState("");
   const [creating, setCreating] = useState(false);
   const [pendingCreationChecks, setPendingCreationChecks] = useState<{ id: string; sequence: number }[]>([]);
+  const pendingRef = useRef(pendingCreationChecks);
+  const [creationWithdrawn, setCreationWithdrawn] = useState(false);
   const pendingCreations = pendingCreationChecks.map(({ id }) => id);
+  function updatePending(items: typeof pendingCreationChecks) { pendingRef.current = items; setPendingCreationChecks(items); }
   function forgetPendingCreation(id: string) {
-    setPendingCreationChecks((items) => items.filter((item) => item.id !== id));
+    updatePending(pendingRef.current.filter((item) => item.id !== id));
   }
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
@@ -132,7 +145,21 @@ export function useConversation() {
     };
   }, []);
   useEffect(() => {
-    controller.current?.select(selected);
+    let active = true;
+    if (selectionWrite) {
+      controller.current?.select(null);
+      void selectionWrite.then(() => {
+        const current = directoryRef.current;
+        if (!active || current.selected !== selected || current.selectionWrite !== selectionWrite) return;
+        if (selected) controller.current?.select(selected);
+        else updateDirectory({ ...current, selectionWrite: undefined });
+      });
+    } else {
+      controller.current?.select(selected);
+    }
+    return () => { active = false; };
+  }, [selected, selectionWrite]);
+  useEffect(() => {
     setNotice("");
   }, [selected]);
   useEffect(() => {
@@ -148,35 +175,57 @@ export function useConversation() {
         if (!response.ok) throw new Error("目录读取失败");
         return response.json() as Promise<unknown>;
       },
-      onSnapshotStart: () => creationSequence.current,
+      onSnapshotStart: () => {
+        snapshotKnownIds.current = new Set(directoryRef.current.entries.map((entry) => entry.sessionId));
+        return creationSequence.current;
+      },
       onFailure: () => setDirectoryFailed(true),
       onCoveredRemoval(id) {
         if (creationInFlight.current) removedIds.current.add(id);
+        if (pendingRef.current.some((item) => item.id === id)) setCreationWithdrawn(true);
         forgetPendingCreation(id);
+        const current = directoryRef.current;
+        if (!Object.hasOwn(current.protectedIds, id)) return;
+        const protectedIds = { ...current.protectedIds };
+        delete protectedIds[id];
+        const selected = current.selected === id ? null : current.selected;
+        const selectionWrite = current.selected === id ? saveSelection(browserStorage(), null) ?? undefined : current.selectionWrite;
+        updateDirectory({ ...current, entries: current.entries.filter((entry) => entry.sessionId !== id), selected, protectedIds, selectionWrite });
       },
       onState(next: DirectoryState) {
         const current = directoryRef.current;
         const protectedIds = { ...current.protectedIds };
         const listedIds = new Set(next.sessions.map((entry) => entry.sessionId));
-        const withdrawnIds = new Set(next.removed);
-        for (const id of next.removed) { if (creationInFlight.current) removedIds.current.add(id); delete protectedIds[id]; }
-        for (const entry of next.sessions) { removedIds.current.delete(entry.sessionId); delete protectedIds[entry.sessionId]; }
+        const withdrawnIds = new Set(next.withdrawn ?? []);
+        directoryMembers.current = listedIds;
+        if (next.snapshotToken !== undefined) completedSnapshot.current++;
+        if (next.snapshotToken !== undefined && creationInFlight.current) {
+          for (const id of next.removed) if (snapshotKnownIds.current.has(id)) removedIds.current.add(id);
+        }
+        for (const id of next.withdrawn ?? []) { if (creationInFlight.current) removedIds.current.add(id); delete protectedIds[id]; }
+        for (const entry of next.sessions) { if (!next.errorOnly) { removedIds.current.delete(entry.sessionId); delete protectedIds[entry.sessionId]; } }
         if (next.snapshotToken !== undefined) {
           for (const [id, sequence] of Object.entries(protectedIds)) if (sequence <= next.snapshotToken) delete protectedIds[id];
         }
         const entries = [...next.sessions];
         for (const entry of current.entries) if (Object.hasOwn(protectedIds, entry.sessionId) && !entries.some((item) => item.sessionId === entry.sessionId)) entries.push(entry);
         entries.sort(compareDirectoryEntries);
-        const desired = initialized.current ? current.selected : (current.selected ?? hint.current);
+        const restoring = !initialized.current && selectionRevision.current === 0;
+        const desired = restoring ? (initialHint.selection.sessionId ?? null) : current.selected;
         const selected = desired && entries.some((entry) => entry.sessionId === desired) ? desired : null;
-        if (desired && !selected && loadDirectory(browserStorage()).selected === desired) saveDirectory(browserStorage(), { sessions: [], selected: null });
+        let selectionWrite = current.selectionWrite;
+        if (restoring) selectionWrite = confirmInitialSelection(browserStorage(), initialHint, selected !== null) ?? undefined;
+        else if (desired && !selected) selectionWrite = saveSelection(browserStorage(), null) ?? undefined;
         initialized.current = true;
-        updateDirectory({ entries, selected, protectedIds });
+        updateDirectory({ entries, selected, protectedIds, selectionWrite });
         const readStartedAt = next.snapshotToken;
-        setPendingCreationChecks((items) => items.filter(({ id, sequence }) =>
-          !withdrawnIds.has(id) && (readStartedAt === undefined || sequence > readStartedAt || listedIds.has(id)),
-        ));
+        const remaining = pendingRef.current.filter(({ id, sequence }) =>
+          !withdrawnIds.has(id) && (readStartedAt === undefined || listedIds.has(id) || (sequence > readStartedAt && !snapshotKnownIds.current.has(id))),
+        );
+        if (remaining.length < pendingRef.current.length) setCreationWithdrawn(true);
+        updatePending(remaining);
         setDirectoryFailed(false);
+        if (readStartedAt !== undefined && remaining.some(({ id, sequence }) => sequence > readStartedAt && !listedIds.has(id))) instance.retry();
       },
     });
     directoryController.current = instance; instance.start();
@@ -192,19 +241,25 @@ export function useConversation() {
       ...current.entries,
       { sessionId, createdAt: now, updatedAt: now, blank: true, running: false },
     ].sort(compareDirectoryEntries);
-    const protectedIds = exists ? current.protectedIds : { ...current.protectedIds, [sessionId]: ++creationSequence.current };
+    const protectedIds = { ...current.protectedIds, [sessionId]: ++creationSequence.current };
     const selected = selectionRevision.current === revision ? sessionId : current.selected;
-    updateDirectory({ entries, selected, protectedIds });
-    if (selectionRevision.current === revision) { hint.current = sessionId; saveDirectory(browserStorage(), { sessions: entries.map((entry) => entry.sessionId), selected }); }
+    let selectionWrite = current.selectionWrite;
+    if (selectionRevision.current === revision && current.selected !== sessionId) {
+      selectionRevision.current++;
+      selectionWrite = saveSelection(browserStorage(), sessionId) ?? undefined;
+    }
+    updateDirectory({ entries, selected, protectedIds, selectionWrite });
   }
 
   async function createSession() {
     if (creating) return;
     const revision = selectionRevision.current;
+    const snapshotCount = completedSnapshot.current;
     setCreating(true);
     creationInFlight.current = true;
     removedIds.current.clear();
     setNotice("");
+    setCreationWithdrawn(false);
     try {
       const response = await fetch(`${api}/sessions`, {
         method: "POST",
@@ -215,8 +270,9 @@ export function useConversation() {
         const result = sessionCreationPendingSchema.parse(await response.json());
         if (mounted.current && !removedIds.current.has(result.sessionId)) {
           const pending = { id: result.sessionId, sequence: ++creationSequence.current };
-          setPendingCreationChecks((items) => [...items, pending]);
-        }
+          updatePending([...pendingRef.current.filter((item) => item.id !== pending.id), pending]);
+          if (completedSnapshot.current > snapshotCount && !directoryMembers.current.has(result.sessionId)) directoryController.current?.retry();
+        } else if (mounted.current) setCreationWithdrawn(true);
         return;
       }
       if (!response.ok) throw new Error();
@@ -234,30 +290,6 @@ export function useConversation() {
     }
   }
 
-  async function retryCreationCheck(sessionId: string) {
-    if (creating || !pendingCreations.includes(sessionId)) return;
-    const revision = selectionRevision.current;
-    setCreating(true);
-    setNotice("");
-    try {
-      const response = await fetch(sessionPath(sessionId), { cache: "no-store" });
-      if (!mounted.current) return;
-      if (response.status === 404 && (await response.json())?.code === "session_not_found") {
-        if (!mounted.current) return;
-        forgetPendingCreation(sessionId);
-        setNotice("创建会话失败，请重试。");
-        return;
-      }
-      if (!response.ok) throw new Error();
-      const history = rawSessionHistorySchema.parse(await response.json());
-      if (history.sessionId !== sessionId) throw new Error();
-      if (mounted.current) confirmCreation(sessionId, revision);
-    } catch {
-      if (mounted.current) setNotice("暂时无法确认会话是否已保存，请重试核实。");
-    } finally {
-      if (mounted.current) setCreating(false);
-    }
-  }
   async function send(event: FormEvent) {
     event.preventDefault();
     const id = selected;
@@ -339,5 +371,5 @@ export function useConversation() {
       state.inheritedEventCount,
     ).status === "accepted";
   const visibleMessages = state.sessionId === selected ? messages(state) : [];
-  return { approvals, sessions, selected, directoryFailed, retryDirectory: () => directoryController.current?.retry(), setSelected, state, submissions, text, setText, notice, creating, controller, createSession, pendingCreations, retryCreationCheck, send, cancel, submission, confirmedRecord, visibleMessages, compaction };
+  return { approvals, sessions, selected, selectionClearPending: selected === null && selectionWrite !== undefined, directoryFailed, retryDirectory: () => directoryController.current?.retry(), setSelected, state, submissions, text, setText, notice, creating, controller, createSession, pendingCreations, creationWithdrawn, send, cancel, submission, confirmedRecord, visibleMessages, compaction };
 }

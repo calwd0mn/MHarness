@@ -97,7 +97,7 @@ test("真实 Agent、SQLite、HTTP 和 SSE 驱动审批刷新、决定与恢复"
     }
     vi.stubGlobal("EventSource", NetworkEventSource);
     localStorage.clear();
-    localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId], selected: sessionId }));
+    localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: sessionId }));
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
     await act(async () => root.render(<App />));
     await waitFor(() => container.textContent.includes("已连接"));
@@ -140,7 +140,7 @@ test("真实 Agent、SQLite、HTTP 和 SSE 驱动审批刷新、决定与恢复"
     const secondCreated = await post("/api/sessions", {});
     const secondId = (await secondCreated.json()).sessionId;
     const secondPath = `/api/sessions/${secondId}`;
-    localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [secondId], selected: secondId }));
+    localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: secondId }));
     await act(async () => root.unmount()); root = createRoot(container);
     await act(async () => root.render(<App />));
     await waitFor(() => container.textContent.includes("已连接"));
@@ -156,7 +156,7 @@ test("真实 Agent、SQLite、HTTP 和 SSE 驱动审批刷新、决定与恢复"
     expect(rejectedHistory.records.find(record => record.event.type === "approval/decided").event.data.outcome).toBe("rejected");
     expect(rejectedHistory.records.find(record => record.event.type === "tool/result").event.data.error.code).toBe("APPROVAL_REJECTED");
     expect(executions).toBe(1);
-    localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId], selected: sessionId }));
+    localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: sessionId }));
     recovered = await createEventSessionApp(join(dir, "recovery.sqlite"));
     const recoveryOrigin = await listen(recovered);
     const stale = await nativeFetch(recoveryOrigin + decisionPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outcome: "allowed-once" }) });

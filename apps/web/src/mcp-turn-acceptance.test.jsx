@@ -216,7 +216,7 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     const post = (path, body) => nativeFetch(origin + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const { sessionId } = await (await post("/api/sessions", {})).json();
     const path = `/api/sessions/${sessionId}`;
-    localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId], selected: sessionId }));
+    localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: sessionId }));
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
     await act(async () => root.render(<App />)); await waitFor(() => sources.length === 1); const initial = await sources[0].next();
     expect(initial.type).toBe("snapshot");

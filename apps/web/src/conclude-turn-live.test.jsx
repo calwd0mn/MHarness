@@ -97,7 +97,7 @@ test("结束意向保留到批次完成，后续明确错误仍展示并持久�
     const post = (path, body) => nativeFetch(origin + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const { sessionId } = await (await post("/api/sessions", {})).json();
     const path = `/api/sessions/${sessionId}`;
-    localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId], selected: sessionId }));
+    localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: sessionId }));
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
     await act(async () => root.render(<App />));
     await waitFor(() => sources.length === 1);

@@ -8,8 +8,12 @@ export interface DirectoryState {
   sessions: DirectoryEntry[];
   /** 本次确认缺失的先前可见项或收到撤回的项，供调用方对账。 */
   removed: string[];
+  /** 本次有效撤回，不包含仅由快照缺项推断的条目。 */
+  withdrawn?: string[];
   /** 仅安装快照时携带读取开始时的调用方令牌。 */
   snapshotToken?: number;
+  /** 错误帧只更新错误信息，不确认目录成员关系。 */
+  errorOnly?: boolean;
 }
 interface Options {
   /** 建立订阅；关闭订阅不得取消后端运行。 */
@@ -18,7 +22,7 @@ interface Options {
   read(signal: AbortSignal): Promise<unknown>;
   /** 收到完整合并结果；读取中保留上一次结果。 */
   onState(state: DirectoryState): void;
-  /** 目录进度已覆盖迟到的撤回且该会话仍缺失时，通知调用方对账待核实创建。 */
+  /** 目录进度已覆盖迟到的撤回且该会话仍缺失时，通知调用方对账本地创建条目。 */
   onCoveredRemoval?(sessionId: string): void;
   /** 读取失败后调用，等待调用方主动重试。 */
   onFailure?(): void;
@@ -40,6 +44,7 @@ interface Generation {
 function apply(state: DirectoryState, frames: readonly SessionDirectoryMutation[]): DirectoryState | null {
   const entries = new Map(state.sessions.map((item) => [item.sessionId, item]));
   const removed = new Set(state.removed);
+  const withdrawn = new Set(state.withdrawn);
   let revision = state.revision;
   for (const frame of frames) {
     if (frame.revision <= revision) continue;
@@ -53,6 +58,7 @@ function apply(state: DirectoryState, frames: readonly SessionDirectoryMutation[
     } else if (frame.type === "api-session/removed") {
       entries.delete(frame.sessionId);
       removed.add(frame.sessionId);
+      withdrawn.add(frame.sessionId);
     } else {
       const entry = entries.get(frame.sessionId);
       if (!entry) continue;
@@ -66,6 +72,7 @@ function apply(state: DirectoryState, frames: readonly SessionDirectoryMutation[
     revision,
     sessions: [...entries.values()].sort(compareDirectoryEntries),
     removed: [...removed].filter((id) => !entries.has(id)),
+    withdrawn: [...withdrawn].filter((id) => !entries.has(id)),
   };
 }
 
@@ -133,7 +140,7 @@ export class DirectoryController {
     if (frame.type === "api-session/error") {
 
       if (!this.state?.sessions.some((entry) => entry.sessionId === frame.sessionId)) return;
-      this.state = { ...this.state, removed: [], snapshotToken: undefined, sessions: this.state.sessions.map((entry) => entry.sessionId === frame.sessionId ? { ...entry, lastAgentError: frame.message } : entry) };
+      this.state = { ...this.state, removed: [], withdrawn: [], snapshotToken: undefined, errorOnly: true, sessions: this.state.sessions.map((entry) => entry.sessionId === frame.sessionId ? { ...entry, lastAgentError: frame.message } : entry) };
       this.options.onState(this.state); return;
     }
     if (!generation.installed) { generation.buffer.push(frame); return; }
@@ -144,7 +151,7 @@ export class DirectoryController {
       }
       return;
     }
-    const next = apply({ ...this.state, removed: [], snapshotToken: undefined }, [frame]);
+    const next = apply({ ...this.state, removed: [], withdrawn: [], snapshotToken: undefined, errorOnly: false }, [frame]);
     if (!next) { this.reconnect(); return; }
     if (next.revision !== this.state.revision) { this.state = next; this.options.onState(next); }
   }
@@ -154,9 +161,10 @@ export class DirectoryController {
       if (this.generation !== generation) return;
       const previous = new Map(this.state?.sessions.map((entry) => [entry.sessionId, entry]));
       const removed = [...previous.keys()];
+      const withdrawn: string[] = [];
       for (const frame of generation.buffer) {
         // 快照已经吸收这些撤回；保留 ID 供待核实创建对账。
-        if (frame.type === "api-session/removed" && frame.revision <= snapshot.revision) removed.push(frame.sessionId);
+        if (frame.type === "api-session/removed" && frame.revision <= snapshot.revision) { removed.push(frame.sessionId); withdrawn.push(frame.sessionId); }
       }
       const candidate = apply({
         revision: snapshot.revision,
@@ -165,6 +173,7 @@ export class DirectoryController {
           return error === undefined ? entry : { ...entry, lastAgentError: error };
         }),
         removed,
+        withdrawn,
         snapshotToken: generation.token,
       }, generation.buffer);
       if (!candidate) { this.reconnect(); return; }

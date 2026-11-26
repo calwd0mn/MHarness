@@ -32,7 +32,7 @@ beforeEach(async () => {
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   connections.length = 0;
   localStorage.clear();
-  localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a", "b"], selected: "a" }));
+  localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "a" }));
   vi.stubGlobal("EventSource", Source);
   vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) }));
   container = document.createElement("div"); document.body.append(container);
@@ -42,31 +42,14 @@ beforeEach(async () => {
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
 
-test.each([200, 404])("创建结果未知时保留临时项，按原 ID 核实返回 %s", async (status) => {
-  const sessionId = "pending";
-  fetch.mockResolvedValueOnce({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId }) });
+test("创建结果未知时显示非交互状态并保留选择", async () => {
+  fetch.mockResolvedValueOnce({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "pending" }) });
   await click(button("新建会话"));
-  expect(button("核实待保存会话").textContent).toContain(sessionId);
-  expect(connections.map(({ url }) => url)).toEqual(["/api/sessions/a/follow"]);
-
-  fetch.mockRejectedValueOnce(new Error("still offline"));
-  await click(button("核实待保存会话"));
-  expect(button("核实待保存会话")).toBeDefined();
-  expect(fetch.mock.calls[1]).toEqual(["/api/sessions/pending", { cache: "no-store" }]);
-
-  fetch.mockResolvedValueOnce({ status, ok: status === 200, json: async () => status === 200
-    ? { sessionId, inheritedEventCount: 0, cursor: -1, records: [] }
-    : { code: "session_not_found" } });
-  await click(button("核实待保存会话"));
-  expect(fetch.mock.calls[2]).toEqual(fetch.mock.calls[1]);
+  expect(container.textContent).toContain("创建结果未知");
   expect(button("核实待保存会话")).toBeUndefined();
-  if (status === 200) {
-    expect(container.querySelector('nav [aria-current="page"] small').textContent).toBe(sessionId);
-    expect(connections.at(-1).url).toBe("/api/sessions/pending/follow");
-  } else {
-    expect(button("会话 3")).toBeUndefined();
-    expect(container.textContent).toContain("创建会话失败");
-  }
+  expect(localStorage.getItem("mharness.sessions.current")).toBe('{"sessionId":"a"}');
+  expect(connections.map(({ url }) => url)).toEqual(["/api/sessions/a/follow"]);
+  expect(fetch.mock.calls).toHaveLength(1);
 });
 
 test("首屏和切换只订阅选中会话，旧回调不能覆盖当前画面", async () => {
@@ -828,7 +811,7 @@ test("迟到创建成功加入目录但不抢显式选择，即使切回原会�
   await click(button("新建会话")); await click(button("会话 2")); await click(button("会话 1"));
   await act(async () => resolve({ ok: true, json: async () => ({ sessionId: "c" }) })); await flush();
   expect(container.querySelector('nav [aria-current="page"] small').textContent).toBe("a");
-  expect([...container.querySelectorAll("nav button small")].some((item) => item.textContent === "c")).toBe(true);
+  expect([...container.querySelectorAll("nav button small")].some((item) => item.textContent === "c")).toBe(false);
 });
 
 test("迟到创建失败不污染新会话通知", async () => {

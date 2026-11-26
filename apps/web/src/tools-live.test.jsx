@@ -108,7 +108,7 @@ test("真实工具流、快照和持久历史一致地呈现参数与结果", as
     vi.stubGlobal("EventSource", RealSource);
     const created = await nativeFetch(`${base}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const { sessionId } = await created.json();
-    localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: [sessionId, "recovered"], selected: sessionId }));
+    localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: sessionId }));
     root = createRoot(container); await act(async () => root.render(<App />));
     await until(() => source); expect((await source.next()).type).toBe("snapshot");
     const submitted = await nativeFetch(`${base}/api/sessions/${sessionId}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId: "request", content: [{ type: "text", text: "查询" }] }) });

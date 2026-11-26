@@ -8,8 +8,8 @@ import { commandCards, lastTurn } from "../../session/view.ts";
 import type { useConversation } from "../../session/use-conversation.ts";
 
 
-/** 显示最近一次有效目录及创建入口，目录读取失败时提供独立重试。 */
-export function SessionNavigation({ sessions, selected, setSelected, creating, createSession, pendingCreations, retryCreationCheck, directoryFailed, retryDirectory }: Pick<ReturnType<typeof useConversation>, "sessions" | "selected" | "setSelected" | "creating" | "createSession" | "pendingCreations" | "retryCreationCheck" | "directoryFailed" | "retryDirectory">) {
+/** 显示最近一次有效目录及创建入口；未知创建和撤回以非交互状态提示，目录读取失败时提供独立重试。 */
+export function SessionNavigation({ sessions, selected, setSelected, creating, createSession, pendingCreations, creationWithdrawn, directoryFailed, retryDirectory }: Pick<ReturnType<typeof useConversation>, "sessions" | "selected" | "setSelected" | "creating" | "createSession" | "pendingCreations" | "creationWithdrawn" | "directoryFailed" | "retryDirectory">) {
   const [expanded, setExpanded] = useState(true);
   return (
     <aside className={"sidebar " + styles["sidebar"]}>
@@ -34,6 +34,8 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
           </svg>
           新建会话
         </Button>
+        {pendingCreations.length > 0 && <p role="status">创建结果未知，暂未确认。</p>}
+        {creationWithdrawn && <p role="status">创建会话失败，请重试。</p>}
         <Button aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? "收起会话导航" : "展开会话导航"}</Button>
         {expanded && <div className={"session-directory " + styles["session-directory"]}>
           <h2 className={"section-label " + styles["section-label"]}>会话</h2>
@@ -50,21 +52,15 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
                 <small>{id}</small>
               </Button>
             ))}
-            {pendingCreations.map((id) => (
-              <Button key={id} onClick={() => void retryCreationCheck(id)} disabled={creating}>
-                核实待保存会话
-                <small>{id}</small>
-              </Button>
-            ))}
           </nav>
-          {sessions.length === 0 && pendingCreations.length === 0 && <p className={"directory-empty " + styles["directory-empty"]}>还没有会话</p>}
+          {sessions.length === 0 && <p className={"directory-empty " + styles["directory-empty"]}>还没有会话</p>}
         </div>}
       </aside>
   );
 }
 
-/** 显示所选会话和运行状态。 */
-export function ConversationHeader({ selected, sessions, state, cancel, compaction }: Pick<ReturnType<typeof useConversation>, "selected" | "sessions" | "state" | "cancel" | "compaction">) {
+/** 显示所选会话和运行状态；关闭会话只释放本页 follow，取消任务独立作用于后端运行。 */
+export function ConversationHeader({ selected, sessions, state, cancel, compaction, setSelected, selectionClearPending }: Pick<ReturnType<typeof useConversation>, "selected" | "sessions" | "state" | "cancel" | "compaction" | "setSelected" | "selectionClearPending">) {
   return (
     <header className={"conversation-header " + styles["conversation-header"]}>
           <div>
@@ -73,19 +69,22 @@ export function ConversationHeader({ selected, sessions, state, cancel, compacti
                 ? `会话 ${sessions.indexOf(selected) + 1}`
                 : "开始一个会话"}
             </h2>
-            <p>
+            <p role={selectionClearPending ? "status" : undefined}>
               {selected
-                ? state.status === "ready"
-                  ? (lastTurn(state.records) ?? "已连接")
-                  : state.status === "syncing"
-                    ? "正在同步"
+                ? state.sessionId !== selected || state.status === "syncing" || state.status === "idle"
+                  ? "正在同步"
+                  : state.status === "ready"
+                    ? (lastTurn(state.records) ?? "已连接")
                     : "同步失败"
-                : "创建会话后即可发送消息"}
+                : selectionClearPending ? "正在清除恢复提示" : "创建会话后即可发送消息"}
             </p>
           </div>
           {compaction.label && <p role="status">{compaction.label}</p>}
           {compaction.activityLabel && <p role="status">{compaction.activityLabel}</p>}
-          {selected && <Button onClick={() => void cancel()}>取消任务</Button>}
+          {selected && <>
+            <Button onClick={() => setSelected(null)}>关闭会话</Button>
+            <Button onClick={() => void cancel()}>取消任务</Button>
+          </>}
         </header>
   );
 }
@@ -151,7 +150,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
                 </p>
               </div>
             )}
-          {state.status === "failed" && (
+          {state.sessionId === selected && state.status === "failed" && (
             <p className={"error " + styles["error"]}>
               {state.error}{" "}
               <Button onClick={() => controller.current?.retry()}>
@@ -159,7 +158,7 @@ export function MessageStream({ visibleMessages, submission, state, selected, co
               </Button>
             </p>
           )}
-          {state.agentError && (
+          {state.sessionId === selected && state.agentError && (
             <p className={"error " + styles["error"]}>执行错误：{state.agentError}</p>
           )}
           {[...visibleMessages.map((message) => ({ kind: "message" as const, order: message.order, message })),

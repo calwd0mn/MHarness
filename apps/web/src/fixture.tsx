@@ -1,5 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
+import { compareDirectoryEntries } from "./session/directory-controller.ts";
 import "./theme.css";
 import "./style.css";
 
@@ -28,13 +29,28 @@ if (mode === "light" || mode === "dark") {
   document.documentElement.style.colorScheme = mode;
   for (const [name, value] of Object.entries(mode === "light" ? light : dark)) document.documentElement.style.setProperty(name, value);
 }
-localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["fixture"], selected: "fixture" }));
+const fixtureValues = new Map<string, string>([
+  ["mharness.sessions.current", JSON.stringify({ sessionId: "fixture" })],
+]);
+const fixtureStorage: Storage = {
+  get length() { return fixtureValues.size; },
+  clear() { fixtureValues.clear(); },
+  getItem(key) { return fixtureValues.get(key) ?? null; },
+  key(index) { return [...fixtureValues.keys()][index] ?? null; },
+  removeItem(key) { fixtureValues.delete(key); },
+  setItem(key, value) { fixtureValues.set(key, String(value)); },
+};
+Object.defineProperty(window, "localStorage", { value: fixtureStorage, configurable: true });
+let directoryRevision = 0;
+const fixtureSessions = [{ sessionId: "fixture", createdAt: 1, updatedAt: 1, running: false, blank: false }];
+const directorySources = new Set<FixtureSource>();
 class FixtureSource {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   constructor(url: string) {
     if (url.endsWith("/session-directory/events")) {
-      queueMicrotask(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "api-session/ready" }) })));
+      directorySources.add(this);
+      queueMicrotask(() => { if (directorySources.has(this)) this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "api-session/ready" }) })); });
       return;
     }
     const id = decodeURIComponent(url.split("/").at(-2) ?? "fixture");
@@ -45,14 +61,23 @@ class FixtureSource {
       if (fail) setTimeout(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "error", error: { code: "follow_sync_failed", message: "隔离同步故障", details: {} } }) })), 100);
     });
   }
-  close() {}
+  close() { directorySources.delete(this); }
 }
 Object.defineProperty(window, "EventSource", { value: FixtureSource, configurable: true });
 let created = 0;
 window.fetch = async (input, init) => {
   const url = String(input);
   const body = typeof init?.body === "string" ? JSON.parse(init.body) as { outcome?: string } : {};
-  const payload = url.endsWith("/sessions") && init?.method !== "POST" ? { revision: 0, sessions: [{ sessionId: "fixture", createdAt: 1, updatedAt: 1, running: false, blank: false }] } : url.endsWith("/sessions") ? { sessionId: `fixture-${++created}` } : url.includes("/decision") ? { id: "approval", outcome: body.outcome } : { accepted: true };
+  if (url.endsWith("/sessions") && init?.method === "POST") {
+    const sessionId = `fixture-${++created}`;
+    const now = Date.now();
+    const summary = { sessionId, createdAt: now, updatedAt: now, running: false, blank: true };
+    fixtureSessions.push(summary);
+    const data = JSON.stringify({ type: "api-session/added", revision: ++directoryRevision, summary });
+    for (const source of directorySources) queueMicrotask(() => { if (directorySources.has(source)) source.onmessage?.(new MessageEvent("message", { data })); });
+    return new Response(JSON.stringify({ sessionId }), { status: 201, headers: { "Content-Type": "application/json" } });
+  }
+  const payload = url.endsWith("/sessions") ? { revision: directoryRevision, sessions: [...fixtureSessions].sort(compareDirectoryEntries) } : url.includes("/decision") ? { id: "approval", outcome: body.outcome } : { accepted: true };
   return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 };
 const root = document.getElementById("root");

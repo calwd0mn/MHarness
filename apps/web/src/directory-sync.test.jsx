@@ -6,7 +6,7 @@ import { App } from "./App.tsx";
 
 test("目录 ready 后合并快照并确认选中项，卸载关闭订阅", async () => {
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-  localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a"], selected: "a" }));
+  localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "a" }));
   const sources = []; let resolve;
   class Source { constructor(url) { this.url = url; sources.push(this); } close() { this.closed = true; } frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
   vi.stubGlobal("EventSource", Source);
@@ -47,12 +47,12 @@ test("创建响应未知前收到撤回时不显示待核实项", async () => {
     await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
     await act(async () => { sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false } }); sources[0].frame({ type: "api-session/removed", revision: 2, sessionId: "x", reason: "creation-failed" }); });
     await act(async () => resolvePost({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
-    expect(container.textContent).not.toContain("核实待保存会话");
+    expect(container.textContent).not.toContain("创建结果未知");
   } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });
 
 test.each([true, false])("重连期间改选后按快照对账，快照是否包含选中项 %s", async (includesSelected) => {
-  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a", "b"], selected: "a" }));
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "a" }));
   const sources = []; const reads = [];
   class Source { constructor(url) { this.url = url; sources.push(this); } close() { this.closed = true; } frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
   vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve) => reads.push(resolve))));
@@ -95,24 +95,24 @@ test("读取期间确认创建受保护，随后较新快照可以对账", async
 });
 
 test.each([true, false])("初始读取失败保留提示，重试对账及收到通知不影响其他窗口；原提示有效 %s", async (validHint) => {
-  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a"], selected: "a" }));
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "a" }));
   const sources = []; const reads = [];
   class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
   vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve) => reads.push(resolve))));
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
   try {
     await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
-    await act(async () => reads[0]({ ok: false })); expect(container.textContent).toContain("重试目录"); expect(JSON.parse(localStorage.getItem("mharness.session-directory.v1")).selected).toBe("a");
+    await act(async () => reads[0]({ ok: false })); expect(container.textContent).toContain("重试目录"); expect(JSON.parse(localStorage.getItem("mharness.sessions.current")).sessionId).toBe("a");
     await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("重试目录")).click());
     const directory = sources.findLast((s) => s.url === "/api/session-directory/events"); await act(async () => directory.frame({ type: "api-session/ready" }));
-    localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["b"], selected: "b" }));
+    localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "b" }));
     const a = { sessionId: "a", createdAt: 1, updatedAt: 1, blank: false, running: false };
     await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 0, sessions: validHint ? [a] : [] }) }));
     const selected = container.querySelector('[aria-current="page"]');
     if (validHint) expect(selected.textContent).toContain("a");
     else expect(selected).toBeNull();
     await act(async () => directory.frame({ type: "api-session/added", revision: 1, summary: { ...a, sessionId: "c" } }));
-    expect(JSON.parse(localStorage.getItem("mharness.session-directory.v1")).selected).toBe("b");
+    expect(JSON.parse(localStorage.getItem("mharness.sessions.current")).sessionId).toBe("b");
   } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });
 
@@ -136,16 +136,20 @@ test.each([
   try {
     await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" })); await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
     const response = () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) });
-    const remove = () => sources[0].frame({ type: "api-session/removed", revision: 1, sessionId: "x", reason: "creation-failed" });
+    const remove = () => sources.findLast((source) => source.url === "/api/session-directory/events").frame({ type: "api-session/removed", revision: 1, sessionId: "x", reason: "creation-failed" });
     if (responseFirst) await act(async () => response());
     if (timing !== "快照后") await act(async () => remove());
     if (timing !== "实时") await act(async () => read({ ok: true, json: async () => ({ revision: 1, sessions: [] }) }));
     if (timing === "快照后") {
-      if (responseFirst) expect(container.textContent).toContain("核实待保存会话");
+      if (responseFirst) {
+        expect(container.textContent).toContain("创建结果未知");
+        await act(async () => sources.findLast((source) => source.url === "/api/session-directory/events").frame({ type: "api-session/ready" }));
+        await act(async () => read({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+      }
       await act(async () => remove());
     }
     if (!responseFirst) await act(async () => response());
-    expect(container.textContent).not.toContain("核实待保存会话");
+    expect(container.textContent).not.toContain("创建结果未知");
   } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });
 
@@ -178,7 +182,7 @@ test("撤回已进入目录状态时，旧导航按钮不能打开 follow 或保
       priorButton.click();
     });
     expect(sources.map(({ url }) => url)).toEqual(["/api/session-directory/events"]);
-    expect(localStorage.getItem("mharness.session-directory.v1")).toBeNull();
+    expect(localStorage.getItem("mharness.sessions.current")).toBeNull();
   } finally {
     await act(async () => root.unmount());
     container.remove();
@@ -215,13 +219,14 @@ test.each([true, false])("断线遗漏撤回时重连快照对账待核实会话
     }
     const create = [...container.querySelectorAll("button")].find((button) => button.textContent.includes("新建会话"));
     await act(async () => create.click());
-    expect(container.textContent).toContain("核实待保存会话");
+    expect(container.textContent).toContain("创建结果未知");
     revision = 2;
     vi.useFakeTimers();
     await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); });
     vi.useRealTimers();
     await act(async () => sources[1].frame({ type: "api-session/ready" }));
-    expect(container.textContent).not.toContain("核实待保存会话");
+    expect(container.textContent).not.toContain("创建结果未知");
+    expect(container.textContent).toContain("创建会话失败");
   } finally {
     vi.useRealTimers();
     await act(async () => root.unmount());
@@ -286,4 +291,200 @@ test("快照截点之后已撤回的行不会短暂呈现", async () => {
     await act(async () => read({ ok: true, json: async () => ({ revision: 0, sessions: [{ sessionId: "gone", createdAt: 1, updatedAt: 1, blank: false, running: false }] }) }));
     expect(observed.some((text) => text.includes("gone"))).toBe(false);
   } finally { observer.disconnect(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("重连读取期间已有摘要的 201 不被旧错误与缺项快照覆盖", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; const reads = []; let post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() { this.closed = true; } frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => reads.push(resolve))));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => reads[0]({ ok: true, json: async () => ({ revision: 0, sessions: [{ sessionId: "a", createdAt: 1, updatedAt: 1, blank: false, running: false }] }) }));
+    await act(async () => sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 2, updatedAt: 2, blank: true, running: false } }));
+    vi.useFakeTimers(); await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); }); vi.useRealTimers();
+    const directory = sources.findLast((s) => s.url === "/api/session-directory/events"); await act(async () => directory.frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => post({ ok: true, json: async () => ({ sessionId: "x" }) }));
+    await act(async () => directory.frame({ type: "api-session/error", sessionId: "x", message: "错误" }));
+    await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    expect(container.querySelector('[aria-current="page"]').textContent).toContain("x");
+    expect(JSON.parse(localStorage.getItem("mharness.sessions.current")).sessionId).toBe("x");
+    expect(sources.findLast((s) => s.url === "/api/sessions/x/follow").closed).not.toBe(true);
+  } finally { vi.useRealTimers(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("较旧读取缺项后收到已覆盖撤回时解除 201 保护", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; let read, post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() { this.closed = true; } frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => { read = resolve; })));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => post({ ok: true, json: async () => ({ sessionId: "x" }) }));
+    await act(async () => read({ ok: true, json: async () => ({ revision: 1, sessions: [] }) }));
+    expect(container.querySelector('[aria-current="page"]').textContent).toContain("x");
+    await act(async () => sources[0].frame({ type: "api-session/removed", revision: 1, sessionId: "x", reason: "creation-failed" }));
+    expect(container.querySelector('[aria-current="page"]')).toBeNull();
+    expect(JSON.parse(localStorage.getItem("mharness.sessions.current"))).toEqual({});
+  } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("多个未知创建在目录存在时仍未确认，撤回逐一收敛并显示失败", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; let n = 0;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn(async (_url, options) => options?.method === "POST" ? { status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: `x${++n}` }) } : { ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    const create = [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话"));
+    await act(async () => create.click()); await act(async () => create.click());
+    await act(async () => sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x1", createdAt: 1, updatedAt: 1, blank: true, running: false } }));
+    expect(container.textContent).toContain("创建结果未知"); expect(container.querySelector('[aria-current="page"]')).toBeNull();
+    await act(async () => sources[0].frame({ type: "api-session/removed", revision: 2, sessionId: "x1", reason: "creation-failed" }));
+    expect(container.textContent).toContain("创建结果未知"); expect(container.textContent).toContain("创建会话失败");
+    await act(async () => sources[0].frame({ type: "api-session/removed", revision: 3, sessionId: "x2", reason: "creation-failed" }));
+    expect(container.textContent).not.toContain("创建结果未知"); expect(container.textContent).toContain("创建会话失败");
+    expect(sources.map((s) => s.url)).toEqual(["/api/session-directory/events"]);
+  } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("读取开始前已见新增，503 后缺项快照解除待确认", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; const reads = []; let post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => reads.push(resolve))));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => reads[0]({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    await act(async () => sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false } }));
+    vi.useFakeTimers(); await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); }); vi.useRealTimers();
+    const directory = sources.findLast((s) => s.url === "/api/session-directory/events"); await act(async () => directory.frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
+    await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 1, sessions: [] }) }));
+    expect(container.textContent).not.toContain("创建结果未知");
+  } finally { vi.useRealTimers(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test.each(["快照包含", "重放新增"])("快照覆盖的撤回不会移除最终存在的会话：%s", async (kind) => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; let read, post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => { read = resolve; })));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  const summary = { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false };
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
+    await act(async () => sources[0].frame({ type: "api-session/removed", revision: 1, sessionId: "x", reason: "creation-failed" }));
+    if (kind === "重放新增") await act(async () => sources[0].frame({ type: "api-session/added", revision: 2, summary }));
+    await act(async () => read({ ok: true, json: async () => ({ revision: 1, sessions: kind === "快照包含" ? [summary] : [] }) }));
+    expect(container.textContent).toContain("创建结果未知");
+    expect(container.textContent).not.toContain("创建会话失败");
+  } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("在途创建已见新增后被重连快照移除，迟到 503 不恢复待确认", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; const reads = []; let post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => reads.push(resolve))));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => reads[0]({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false } }));
+    vi.useFakeTimers(); await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); }); vi.useRealTimers();
+    const directory = sources.findLast((s) => s.url === "/api/session-directory/events"); await act(async () => directory.frame({ type: "api-session/ready" }));
+    await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 1, sessions: [] }) }));
+    await act(async () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
+    expect(container.textContent).not.toContain("创建结果未知");
+    expect(container.textContent).toContain("创建会话失败");
+  } finally { vi.useRealTimers(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("在途新增发生于读取开始后，缺项旧快照不阻止迟到 503 登记", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; let read, post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => { read = resolve; })));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    await act(async () => sources[0].frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false } }));
+    await act(async () => read({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    await act(async () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
+    expect(container.textContent).toContain("创建结果未知");
+    await act(async () => sources[0].frame({ type: "api-session/updated", revision: 2, sessionId: "x", blank: false, seq: 0 }));
+    expect([...container.querySelectorAll("nav button small")].map((item) => item.textContent)).toContain("x");
+  } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test.each([
+  { included: true, responseFirst: false }, { included: false, responseFirst: false },
+  { included: true, responseFirst: true }, { included: false, responseFirst: true },
+])("在途缺项快照与 503 交错后重新读取，补读包含 $included，响应先到 $responseFirst", async ({ included, responseFirst }) => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = []; const reads = []; let post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => reads.push(resolve))));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => reads[0]({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    vi.useFakeTimers(); await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); }); vi.useRealTimers();
+    const second = sources.findLast((s) => s.url === "/api/session-directory/events"); await act(async () => second.frame({ type: "api-session/ready" }));
+    const resolvePost = () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) });
+    if (responseFirst) await act(async () => resolvePost());
+    await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+    if (!responseFirst) await act(async () => resolvePost());
+    expect(container.textContent).toContain("创建结果未知");
+    const third = sources.findLast((s) => s.url === "/api/session-directory/events"); expect(third).not.toBe(second);
+    await act(async () => third.frame({ type: "api-session/ready" }));
+    const summary = { sessionId: "x", createdAt: 1, updatedAt: 1, blank: true, running: false };
+    await act(async () => reads[2]({ ok: true, json: async () => ({ revision: 0, sessions: included ? [summary] : [] }) }));
+    if (included) { expect(container.textContent).toContain("创建结果未知"); expect(container.textContent).not.toContain("创建会话失败"); }
+    else { expect(container.textContent).not.toContain("创建结果未知"); expect(container.textContent).toContain("创建会话失败"); }
+    expect(sources.filter((source) => source.url === "/api/session-directory/events")).toHaveLength(3);
+  } finally { vi.useRealTimers(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("折叠导航后仍可看到未知创建和撤回反馈", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); const sources = [];
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() {} frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn(async (_url, options) => options?.method === "POST" ? { status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) } : { ok: true, json: async () => ({ revision: 0, sessions: [] }) }));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("收起会话导航")).click());
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    expect(container.textContent).toContain("创建结果未知");
+    await act(async () => sources[0].frame({ type: "api-session/removed", revision: 1, sessionId: "x", reason: "creation-failed" }));
+    expect(container.textContent).toContain("创建会话失败");
+  } finally { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+test("在途快照缺项后已收到新增，迟到 503 保留健康目录订阅", async () => {
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); localStorage.setItem("mharness.sessions.current", JSON.stringify({ sessionId: "a" })); const sources = []; const reads = []; let post;
+  class Source { constructor(url) { this.url = url; sources.push(this); } close() { this.closed = true; } frame(value) { this.onmessage?.({ data: JSON.stringify(value) }); } }
+  vi.stubGlobal("EventSource", Source); vi.stubGlobal("fetch", vi.fn((_url, options) => options?.method === "POST" ? new Promise((resolve) => { post = resolve; }) : new Promise((resolve) => reads.push(resolve))));
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<App />)); await act(async () => sources[0].frame({ type: "api-session/ready" }));
+    const a = { sessionId: "a", createdAt: 1, updatedAt: 1, blank: false, running: false };
+    await act(async () => reads[0]({ ok: true, json: async () => ({ revision: 0, sessions: [a] }) }));
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent.includes("新建会话")).click());
+    vi.useFakeTimers(); await act(async () => { sources[0].onerror(); await vi.advanceTimersByTimeAsync(250); }); vi.useRealTimers();
+    const directory = sources.findLast((source) => source.url === "/api/session-directory/events"); await act(async () => directory.frame({ type: "api-session/ready" }));
+    await act(async () => reads[1]({ ok: true, json: async () => ({ revision: 0, sessions: [a] }) }));
+    await act(async () => directory.frame({ type: "api-session/added", revision: 1, summary: { sessionId: "x", createdAt: 2, updatedAt: 2, blank: true, running: false } }));
+    await act(async () => post({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId: "x" }) }));
+    expect(directory.closed).not.toBe(true); expect(sources.filter((source) => source.url === "/api/session-directory/events")).toHaveLength(2);
+    expect(container.querySelector('[aria-current="page"]').textContent).toContain("a"); expect(container.textContent).toContain("创建结果未知");
+    await act(async () => directory.frame({ type: "api-session/removed", revision: 2, sessionId: "x", reason: "creation-failed" }));
+    expect(container.textContent).not.toContain("创建结果未知"); expect(container.textContent).toContain("创建会话失败");
+    expect(JSON.parse(localStorage.getItem("mharness.sessions.current")).sessionId).toBe("a");
+  } finally { vi.useRealTimers(); await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });
