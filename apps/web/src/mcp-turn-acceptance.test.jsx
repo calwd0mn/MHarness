@@ -159,7 +159,15 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
     app = await createEventSessionApp(join(dir, "session.sqlite"), false, runTurn, { approvalService });
     origin = await safePort(port => app.listen({ host: "127.0.0.1", port }));
     class NetworkSource {
-      constructor(url) { this.controller = new AbortController(); this.queue = []; this.delivered = []; this.heartbeats = 0; sources.push(this); void this.read(origin + url); }
+      constructor(url) {
+        this.controller = new AbortController();
+        this.queue = [];
+        this.delivered = [];
+        this.heartbeats = 0;
+        this.isDirectory = url.endsWith("/session-directory/events");
+        if (!this.isDirectory) sources.push(this);
+        void this.read(origin + url);
+      }
       async read(url) {
         try {
           const response = await nativeFetch(url, { signal: this.controller.signal });
@@ -170,6 +178,10 @@ for (const scenario of scenarios) test(`真实页面和 MCP 闭环：${scenario.
             while ((end = buffer.indexOf("\n\n")) >= 0) {
               const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
               const data = block.split("\n").find(line => line.startsWith("data:"));
+              if (this.isDirectory) {
+                if (data) act(() => this.onmessage?.({ data: data.slice(5).trim() }));
+                continue;
+              }
               if (data) this.queue.push(JSON.parse(data.slice(5).trim()));
               else if (block === ": heartbeat") this.queue.push({ heartbeat: ++this.heartbeats });
             }

@@ -47,14 +47,62 @@ export class ReActAgent {
   #toolIndices = new Map<number, number>();
   readonly #listeners = new Set<(notice: AgentObservation) => void>();
   readonly #unsubscribe: () => void;
+  #publishingIdle = false;
+  #directoryErrorTurn: number | undefined;
+  readonly #directoryErrorListeners = new Set<(turn: number, message: string) => void>();
+  readonly #stateListeners = new Set<(state: "idle" | "running" | "maintenance") => void>();
+  readonly #stopListeners = new Set<() => void>();
 
   constructor(readonly session: Session, private readonly runTurn: RunTurn, private readonly handle: SessionHandle) {
-    this.#unsubscribe = session.on("session/event", (event) => this.#emit({ type: "event", event }));
+    this.#unsubscribe = session.on("session/event", (event) => {
+      this.#emit({ type: "event", event });
+      if (event.type === "turn/end" && event.data.reason.kind === "error") this.#reportDirectoryError(event.data.turn);
+    });
   }
   /** 当前进程内占用；不代表持久化 Turn 的终态。 */
   get state(): "idle" | "running" | "maintenance" { return this.#state; }
-  /** 活动任务及其忙碌拒绝日志尚未交接完成时，保持新任务忙碌。 */
-  get busy(): boolean { return this.#state !== "idle" || this.#pendingBusyWrites > 0; }
+  /**
+   * 同步观察后续占用状态；idle 通知完成前新活动仍会被判为忙碌。解除订阅不会影响活动。
+   * @param listener - 状态变化时同步调用的监听器。
+   * @returns 解除订阅的函数。
+   */
+  onStateChange(listener: (state: "idle" | "running" | "maintenance") => void): () => void {
+    this.#stateListeners.add(listener);
+    return () => { this.#stateListeners.delete(listener); };
+  }
+  /**
+   * 观察当前 Turn 的公开失败，每轮最多通知一次，不改变聊天观察流。
+   * @param listener - 接收失败 Turn 编号及公开文案的同步监听器。
+   * @returns 解除订阅的函数。
+   */
+  onDirectoryError(listener: (turn: number, message: string) => void): () => void {
+    this.#directoryErrorListeners.add(listener);
+    return () => { this.#directoryErrorListeners.delete(listener); };
+  }
+  #reportDirectoryError(turn: number, message = "本轮执行失败"): void {
+    if (this.#turn !== turn || this.#directoryErrorTurn === turn) return;
+    this.#directoryErrorTurn = turn;
+    for (const listener of [...this.#directoryErrorListeners]) { try { listener(turn, message); } catch (error) { console.error("Agent 错误监听失败", error); } }
+  }
+  /**
+   * 观察 Agent 停止完成；回调在活动退出后的状态通知之后执行。
+   * @param listener - 停止完成时调用的监听器。
+   * @returns 解除订阅的函数。
+   */
+  onStopped(listener: () => void): () => void {
+    this.#stopListeners.add(listener);
+    return () => { this.#stopListeners.delete(listener); };
+  }
+  #setState(state: "idle" | "running" | "maintenance"): void {
+    if (this.#state === state) return;
+    this.#state = state;
+    this.#publishingIdle = state === "idle";
+    try {
+      for (const listener of [...this.#stateListeners]) { try { listener(state); } catch (error) { console.error("Agent 状态监听失败", error); } }
+    } finally { this.#publishingIdle = false; }
+  }
+  /** 活动任务、其忙碌拒绝日志或空闲状态通知尚未交接完成时，保持新任务忙碌。 */
+  get busy(): boolean { return this.#state !== "idle" || this.#publishingIdle || this.#pendingBusyWrites > 0; }
   /** 是否允许新任务进入存储检查点。 */
   get storageOpen(): boolean { return !this.#storageBlocked; }
   /**
@@ -173,7 +221,7 @@ export class ReActAgent {
     for (const listener of [...this.#listeners]) { try { listener(notice); } catch (error) { console.error("Agent 观察监听失败", error); } }
   }
   #publish(notice: ExecutionNotice): void {
-    if (notice.type === "agent/error") { this.#emit(notice); return; }
+    if (notice.type === "agent/error") { this.#emit(notice); this.#reportDirectoryError(notice.turn, notice.message); return; }
     if (notice.type === "assistant/start") {
       const revision = ++this.#revision;
       this.#toolIndices.clear();
@@ -219,26 +267,31 @@ export class ReActAgent {
       && event.data.source.kind === "user" && "requestId" in event.data && event.data.requestId === request.requestId)) return { accepted: true };
     this.#assertAdmission();
     const turn = events.reduce((max, event) => event.type === "turn/start" ? Math.max(max, event.data.turn) : max, 0) + 1;
-    this.#state = "running";
     this.#turn = turn;
     this.#controller = new AbortController();
+    let finishRunning!: () => void;
+    this.#running = new Promise<void>(resolve => { finishRunning = resolve; });
+    this.#setState("running");
     try {
       this.session.append({ type: "turn/start", data: { turn } });
       this.session.append({ type: "user/message", surfaceOp: "append", data: { turn, requestId: request.requestId,
         id: randomUUID(), role: "user", source: { kind: "user" }, content: request.content } });
-    } catch (error) { this.blockStorage(error); this.#state = "idle"; this.#controller = undefined; this.#turn = null; throw error; }
+    } catch (error) { this.blockStorage(error); this.#controller = undefined; this.#turn = null; this.#setState("idle"); finishRunning(); throw error; }
     const signal = this.#controller.signal;
-    this.#running = Promise.resolve().then(() => this.runTurn({
+    void Promise.resolve().then(() => this.runTurn({
       session: this.session, turn, step: 1, signal,
       publish: notice => this.#publish(notice), blockStorage: error => this.blockStorage(error),
       storageOpen: () => this.storageOpen, storageFailure: () => this.#storageBlocked ? { value: this.#storageError } : undefined,
       settleCompaction: (context, options) => this.settleCompaction(context, options),
     }))
       .catch((error: unknown) => {
+        const storageFailed = !this.storageOpen;
         if (this.storageOpen) this.blockStorage(error);
         console.error("Turn 驱动失败", error);
+        if (storageFailed || (!signal.aborted && !(error instanceof Error && error.name === "AbortError"))) this.#reportDirectoryError(turn);
       })
-      .finally(() => { this.#state = "idle"; this.#controller = undefined; this.#turn = null; });
+      .finally(() => { this.#controller = undefined; this.#turn = null; this.#setState("idle"); })
+      .then(finishRunning, finishRunning);
     return { accepted: true };
   }
   /**
@@ -249,14 +302,16 @@ export class ReActAgent {
    */
   runMaintenance<TResult>(work: (signal: AbortSignal) => Promise<TResult>): Promise<TResult> {
     try { this.#assertAdmission(); } catch (error) { return Promise.reject(error); }
-    this.#state = "maintenance";
     this.#controller = new AbortController();
+    let finishRunning!: () => void;
+    this.#running = new Promise<void>(resolve => { finishRunning = resolve; });
+    this.#setState("maintenance");
     const signal = this.#controller.signal;
     const task = Promise.resolve().then(() => work(signal)).finally(() => {
-      this.#state = "idle";
       this.#controller = undefined;
+      this.#setState("idle");
     });
-    this.#running = task.then(() => {}, () => {});
+    void task.then(finishRunning, finishRunning);
     return task;
   }
   /**
@@ -309,6 +364,10 @@ export class ReActAgent {
       await this.#recovering;
     } finally {
       this.#unsubscribe();
+      for (const listener of [...this.#stopListeners]) { try { listener(); } catch (error) { console.error("Agent 停止监听失败", error); } }
+      this.#stopListeners.clear();
+      this.#stateListeners.clear();
+      this.#directoryErrorListeners.clear();
     }
   }
 }

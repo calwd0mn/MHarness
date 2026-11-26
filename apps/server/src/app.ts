@@ -30,6 +30,7 @@ import type { ModelConfig } from "./model/runtime.ts";
 import { LlmRuntime } from "./model/runtime.ts";
 import { registerSessionRoutes } from "./session/routes.ts";
 import { SessionDirectory } from "./session/directory.ts";
+import { registerDirectoryEvents } from "./session/directory-events.ts";
 import { ApprovalService } from "./approval/service.ts";
 import { registerApprovalRoutes } from "./approval/routes.ts";
 
@@ -239,6 +240,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
   });
   const agents = new AgentManager(persistence, driver);
   let directory = new SessionDirectory();
+  agents.onLoaded((agent) => directory.observeAgent(agent));
   agents.onSessionCreated((session) => directory.register(session));
   const commands = new SessionCommandController(agents, () => {
     const businessModel = runtime.prepare(configuredModel(), { recordable: true });
@@ -281,6 +283,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     }
   });
   registerSessionRoutes(app, sessionsPath, persistence, commands, agents, () => directory);
+  registerDirectoryEvents(app, `${localConfig.apiPrefix}/session-directory/events`, () => directory);
   registerApprovalRoutes(app, sessionsPath, persistence, agents, approvalService);
   return app;
 }

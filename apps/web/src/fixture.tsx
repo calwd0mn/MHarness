@@ -33,6 +33,10 @@ class FixtureSource {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   constructor(url: string) {
+    if (url.endsWith("/session-directory/events")) {
+      queueMicrotask(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "api-session/ready" }) })));
+      return;
+    }
     const id = decodeURIComponent(url.split("/").at(-2) ?? "fixture");
     const windowRecords = id === "fixture" ? (scenario === "result" ? complete : records) : [];
     const fail = id === "fixture" && scenario === "failed" && fixtureConnections++ === 0;
@@ -48,7 +52,7 @@ let created = 0;
 window.fetch = async (input, init) => {
   const url = String(input);
   const body = typeof init?.body === "string" ? JSON.parse(init.body) as { outcome?: string } : {};
-  const payload = url.endsWith("/sessions") ? { sessionId: `fixture-${++created}` } : url.includes("/decision") ? { id: "approval", outcome: body.outcome } : { accepted: true };
+  const payload = url.endsWith("/sessions") && init?.method !== "POST" ? { revision: 0, sessions: [{ sessionId: "fixture", createdAt: 1, updatedAt: 1, running: false, blank: false }] } : url.endsWith("/sessions") ? { sessionId: `fixture-${++created}` } : url.includes("/decision") ? { id: "approval", outcome: body.outcome } : { accepted: true };
   return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 };
 const root = document.getElementById("root");

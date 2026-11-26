@@ -4,6 +4,7 @@ import { Session, SqliteSessionPersistence, type SessionPersistence } from "@mha
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { sessionDirectoryFrameSchema, sessionDirectorySnapshotSchema } from "@mharness/session/contracts";
 import { SessionDirectory } from "./directory.ts";
 
@@ -48,6 +49,9 @@ test("恢复使用检查点而不打开事件日志", async (t) => {
   await active.append([{ type: "turn/start", seq: 0, time: 4, data: { turn: 1 } },
     { type: "user/message", seq: 1, time: 9, surfaceOp: "append", data: { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [] } }]);
   await active.close();
+  const fixture = new DatabaseSync(join(dir, "events.sqlite"));
+  fixture.prepare("DELETE FROM mh_session_list_metadata WHERE session_id=?").run("active");
+  fixture.close();
   t.mock.method(persistence, "open", async () => { throw new Error("不应读取日志"); });
   const directory = await SessionDirectory.restore(persistence);
   assert.deepEqual(directory.snapshot(), { revision: 0, sessions: [
@@ -124,4 +128,62 @@ test("损坏检查点只降级对应会话", async (t) => {
     { sessionId: "overflow", createdAt: 2, updatedAt: 2, running: false, blank: false },
     { sessionId: "blank", createdAt: 1, updatedAt: 1, running: false, blank: true },
   ]);
+});
+
+test("业务监听新增和撤回按版本交付并隔离摘要", () => {
+  const directory = new SessionDirectory();
+  const frames: unknown[] = []; const added: unknown[] = []; const removed: string[] = [];
+  const observedBlank: boolean[] = [];
+  directory.on("api-session/added", summary => { added.push({ ...summary }); Reflect.set(summary, "blank", false); });
+  const off = directory.on("api-session/removed", id => removed.push(id));
+  directory.onObservation(frame => { frames.push(structuredClone(frame)); if (frame.type === "api-session/added") Reflect.set(frame.summary, "blank", false); });
+  directory.onObservation(frame => { if (frame.type === "api-session/added") observedBlank.push(frame.summary.blank); });
+  const session = new Session({ sessionId: "new", createdAt: 1 });
+  assert.equal(directory.register(session, true), true);
+  assert.equal(directory.register(session, true), false);
+  assert.equal(directory.snapshot().sessions[0]?.blank, true);
+  directory.confirm("new");
+  assert.equal(directory.snapshot().revision, 1);
+  directory.remove("new"); directory.remove("new"); off(); off();
+  directory.register(new Session({ sessionId: "other", createdAt: 2 }), true); directory.remove("other");
+  assert.deepEqual(observedBlank, [true, true]);
+  assert.deepEqual(added, [
+    { sessionId: "new", createdAt: 1, updatedAt: 1, running: false, blank: true },
+    { sessionId: "other", createdAt: 2, updatedAt: 2, running: false, blank: true },
+  ]);
+  assert.deepEqual(removed, ["new"]);
+  assert.deepEqual(frames, [
+    { type: "api-session/added", revision: 1, summary: added[0] },
+    { type: "api-session/removed", revision: 2, sessionId: "new", reason: "creation-failed" },
+    { type: "api-session/added", revision: 3, summary: added[1] },
+    { type: "api-session/removed", revision: 4, sessionId: "other", reason: "creation-failed" },
+  ]);
+});
+
+test("业务监听同步重入保持完整帧顺序", () => {
+  const directory = new SessionDirectory(); const revisions: number[] = [];
+  directory.on("api-session/added", summary => { if (summary.sessionId === "a") directory.register(new Session({ sessionId: "b", createdAt: 2 })); });
+  directory.onObservation(frame => { if ("revision" in frame) revisions.push(frame.revision); });
+  directory.register(new Session({ sessionId: "a", createdAt: 1 }));
+  assert.deepEqual(revisions, [1, 2]);
+});
+
+test("监听器抛错不阻止后续监听和目录版本", (t) => {
+  const directory = new SessionDirectory(); const received: string[] = [];
+  t.mock.method(console, "error", () => {});
+  directory.on("api-session/added", () => { throw new Error("listener failure"); });
+  directory.on("api-session/added", summary => received.push(summary.sessionId));
+  directory.register(new Session({ sessionId: "safe", createdAt: 1 }));
+  assert.deepEqual(received, ["safe"]); assert.equal(directory.snapshot().revision, 1);
+});
+
+test("业务监听参数类型随事件收窄", () => {
+  const directory = new SessionDirectory();
+  directory.on("api-session/updated", (id, blank, seq) => { const values: [string, false, number] = [id, blank, seq]; assert.equal(values.length, 3); });
+  if (false) {
+    // @ts-expect-error updated 的第二个参数固定为 false。
+    directory.on("api-session/updated", (_id: string, _blank: true) => {});
+    // @ts-expect-error 未定义的事件不可订阅。
+    directory.on("api-session/unknown", () => {});
+  }
 });

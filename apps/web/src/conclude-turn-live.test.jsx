@@ -57,7 +57,14 @@ test("结束意向保留到批次完成，后续明确错误仍展示并持久�
     app = await createEventSessionApp(db, false, driver);
     origin = await listen(app);
     class NetworkSource {
-      constructor(url) { this.controller = new AbortController(); this.queue = []; this.delivered = []; sources.push(this); void this.read(origin + url); }
+      constructor(url) {
+        this.controller = new AbortController();
+        this.queue = [];
+        this.delivered = [];
+        this.isDirectory = url.endsWith("/session-directory/events");
+        if (!this.isDirectory) sources.push(this);
+        void this.read(origin + url);
+      }
       async read(url) {
         try {
           const response = await nativeFetch(url, { signal: this.controller.signal });
@@ -70,7 +77,9 @@ test("结束意向保留到批次完成，后续明确错误仍展示并持久�
             while ((end = buffer.indexOf("\n\n")) >= 0) {
               const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
               const data = block.split("\n").find(line => line.startsWith("data:"));
-              if (data) this.queue.push(JSON.parse(data.slice(5).trim()));
+              if (!data) continue;
+              if (this.isDirectory) act(() => this.onmessage?.({ data: data.slice(5).trim() }));
+              else this.queue.push(JSON.parse(data.slice(5).trim()));
             }
           }
         } catch (error) { if (!this.controller.signal.aborted) this.failure = error; }

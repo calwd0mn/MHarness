@@ -77,7 +77,11 @@ test("真实工具流、快照和持久历史一致地呈现参数与结果", as
   base = await listen(app);
   class RealSource {
     constructor(url) {
-      source = this; this.controller = new AbortController(); this.queue = []; this.delivered = [];
+      this.controller = new AbortController();
+      this.queue = [];
+      this.delivered = [];
+      this.isDirectory = url.endsWith("/session-directory/events");
+      if (!this.isDirectory) source = this;
       void this.read(url);
     }
     async read(url) {
@@ -90,7 +94,9 @@ test("真实工具流、快照和持久历史一致地呈现参数与结果", as
           let end; while ((end = buffer.indexOf("\n\n")) >= 0) {
             const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
             const data = block.split("\n").find(line => line.startsWith("data:"));
-            if (data) this.queue.push(JSON.parse(data.slice(5).trim()));
+            if (!data) continue;
+            if (this.isDirectory) act(() => this.onmessage?.({ data: data.slice(5).trim() }));
+            else this.queue.push(JSON.parse(data.slice(5).trim()));
           }
         }
       } catch (error) { if (!this.controller.signal.aborted) throw error; }

@@ -7,7 +7,9 @@ pnpm install
 pnpm dev
 ```
 
-打开 `http://127.0.0.1:5173`，新建会话即可开始问答。页面支持会话切换、按会话取消、刷新恢复，以及发送结果未知时使用原编号重试。开发服务将 HTTP 和 SSE 的 `/api` 请求转发到 Fastify。
+打开 `https://127.0.0.1:5173`，新建会话即可开始问答。Vite 会为本地开发生成自签名证书，浏览器首次访问可能提示证书未受信任。确认地址为本机开发入口后，可在浏览器中继续访问。HTTPS 通过 HTTP/2 多路复用目录 SSE、聊天订阅和普通 `/api` 请求，开发服务将这些请求转发到 Fastify。
+
+页面支持会话切换、按会话取消、刷新恢复，以及发送结果未知时使用原编号重试。旧 HTTP 地址的选中提示保存在另一个浏览器来源，首次访问 HTTPS 地址需重新选择会话。已保存会话仍从同一开发后端读取。
 
 后端启动时会读取仓库根目录的 `.env`，已设置的进程环境变量优先。未指定模型 Provider 时使用 Mock。要在页面使用 DeepSeek，参照 `.env.example` 填写根目录的 `.env`，设置 `MHARNESS_MODEL_PROVIDER=deepseek` 和 `DEEPSEEK_API_KEY`，然后启动或重启 `pnpm dev`。
 
@@ -123,8 +125,10 @@ pnpm dev
 
 ## 会话接口
 
+以下 PowerShell 示例直接请求本机 Fastify。
+
 ```powershell
-$api = 'http://127.0.0.1:5173/api'
+$api = 'http://127.0.0.1:3000/api'
 $session = Invoke-RestMethod -Method Post -Uri "$api/sessions" -ContentType 'application/json' -Body '{}'
 $accepted = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionId)/messages" -ContentType 'application/json' -Body '{"requestId":"req-1","content":[{"type":"text","text":"你好"}]}'
 $history = Invoke-RestMethod -Uri "$api/sessions/$($session.sessionId)"
@@ -136,7 +140,7 @@ $cancel = Invoke-RestMethod -Method Post -Uri "$api/sessions/$($session.sessionI
 - 读取历史返回 `200`。空会话为 `{"sessionId":"…","inheritedEventCount":0,"cursor":-1,"records":[]}`，事件序号从 0 连续递增。
 - `GET /api/sessions/:sessionId/follow` 使用 SSE。首帧是完整快照，后续交付原始事件及 Assistant 实时流。关闭连接或切换会话只停止观察，Turn 继续运行。同步故障会终止当前流并允许用户主动重试。
 - 取消已加载会话返回 `202 {"accept":true}`，结果通过历史或 follow 确认。未加载会话返回 `404 {"code":"session/not-found"}`，取消请求不会加载 Agent。存储阻塞时新提交返回 `503`。
-- 浏览器本地目录保存会话编号及选中项，刷新后重新通过 follow 安装快照。本地存储不可用时仅在当前页面保留目录。手动压缩可在空闲会话中通过 `/compact` 发起。
+- 浏览器从后端目录恢复选中项，并通过 follow 加载该会话的聊天快照。本地存储不可用时，选中项只保留在当前页面。手动压缩可在空闲会话中通过 `/compact` 发起。
 
 ## 审批答复接口
 

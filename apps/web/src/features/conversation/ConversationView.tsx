@@ -8,8 +8,8 @@ import { commandCards, lastTurn } from "../../session/view.ts";
 import type { useConversation } from "../../session/use-conversation.ts";
 
 
-/** 显示会话目录和创建入口。 */
-export function SessionNavigation({ sessions, selected, setSelected, creating, createSession }: Pick<ReturnType<typeof useConversation>, "sessions" | "selected" | "setSelected" | "creating" | "createSession">) {
+/** 显示最近一次有效目录及创建入口，目录读取失败时提供独立重试。 */
+export function SessionNavigation({ sessions, selected, setSelected, creating, createSession, pendingCreations, retryCreationCheck, directoryFailed, retryDirectory }: Pick<ReturnType<typeof useConversation>, "sessions" | "selected" | "setSelected" | "creating" | "createSession" | "pendingCreations" | "retryCreationCheck" | "directoryFailed" | "retryDirectory">) {
   const [expanded, setExpanded] = useState(true);
   return (
     <aside className={"sidebar " + styles["sidebar"]}>
@@ -37,6 +37,7 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
         <Button aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? "收起会话导航" : "展开会话导航"}</Button>
         {expanded && <div className={"session-directory " + styles["session-directory"]}>
           <h2 className={"section-label " + styles["section-label"]}>会话</h2>
+          {directoryFailed && <p role="alert">目录读取失败 <Button onClick={retryDirectory}>重试目录</Button></p>}
           <nav className={"session-list " + styles["session-list"]} aria-label="会话">
             {sessions.map((id, index) => (
               <Button
@@ -49,8 +50,14 @@ export function SessionNavigation({ sessions, selected, setSelected, creating, c
                 <small>{id}</small>
               </Button>
             ))}
+            {pendingCreations.map((id) => (
+              <Button key={id} onClick={() => void retryCreationCheck(id)} disabled={creating}>
+                核实待保存会话
+                <small>{id}</small>
+              </Button>
+            ))}
           </nav>
-          {sessions.length === 0 && <p className={"directory-empty " + styles["directory-empty"]}>还没有会话</p>}
+          {sessions.length === 0 && pendingCreations.length === 0 && <p className={"directory-empty " + styles["directory-empty"]}>还没有会话</p>}
         </div>}
       </aside>
   );

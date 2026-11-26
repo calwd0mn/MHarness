@@ -7,21 +7,29 @@ import { SessionCreationCleanupError, SessionPersistence, type SessionAccess, ty
 import { isValidSessionId } from "../session-id.ts";
 import type { Session, SessionHeader, StagedPersistenceResult } from "../session.ts";
 import { SessionWriter } from "../writer.ts";
+import { projectListMetadata, type ListProjection } from "../list-metadata.ts";
 import { acquireSessionOwnership, OwnershipAcquisitionCleanupError, type Ownership } from "./ownership.ts";
 
 type Row = Record<string, unknown>;
-type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; fromWriter?: boolean; staged?: boolean; preflightFailed?: boolean };
+type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; fromWriter?: boolean; staged?: boolean; preflightFailed?: boolean; attemptedAt?: number; checkpointEnabled?: boolean; transaction?: object };
+type Checkpoint = { header: SessionHeader; inheritedEventCount: number; eventCount: number; projection?: ListProjection; dueAt?: number };
+type UncertainCheckpoint = { checkpoint: Checkpoint; batch: Pending; transactionActive: () => boolean };
 class StagedPrefixError extends Error {}
 
 interface HandleStorage {
   readonly db: DatabaseSync;
   readonly reader: DatabaseSync;
+  readonly checkpointReader?: DatabaseSync;
   beginWrite(owner: SqliteHandle, transaction: object): void;
   rollbackWrite(owner: SqliteHandle): void;
   clearEndedTransaction(): void;
   abortWriteConnection(owner: SqliteHandle): void;
   confirmCreationEnded(owner: SqliteHandle, transaction: object | undefined): boolean;
   readFresh(id: string): SessionPersistenceSnapshot | undefined;
+  saveCheckpoint(checkpoint: Checkpoint): void;
+  verifyCheckpoint(item: UncertainCheckpoint): void;
+  cancelCheckpointVerification(batch: Pending): void;
+  transactionActive(owner: SqliteHandle, transaction: object): boolean;
   release(ownership: Ownership): Promise<void>;
   forget(handle: SqliteHandle): void;
 }
@@ -102,6 +110,10 @@ export class SqliteSessionPersistence extends SessionPersistence {
   readonly #path: string;
   readonly #db: DatabaseSync;
   readonly #reader: DatabaseSync;
+  readonly #checkpointDb?: DatabaseSync;
+  readonly #checkpoints = new Map<string, Checkpoint>();
+  readonly #uncertainCheckpoints = new Map<Pending, UncertainCheckpoint>();
+  #checkpointRetry?: ReturnType<typeof setTimeout>;
   readonly #handleStorage: HandleStorage;
   readonly #handles = new Set<SqliteHandle>();
   readonly #cleanup = new Map<Ownership, ReturnType<typeof setTimeout> | undefined>();
@@ -133,6 +145,7 @@ export class SqliteSessionPersistence extends SessionPersistence {
       } finally { probe.close(); }
     }
     this.#db = new DatabaseSync(this.#path, { readOnly: this.#readOnly, enableForeignKeyConstraints: true, timeout: 5000 });
+    let openedReader: DatabaseSync | undefined;
     try {
       const version = this.#db.prepare("PRAGMA user_version").get()?.user_version;
       const objects = this.#db.prepare("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'").all();
@@ -144,11 +157,13 @@ export class SqliteSessionPersistence extends SessionPersistence {
           COMMIT;`);
       } else if (version !== 1 && version !== 2) throw new Error("不支持的数据库格式或版本");
       verifySchema(this.#db);
-      this.#reader = new DatabaseSync(this.#path, { readOnly: true, timeout: 5000 });
-    } catch (error) { this.#db.close(); throw error; }
+      this.#reader = openedReader = new DatabaseSync(this.#path, { readOnly: true, timeout: 5000 });
+      if (!this.#readOnly) this.#checkpointDb = new DatabaseSync(this.#path, { timeout: 0, enableForeignKeyConstraints: true });
+    } catch (error) { openedReader?.close(); this.#db.close(); throw error; }
     this.#handleStorage = {
       db: this.#db,
       reader: this.#reader,
+      checkpointReader: this.#checkpointDb,
       beginWrite: (owner, transaction) => this.#beginWrite(owner, transaction),
       rollbackWrite: (owner) => this.#rollbackWrite(owner),
       clearEndedTransaction: () => this.#clearEndedTransaction(),
@@ -165,6 +180,10 @@ export class SqliteSessionPersistence extends SessionPersistence {
           return row ? metadata(row) : undefined;
         } finally { reader.close(); }
       },
+      saveCheckpoint: (checkpoint) => this.#enqueueCheckpoint(checkpoint),
+      verifyCheckpoint: (item) => { this.#uncertainCheckpoints.set(item.batch, item); this.#resetCheckpointRetry(); this.#scheduleCheckpointRetry(); },
+      cancelCheckpointVerification: (batch) => { this.#uncertainCheckpoints.delete(batch); },
+      transactionActive: (owner, transaction) => !this.#writeClosed && this.#db.isTransaction && this.#transactionOwner === owner && this.#transaction === transaction,
       forget: (handle) => this.#handles.delete(handle),
       release: (ownership) => this.#release(ownership),
     };
@@ -282,7 +301,7 @@ export class SqliteSessionPersistence extends SessionPersistence {
   }
 
   /**
-   * 关闭各句柄并释放连接，停止写入权清理重试并尝试释放余留锁。任一关闭失败时仍处理其余资源，重复调用共享关闭结果。
+   * 关闭各句柄并释放连接，停止重试并最后尝试保存待处理的目录检查点和释放余留锁。任一关闭失败时仍处理其余资源，重复调用共享关闭结果。
    * @returns 所有资源处理完毕后兑现。
    * @throws 排空或关闭失败时以 AggregateError 汇总。
    */
@@ -295,6 +314,9 @@ export class SqliteSessionPersistence extends SessionPersistence {
     const errors: unknown[] = [];
     await Promise.allSettled(this.#acquiring);
     for (const handle of [...this.#handles]) { try { await handle.close(); } catch (error) { errors.push(error); } }
+    if (this.#checkpointRetry) clearTimeout(this.#checkpointRetry);
+    this.#checkpointRetry = undefined;
+    this.#flushCheckpoints();
     for (const [ownership, timer] of this.#cleanup) {
       if (timer) clearTimeout(timer);
       const inFlight = this.#releasing.get(ownership);
@@ -303,11 +325,105 @@ export class SqliteSessionPersistence extends SessionPersistence {
         try { await this.#release(ownership); } catch (error) { errors.push(error); }
       }
     }
-    for (const connection of this.#writeClosed ? [this.#reader] : [this.#reader, this.#db]) {
+    for (const connection of [this.#reader, ...(!this.#writeClosed ? [this.#db] : []), ...(this.#checkpointDb ? [this.#checkpointDb] : [])]) {
       try { connection.close(); } catch (error) { errors.push(error); }
       finally { if (connection === this.#db && !connection.isOpen) { this.#writeClosed = true; this.#clearEndedTransaction(); } }
     }
     if (errors.length) throw new AggregateError(errors, "关闭存储失败");
+  }
+
+  #enqueueCheckpoint(checkpoint: Checkpoint): void {
+    this.#mergeCheckpoint(checkpoint);
+    this.#resetCheckpointRetry();
+    this.#flushCheckpoints();
+  }
+  #mergeCheckpoint(checkpoint: Checkpoint): void {
+    const previous = this.#checkpoints.get(checkpoint.header.sessionId);
+    if (previous && isDeepStrictEqual(previous.header, checkpoint.header) && previous.inheritedEventCount === checkpoint.inheritedEventCount) {
+      const winner = previous.eventCount > checkpoint.eventCount ? previous : checkpoint;
+      const dueAt = previous.dueAt === undefined || checkpoint.dueAt === undefined ? undefined : Math.min(previous.dueAt, checkpoint.dueAt);
+      checkpoint = { ...winner, dueAt };
+    }
+    this.#checkpoints.set(checkpoint.header.sessionId, checkpoint);
+  }
+  #flushCheckpoints(): void {
+    if (!this.#checkpointDb) return;
+    for (const [batch, item] of this.#uncertainCheckpoints) {
+      if (item.transactionActive()) continue;
+      try {
+        const id = item.checkpoint.header.sessionId;
+        const meta = this.#checkpointDb.prepare(`SELECT s.*,
+          CASE WHEN c.blank BETWEEN 0 AND 9007199254740991 THEN c.blank END AS checkpoint_blank,
+          CASE WHEN c.last_prompt_at BETWEEN 0 AND 9007199254740991 THEN c.last_prompt_at WHEN c.last_prompt_at IS NULL THEN NULL ELSE -1 END AS checkpoint_prompt,
+          CASE WHEN c.event_count BETWEEN 0 AND 9007199254740991 THEN c.event_count END AS checkpoint_count,
+          CASE WHEN c.inherited_count BETWEEN 0 AND 9007199254740991 THEN c.inherited_count END AS checkpoint_inherited,
+          (SELECT COUNT(*) FROM mh_events e WHERE e.session_id=s.session_id) AS actual_count,
+          (SELECT MIN(seq) FROM mh_events e WHERE e.session_id=s.session_id) AS first_seq,
+          (SELECT MAX(seq) FROM mh_events e WHERE e.session_id=s.session_id) AS last_seq,
+          (SELECT json_group_array(json_array(seq, event_json)) FROM
+            (SELECT seq, event_json FROM mh_events WHERE session_id=s.session_id AND seq>=? AND seq<? ORDER BY seq)) AS batch_json
+          FROM mh_sessions s LEFT JOIN mh_session_list_metadata c USING(session_id) WHERE s.session_id=?`).get(batch.start, item.checkpoint.eventCount, id);
+        const parsed: unknown = typeof meta?.batch_json === "string" ? JSON.parse(meta.batch_json) : undefined;
+        const matches = meta && typeof meta.header_json === "string" && isDeepStrictEqual(parseHeader(meta.header_json), item.checkpoint.header) &&
+          meta.inherited_count === item.checkpoint.inheritedEventCount && position(meta.event_count) && meta.event_count >= item.checkpoint.eventCount &&
+          meta.actual_count === meta.event_count && (meta.event_count === 0 || (meta.first_seq === 0 && meta.last_seq === meta.event_count - 1)) &&
+          Array.isArray(parsed) && parsed.length === batch.events.length && parsed.every((row: unknown, index) => Array.isArray(row) &&
+            row[0] === batch.start + index && typeof row[1] === "string" && isDeepStrictEqual(JSON.parse(row[1]), batch.events[index]));
+        this.#uncertainCheckpoints.delete(batch);
+        if (matches && position(meta.event_count)) {
+          const validCheckpoint = (meta.checkpoint_blank === 0 || meta.checkpoint_blank === 1) &&
+            (meta.checkpoint_prompt === null || position(meta.checkpoint_prompt)) && position(meta.checkpoint_count) &&
+            meta.checkpoint_count <= meta.event_count && (meta.checkpoint_count !== 0 || meta.checkpoint_prompt === null) &&
+            meta.checkpoint_inherited === item.checkpoint.inheritedEventCount && meta.checkpoint_count >= item.checkpoint.inheritedEventCount;
+          const covered = validCheckpoint && position(meta.checkpoint_count) ? meta.checkpoint_count : 0;
+          this.#mergeCheckpoint(meta.event_count - covered >= 200 ? { ...item.checkpoint, dueAt: undefined } : item.checkpoint);
+        }
+      } catch { /* 独立核实读取失败时保留候选，不能影响业务批次。 */ }
+    }
+    for (const [id, item] of this.#checkpoints) {
+      if (item.dueAt !== undefined && item.dueAt > Date.now()) continue;
+      try {
+        const meta = this.#checkpointDb.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(id);
+        if (!meta || typeof meta.header_json !== "string" || !isDeepStrictEqual(parseHeader(meta.header_json), item.header) ||
+          meta.inherited_count !== item.inheritedEventCount || !position(meta.event_count) || meta.event_count < item.eventCount) {
+          this.#checkpoints.delete(id);
+          continue;
+        }
+        const count = meta.event_count;
+        let projection = item.projection;
+        if (count !== item.eventCount) projection = undefined;
+        if (!projection) {
+          projection = { blank: true, lastPromptAt: null };
+          const rows = this.#checkpointDb.prepare("SELECT seq, event_json FROM mh_events WHERE session_id=? AND seq<? ORDER BY seq").all(id, count);
+          if (rows.length !== count) throw new Error("目录投影前缀不完整");
+          for (const [index, row] of rows.entries()) {
+            if (row.seq !== index || typeof row.event_json !== "string") throw new Error("目录投影事件无效");
+            projection = projectListMetadata(projection, snapshotSessionEvent(JSON.parse(row.event_json), index, "replay"));
+          }
+        }
+        const written = this.#checkpointDb.prepare(`INSERT INTO mh_session_list_metadata (session_id, blank, last_prompt_at, event_count, inherited_count)
+          SELECT session_id, ?, ?, ?, ? FROM mh_sessions
+          WHERE session_id=? AND header_json=? AND inherited_count=? AND event_count=?
+          ON CONFLICT(session_id) DO UPDATE SET blank=excluded.blank, last_prompt_at=excluded.last_prompt_at,
+            event_count=excluded.event_count, inherited_count=excluded.inherited_count`).run(
+          projection.blank ? 1 : 0, projection.lastPromptAt, count, item.inheritedEventCount,
+          id, meta.header_json, item.inheritedEventCount, count);
+        if (written.changes === 1) this.#checkpoints.delete(id);
+      } catch { /* 数据库繁忙时不阻塞事件循环，保留前缀稍后重试。 */ }
+    }
+    if (this.#checkpoints.size || this.#uncertainCheckpoints.size) this.#scheduleCheckpointRetry();
+  }
+  #scheduleCheckpointRetry(): void {
+    if (this.#closing || this.#checkpointRetry) return;
+    const waiting = [...this.#checkpoints.values()].map((item) => Math.max(0, (item.dueAt ?? Date.now()) - Date.now()));
+    const delay = Math.min(this.#uncertainCheckpoints.size || waiting.some((value) => value === 0) ? 250 : Infinity,
+      ...waiting.filter((value) => value > 0));
+    this.#checkpointRetry = setTimeout(() => { this.#checkpointRetry = undefined; this.#flushCheckpoints(); }, delay);
+    this.#checkpointRetry.unref();
+  }
+  #resetCheckpointRetry(): void {
+    if (this.#checkpointRetry) clearTimeout(this.#checkpointRetry);
+    this.#checkpointRetry = undefined;
   }
 
   #assertOpen(): void { if (this.#closing) throw new Error("存储已关闭"); }
@@ -387,6 +503,14 @@ class SqliteHandle implements SessionHandle {
   #writer?: SessionWriter;
   #session?: Session;
   #creationTransaction?: object;
+  #projection?: ListProjection;
+  #projectionCount = 0;
+  #checkpointCount = 0;
+  #checkpointMissing = false;
+  #checkpointTimer?: ReturnType<typeof setTimeout>;
+  #dirtySince?: number;
+  #dirtyCount = 0;
+  #confirmedCount?: number;
   constructor(private readonly store: HandleStorage, readonly header: SessionHeader, readonly access: SessionAccess,
     readonly inheritedEventCount: number, private readonly ownership: Ownership | undefined, public published: boolean) { this.id = header.sessionId; }
   get writer(): SessionWriter | undefined { return this.#closing ? undefined : this.#writer; }
@@ -542,17 +666,127 @@ class SqliteHandle implements SessionHandle {
     try {
       await this.#writer?.close();
       if (this.#pending) this.#reconcile();
+      this.#prepareReleaseCheckpoint();
+      if (this.access === "write") this.#saveCheckpoint();
     } catch (error) {
+      if (this.#pending) this.#queueUncertain(this.#pending, true);
+      this.#prepareReleaseCheckpoint();
+      if (this.access === "write") this.#saveCheckpoint();
       this.store.abortWriteConnection(this);
       throw error;
-    } finally { this.store.forget(this); if (this.ownership) await this.store.release(this.ownership); }
+    } finally { if (this.#checkpointTimer) clearTimeout(this.#checkpointTimer); this.store.forget(this); if (this.ownership) await this.store.release(this.ownership); }
+  }
+  #prepareReleaseCheckpoint(): void {
+    if (!this.#session || this.#projection) return;
+    try {
+      const db = this.store.checkpointReader;
+      if (!db || db.prepare("PRAGMA user_version").get()?.user_version !== 2) return;
+      const count = db.prepare("SELECT event_count FROM mh_sessions WHERE session_id=?").get(this.id)?.event_count;
+      if (position(count)) this.#ensureProjection(count);
+    } catch { /* 目录检查点故障不能改变事件关闭结果。 */ }
+  }
+  #ensureProjection(start: number): void {
+    if (this.#projection) return;
+    const db = this.store.checkpointReader;
+    if (!db) throw new Error("目录检查点连接不可用");
+    const row = db.prepare(`SELECT
+      CASE WHEN blank BETWEEN 0 AND 9007199254740991 THEN blank END AS blank,
+      CASE WHEN last_prompt_at BETWEEN 0 AND 9007199254740991 THEN last_prompt_at WHEN last_prompt_at IS NULL THEN NULL ELSE -1 END AS last_prompt_at,
+      CASE WHEN event_count BETWEEN 0 AND 9007199254740991 THEN event_count END AS event_count,
+      CASE WHEN inherited_count BETWEEN 0 AND 9007199254740991 THEN inherited_count END AS inherited_count
+      FROM mh_session_list_metadata WHERE session_id=?`).get(this.id);
+    const valid = row && (row.blank === 0 || row.blank === 1) && (row.last_prompt_at === null || position(row.last_prompt_at)) &&
+      position(row.event_count) && row.event_count <= start && (row.event_count !== 0 || row.last_prompt_at === null) &&
+      row.inherited_count === this.inheritedEventCount && row.event_count >= this.inheritedEventCount;
+    if (valid && row.event_count === start && (row.last_prompt_at === null || position(row.last_prompt_at))) {
+      this.#projection = { blank: row.blank === 1, lastPromptAt: row.last_prompt_at };
+      this.#projectionCount = start;
+      this.#checkpointCount = start;
+      return;
+    }
+    let projection: ListProjection = { blank: true, lastPromptAt: null };
+    const rows = db.prepare("SELECT seq, event_json FROM mh_events WHERE session_id=? AND seq<? ORDER BY seq").all(this.id, start);
+    if (rows.length !== start) throw new Error("目录投影前缀不完整");
+    for (const [index, entry] of rows.entries()) {
+      if (entry.seq !== index || typeof entry.event_json !== "string") throw new Error("目录投影事件无效");
+      projection = projectListMetadata(projection, snapshotSessionEvent(JSON.parse(entry.event_json), index, "replay"));
+    }
+    this.#projection = projection;
+    this.#projectionCount = start;
+    this.#checkpointCount = valid && position(row.event_count) ? row.event_count : 0;
+    this.#checkpointMissing = !valid;
+  }
+  #advance(batch: Pending): void {
+    this.#confirmedCount = batch.start + batch.events.length;
+    if (!batch.first && batch.events.length) {
+      this.#dirtySince ??= batch.attemptedAt ?? Date.now();
+      this.#dirtyCount += batch.events.length;
+    }
+    if (!this.#projection) this.#ensureProjection(batch.start + batch.events.length);
+    else {
+      if (this.#projectionCount !== batch.start) throw new Error("目录投影前缀不一致");
+      for (const event of batch.events) this.#projection = projectListMetadata(this.#projection, event);
+      this.#projectionCount += batch.events.length;
+    }
+    if (batch.first) { this.#checkpointCount = this.#projectionCount; this.#checkpointMissing = false; }
+    else if (this.#projectionCount > this.#checkpointCount) {
+      if (this.#projectionCount - this.#checkpointCount >= 200 || batch.events.some((event) => event.type === "turn/end") || Date.now() - (this.#dirtySince ?? Date.now()) >= 5000) this.#saveCheckpoint();
+      else this.#scheduleCheckpoint();
+    }
+  }
+  #scheduleCheckpoint(): void {
+    if (this.#checkpointTimer) return;
+    this.#checkpointTimer = setTimeout(() => {
+      this.#checkpointTimer = undefined;
+      this.#saveCheckpoint();
+    }, Math.max(0, 5000 - (Date.now() - (this.#dirtySince ?? Date.now()))));
+    this.#checkpointTimer.unref();
+  }
+  #saveCheckpoint(): void {
+    if (!this.#projection && this.#confirmedCount !== undefined) {
+      this.store.saveCheckpoint({ header: this.header, inheritedEventCount: this.inheritedEventCount, eventCount: this.#confirmedCount });
+      this.#dirtySince = undefined;
+      this.#dirtyCount = 0;
+      if (this.#checkpointTimer) clearTimeout(this.#checkpointTimer);
+      this.#checkpointTimer = undefined;
+      return;
+    }
+    if (!this.#projection || (this.#projectionCount === this.#checkpointCount && !this.#checkpointMissing)) return;
+    this.store.saveCheckpoint({ header: this.header, inheritedEventCount: this.inheritedEventCount,
+      eventCount: this.#projectionCount, projection: this.#projection });
+    this.#checkpointCount = this.#projectionCount;
+    this.#checkpointMissing = false;
+    this.#dirtySince = undefined;
+    this.#dirtyCount = 0;
+    if (this.#checkpointTimer) clearTimeout(this.#checkpointTimer);
+    this.#checkpointTimer = undefined;
+  }
+  #projectionFailed(batch: Pending): void {
+    this.#projection = undefined;
+    if (this.#dirtyCount >= 200 || batch.events.some((event) => event.type === "turn/end") ||
+      Date.now() - (this.#dirtySince ?? Date.now()) >= 5000) this.#saveCheckpoint();
+    else this.#scheduleCheckpoint();
+  }
+  #queueUncertain(batch: Pending, release = false): void {
+    if (!batch.checkpointEnabled || batch.first || batch.preflightFailed || batch.attemptedAt === undefined || !batch.transaction) return;
+    const transaction = batch.transaction;
+    const priorCount = this.#projection ? batch.start - this.#checkpointCount : this.#dirtyCount;
+    const immediate = release || priorCount + batch.events.length >= 200 || batch.events.some((event) => event.type === "turn/end");
+    this.store.verifyCheckpoint({ checkpoint: { header: this.header, inheritedEventCount: this.inheritedEventCount,
+      eventCount: batch.start + batch.events.length, dueAt: immediate ? undefined : (this.#dirtySince ?? batch.attemptedAt) + 5000 }, batch,
+      transactionActive: () => this.store.transactionActive(this, transaction) });
   }
   #commit(batch: Pending): void {
     const db = this.store.db;
     if (db.isTransaction) throw new Error("其他事务尚未结束");
+    const checkpointEnabled = db.prepare("PRAGMA user_version").get()?.user_version === 2;
+    batch.checkpointEnabled = checkpointEnabled;
+    if (checkpointEnabled && batch.first) this.#projection = { blank: true, lastPromptAt: null };
+    else if (checkpointEnabled) { try { this.#ensureProjection(batch.start); } catch { /* 检查点读取不能阻断事件提交。 */ } }
     this.#pending = batch;
     try {
       const transaction = {};
+      batch.transaction = transaction;
       if (batch.first) this.#creationTransaction = transaction;
       this.store.beginWrite(this, transaction);
       if (batch.staged) {
@@ -568,17 +802,20 @@ class SqliteHandle implements SessionHandle {
         batch.preflightFailed = false;
       }
       if (batch.first) db.prepare("INSERT INTO mh_sessions VALUES (?, ?, ?, 0)").run(this.id, JSON.stringify(this.header), this.inheritedEventCount);
-      if (batch.first && batch.events.length === 0 && db.prepare("PRAGMA user_version").get()?.user_version === 2) {
-        db.prepare("INSERT INTO mh_session_list_metadata VALUES (?, 1, NULL, 0, 0)").run(this.id);
+      if (batch.first && checkpointEnabled) {
+        const projected = batch.events.reduce(projectListMetadata, this.#projection!);
+        db.prepare("INSERT INTO mh_session_list_metadata VALUES (?, ?, ?, ?, ?)").run(this.id, projected.blank ? 1 : 0, projected.lastPromptAt, batch.events.length, this.inheritedEventCount);
       }
       const insert = db.prepare("INSERT INTO mh_events VALUES (?, ?, ?)");
       for (const event of batch.events) insert.run(this.id, event.seq, JSON.stringify(event));
       const result = db.prepare("UPDATE mh_sessions SET event_count=? WHERE session_id=? AND event_count=?").run(batch.start + batch.events.length, this.id, batch.start);
       if (result.changes !== 1) throw new Error("持久游标冲突");
-      try { db.exec("COMMIT"); } finally { this.store.clearEndedTransaction(); }
+      try { db.exec("COMMIT"); } finally { batch.attemptedAt = Date.now(); this.store.clearEndedTransaction(); }
       this.published = true;
       this.#pending = undefined;
+      if (checkpointEnabled) { try { this.#advance(batch); } catch { this.#projectionFailed(batch); } }
     } catch (error) {
+      this.#queueUncertain(batch);
       try { this.store.rollbackWrite(this); } catch { throw error; }
       if (error instanceof StagedPrefixError) { this.#pending = undefined; throw error; }
       try { if (this.#reconcile()) return; } catch { /* 保留待核对批次供后续显式操作处理。 */ }
@@ -602,6 +839,7 @@ class SqliteHandle implements SessionHandle {
     if ((pending.first ? !row : !!row && headerMatches && row.event_count === pending.start) && contiguous(pending.start) && rows.length === 0 && (pending.events.length > 0 || !row)) {
       reader.exec("COMMIT");
       this.#pending = undefined;
+      this.store.cancelCheckpointVerification(pending);
       return false;
     }
     if (!pending.preflightFailed && headerMatches && row.event_count === pending.start + pending.events.length && contiguous(pending.start + pending.events.length) && rows.length === pending.events.length && rows.every((entry, index) =>
@@ -609,6 +847,10 @@ class SqliteHandle implements SessionHandle {
       reader.exec("COMMIT");
       this.published = true;
       this.#pending = undefined;
+      this.store.cancelCheckpointVerification(pending);
+      if (pending.checkpointEnabled) {
+        try { this.#advance(pending); } catch { this.#projectionFailed(pending); }
+      }
       return true;
     }
     throw new Error("事务结果冲突或不完整，写入保持阻塞");

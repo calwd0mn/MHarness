@@ -14,7 +14,7 @@ function Approval({ approval, enabled, decision, closed }) {
 
 const connections = [];
 class Source {
-  constructor(url) { this.url = url; this.closed = false; connections.push(this); }
+  constructor(url) { this.url = url; this.closed = false; if (url === "/api/session-directory/events") queueMicrotask(() => this.frame({ type: "api-session/ready" })); else connections.push(this); }
   close() { this.closed = true; }
   frame(frame) { this.onmessage?.({ data: JSON.stringify(frame) }); }
 }
@@ -34,12 +34,40 @@ beforeEach(async () => {
   localStorage.clear();
   localStorage.setItem("mharness.session-directory.v1", JSON.stringify({ sessions: ["a", "b"], selected: "a" }));
   vi.stubGlobal("EventSource", Source);
-  vi.stubGlobal("fetch", vi.fn());
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) }));
   container = document.createElement("div"); document.body.append(container);
   root = createRoot(container);
   await act(async () => { root.render(<App />); });
+  fetch.mockClear();
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
+
+test.each([200, 404])("创建结果未知时保留临时项，按原 ID 核实返回 %s", async (status) => {
+  const sessionId = "pending";
+  fetch.mockResolvedValueOnce({ status: 503, json: async () => ({ code: "session_creation_unknown", sessionId }) });
+  await click(button("新建会话"));
+  expect(button("核实待保存会话").textContent).toContain(sessionId);
+  expect(connections.map(({ url }) => url)).toEqual(["/api/sessions/a/follow"]);
+
+  fetch.mockRejectedValueOnce(new Error("still offline"));
+  await click(button("核实待保存会话"));
+  expect(button("核实待保存会话")).toBeDefined();
+  expect(fetch.mock.calls[1]).toEqual(["/api/sessions/pending", { cache: "no-store" }]);
+
+  fetch.mockResolvedValueOnce({ status, ok: status === 200, json: async () => status === 200
+    ? { sessionId, inheritedEventCount: 0, cursor: -1, records: [] }
+    : { code: "session_not_found" } });
+  await click(button("核实待保存会话"));
+  expect(fetch.mock.calls[2]).toEqual(fetch.mock.calls[1]);
+  expect(button("核实待保存会话")).toBeUndefined();
+  if (status === 200) {
+    expect(container.querySelector('nav [aria-current="page"] small').textContent).toBe(sessionId);
+    expect(connections.at(-1).url).toBe("/api/sessions/pending/follow");
+  } else {
+    expect(button("会话 3")).toBeUndefined();
+    expect(container.textContent).toContain("创建会话失败");
+  }
+});
 
 test("首屏和切换只订阅选中会话，旧回调不能覆盖当前画面", async () => {
   expect(connections.map(item => item.url)).toEqual(["/api/sessions/a/follow"]);
@@ -799,8 +827,8 @@ test("迟到创建成功加入目录但不抢显式选择，即使切回原会�
   let resolve; fetch.mockImplementation(() => new Promise(r => { resolve = r; }));
   await click(button("新建会话")); await click(button("会话 2")); await click(button("会话 1"));
   await act(async () => resolve({ ok: true, json: async () => ({ sessionId: "c" }) })); await flush();
-  expect(button("会话 1").getAttribute("aria-current")).toBe("page");
-  expect(button("会话 3")).toBeTruthy();
+  expect(container.querySelector('nav [aria-current="page"] small').textContent).toBe("a");
+  expect([...container.querySelectorAll("nav button small")].some((item) => item.textContent === "c")).toBe(true);
 });
 
 test("迟到创建失败不污染新会话通知", async () => {
@@ -1018,7 +1046,9 @@ const sharedCards = page => [...page.querySelectorAll("article")].filter(card =>
 for (const lateResponse of [false, true]) test(`连续提交后旧 C1 ${lateResponse ? "HTTP 响应迟到" : "start 迟到"}不冒充 C2 活动`, async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
     let release;
@@ -1097,7 +1127,9 @@ test("已确认压缩身份只影响所属会话", async () => {
 test("HTTP 已确认的 C1 迟到 start 不显示活动，另一页 C2 开始仍显示", async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
     fetch.mockImplementationOnce(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "c1", status: "succeeded" }) }));
@@ -1131,7 +1163,9 @@ test("HTTP 已确认的 C1 迟到 start 不显示活动，另一页 C2 开始仍
 test("本地 C1 已完成后另一页 C2 运行仍显示活动状态", async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
     fetch.mockImplementationOnce(async (_url, options) => ({ status: 200, json: async () => ({ compactionId: JSON.parse(options.body).compactionId, commandId: "c1", status: "succeeded" }) }));
@@ -1165,7 +1199,9 @@ test("本地 C1 已完成后另一页 C2 运行仍显示活动状态", async () 
 for (const status of [400, 409]) test(`活动压缩期间保留本页 HTTP ${status} 拒绝和活动提示`, async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     const id = "2dfe7336-a43e-4fcb-9530-1880d94588ce";
     vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
@@ -1185,7 +1221,9 @@ for (const status of [400, 409]) test(`活动压缩期间保留本页 HTTP ${sta
 test("两个独立页面按同一 Session 记录显示独立共享命令卡", async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     const { session, frames, add, start, finish, original } = sharedCompactionFixture();
     start("c1", "cp1");
@@ -1216,7 +1254,9 @@ test("两个独立页面按同一 Session 记录显示独立共享命令卡", as
 for (const outcome of ["success", "no-range"]) test(`两页保留 C1 并在重连后重放 C2 ${outcome}`, async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     const { session, frames, add, start, finish, original } = sharedCompactionFixture();
     start("c1", "cp1");
@@ -1259,7 +1299,9 @@ for (const outcome of ["success", "no-range"]) test(`两页保留 C1 并在重�
 for (const [status, text] of [[400, "请求无效"], [413, "正文过大"], [415, "媒体类型无效"]]) test(`两页中仅发起页显示 HTTP ${status} 入口拒绝`, async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
     fetch.mockResolvedValue({ status, json: async () => ({ commandId: null, result: { kind: "error", text } }) });
@@ -1276,7 +1318,9 @@ for (const [status, text] of [[400, "请求无效"], [413, "正文过大"], [415
 test("两页观察 C2 运行时 C1 迟到 done 不覆盖当前状态", async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     for (const connection of connections.slice(0, 2)) await sendFrame(connection, snapshot("a"));
     const { frames, add, start, finish, original } = sharedCompactionFixture();
@@ -1297,7 +1341,9 @@ test("两页观察 C2 运行时 C1 迟到 done 不覆盖当前状态", async () 
 test("两页即时结算共享卡且其他命令不结束本地等待", async () => {
   const other = document.createElement("div"); document.body.append(other);
   const otherRoot = createRoot(other);
+  fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 0, sessions: ["a", "b"].map((sessionId) => ({ sessionId, createdAt: 1, updatedAt: 1, running: false, blank: false })) }) });
   await act(async () => otherRoot.render(<App />));
+  fetch.mockClear();
   try {
     await sendFrame(connections[0], snapshot("a"));
     await sendFrame(connections[1], snapshot("a"));

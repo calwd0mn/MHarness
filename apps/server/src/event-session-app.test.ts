@@ -417,3 +417,26 @@ test("生产关闭先失效在途创建核实再关闭 Agent", async (t) => {
   await new Promise(resolve => setTimeout(resolve, 350));
   assert.equal(checks, 2);
 });
+
+test("真实 HTTP 列表包含实时摘要及其版本", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-http-"));
+  let now = 1_700_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const app = await createEventSessionApp(join(dir, "events.sqlite"), false, async () => { await gate; });
+  t.after(async () => { finish(); await app.close(); await rm(dir, { recursive: true, force: true }); });
+  await app.ready();
+  const created = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  const { sessionId } = createSessionResponseSchema.parse(created.json());
+  const initial = (await app.inject({ method: "GET", url: "/api/sessions" })).json();
+  assert.equal(initial.sessions[0].blank, true);
+  now += 1_000;
+  const sent = await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: { requestId: "r", content: [{ type: "text", text: "hello" }] } });
+  assert.equal(sent.statusCode, 202);
+  const snapshot = (await app.inject({ method: "GET", url: "/api/sessions" })).json();
+  assert.equal(snapshot.revision, initial.revision + 3);
+  assert.equal(snapshot.sessions[0].blank, false);
+  assert.equal(snapshot.sessions[0].running, true);
+  assert.ok(snapshot.sessions[0].updatedAt >= initial.sessions[0].createdAt);
+});

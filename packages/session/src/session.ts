@@ -7,6 +7,7 @@ import {
 } from "./events.ts";
 import { indexSurfaceToolGroups, isCompleteSurfaceToolRange } from "./surface-tool-pairs.ts";
 import { SessionToolCalls } from "./tool-calls.ts";
+import { projectListMetadata } from "./list-metadata.ts";
 
 /** 独立于事件日志的元数据。分支记录直接父会话，创建时间使用 Unix 毫秒。 */
 export type SessionHeader = Readonly<{
@@ -330,8 +331,9 @@ export class Session {
     if ("surfaceOp" in event) this.#acceptSurface(event);
     recordToolCall?.();
     this.#events.push(event);
-    if (event.type === "turn/start") this.#listBlank = false;
-    if (event.type === "user/message" && event.data.source.kind === "user") this.#lastPromptAt = Math.max(this.#lastPromptAt ?? 0, event.time);
+    const projection = projectListMetadata({ blank: this.#listBlank, lastPromptAt: this.#lastPromptAt }, event);
+    this.#listBlank = projection.blank;
+    this.#lastPromptAt = projection.lastPromptAt;
   }
 
   #assertPruneComplete(): void {

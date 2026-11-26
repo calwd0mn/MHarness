@@ -1058,3 +1058,524 @@ test("关闭中的公开事务确认等待写入与关闭结束", async (t) => {
     assert.equal(await store.stat(header.sessionId), undefined);
   } finally { t.mock.restoreAll(); await store.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test("目录检查点按已提交数量和释放保存前缀", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-count-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header);
+  await handle.flush();
+  assert.deepEqual((await store.list())[0]?.listMetadata, { blank: true, lastPromptAt: null, eventCount: 0, inheritedEventCount: 0 });
+  await handle.append(Array.from({ length: 199 }, (_, i) => event(i)));
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  await handle.append([event(199)]);
+  assert.deepEqual((await store.list())[0]?.listMetadata, { blank: false, lastPromptAt: null, eventCount: 200, inheritedEventCount: 0 });
+  await handle.append([event(200)]);
+  await handle.close();
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 201);
+});
+
+test("分支首次提交原子保存继承前缀检查点", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-seed-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const parent = new Session(header);
+  parent.append({ type: "turn/start", data: { turn: 1 } });
+  const child = new Session({ sessionId: "child", parentSession: "s", isSeeded: true, createdAt: 1 }, { seed: { kind: "fork", events: parent.snapshot().events } });
+  const handle = await store.create(child.header, { inheritedEventCount: 1 });
+  await handle.append(child.snapshot().events);
+  assert.deepEqual((await store.list())[0]?.listMetadata, { blank: false, lastPromptAt: null, eventCount: 2, inheritedEventCount: 1 });
+  await handle.close();
+});
+
+test("检查点计时从首条提交开始，turn/end 提前保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-timer-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite")); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  await handle.append([event(0)]); t.mock.timers.tick(3000);
+  await handle.append([event(1)]); t.mock.timers.tick(1999);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(1);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  await handle.append([{ type: "turn/end", seq: 2, time: 3, data: { turn: 2, reason: { kind: "completed" } } }]);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 3);
+  await handle.close();
+});
+
+test("提交回执丢失后核实只计数一次", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-receipt-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite")); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; let lose = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "COMMIT" && lose && !this.isTransaction) { lose = false; throw new Error("回执丢失"); }
+    return result;
+  });
+  await handle.append([event(0)]);
+  await handle.append(Array.from({ length: 198 }, (_, i) => event(i + 1)));
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  await handle.append([event(199)]);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 200);
+  await handle.close();
+});
+
+test("定时检查点不会进入其他句柄的活动事务并会重试", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-conflict-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite")); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.append([event(0)]);
+  const second = await store.create({ sessionId: "other", createdAt: 1 });
+  const exec = DatabaseSync.prototype.exec; let tick = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "BEGIN IMMEDIATE" && tick) { tick = false; t.mock.timers.tick(5000); }
+    return result;
+  });
+  await second.flush();
+  assert.equal((await store.list()).find((item) => item.header.sessionId === "s")?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(5000);
+  assert.equal((await store.list()).find((item) => item.header.sessionId === "s")?.listMetadata?.eventCount, 1);
+  await first.close(); await second.close();
+});
+
+test("暂存提交计入检查点，而未提交的在线消息不计入", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-staged-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite")); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const session = new Session(header); store.bindWriter(handle, session);
+  const staged = await session.commitStaged(() => [{ type: "turn/start", time: 2, data: { turn: 1 } }]);
+  assert.equal(staged.status, "committed");
+  session.append({ type: "user/message", time: 10, surfaceOp: "append", data: { id: "u", role: "user", source: { kind: "user" }, turn: 1, requestId: "r", content: [] } });
+  t.mock.timers.tick(5000);
+  assert.deepEqual((await store.list())[0]?.listMetadata, { blank: false, lastPromptAt: null, eventCount: 1, inheritedEventCount: 0 });
+  await handle.close();
+  assert.deepEqual((await store.list())[0]?.listMetadata, { blank: false, lastPromptAt: 10, eventCount: 2, inheritedEventCount: 0 });
+});
+
+test("重开写句柄按落后检查点累计已提交数量", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-reopen-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush();
+  await first.append(Array.from({ length: 199 }, (_, i) => event(i))); await first.close();
+  const fixture = new DatabaseSync(path); fixture.prepare("UPDATE mh_session_list_metadata SET blank=1, event_count=0 WHERE session_id=?").run("s"); fixture.close();
+  const reopened = await store.open("s", "write"); assert.ok(reopened);
+  await reopened.append([event(199)]);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 200);
+  await reopened.close();
+});
+
+for (const [reason, count] of [["超出安全整数", 9223372036854775807n], ["超出已提交前缀", 100n]] as const) {
+  test(`${reason}的检查点不影响写入并在释放时修复`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-unsafe-")); const path = join(dir, "db.sqlite");
+    const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+    t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+    const first = await store.create(header); await first.flush(); await first.close();
+    const fixture = new DatabaseSync(path);
+    try { fixture.prepare("UPDATE mh_session_list_metadata SET event_count=?").run(count); }
+    finally { fixture.close(); }
+    const reopened = await store.open("s", "write"); assert.ok(reopened);
+    await reopened.append([event(0)]); await reopened.close();
+    assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  });
+}
+
+test("检查点锁竞争不阻塞事件循环，释放后仍可重试", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-lock-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush(); await handle.append([event(0)]);
+  const locker = new DatabaseSync(path); locker.exec("BEGIN IMMEDIATE");
+  try {
+    const started = performance.now(); t.mock.timers.tick(5000);
+    assert.ok(performance.now() - started < 1000, "检查点锁等待阻塞事件循环");
+    await handle.close();
+    assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+    locker.exec("ROLLBACK"); t.mock.timers.tick(5000);
+    assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  } finally { if (locker.isTransaction) locker.exec("ROLLBACK"); locker.close(); }
+});
+
+test("检查点读取暂时失败不阻断已存在会话的提交", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-read-error-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const prepare = DatabaseSync.prototype.prepare; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("FROM mh_session_list_metadata WHERE") && fail) { fail = false; throw new Error("检查点读取失败"); }
+    return prepare.call(this, sql);
+  });
+  await handle.append([event(0)]); await handle.close();
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+});
+
+test("回执丢失并延迟核实时沿用原提交期限", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-deadline-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failRead = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "COMMIT" && lose) { lose = false; failRead = true; throw new Error("回执丢失"); }
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failRead && sql.startsWith("SELECT header_json, inherited_count")) { failRead = false; throw new Error("首次核实失败"); }
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([event(0)]));
+  t.mock.timers.tick(6000);
+  await handle.flush();
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  await handle.close();
+});
+
+test("释放后的旧检查点不能覆盖后续句柄已保存的前缀", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-stale-retry-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.append([event(0)]);
+  const locker = new DatabaseSync(path); locker.exec("BEGIN IMMEDIATE");
+  try { await first.close(); } finally { locker.exec("ROLLBACK"); locker.close(); }
+  const next = await store.open("s", "write"); assert.ok(next);
+  await next.append([{ type: "turn/end", seq: 1, time: 3, data: { turn: 1, reason: { kind: "completed" } } }]);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  t.mock.timers.tick(5000);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  await next.close();
+});
+
+test("释放时目录读取仍失败，存储在锁解除后从确认前缀重建", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-rebuild-release-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const prepare = DatabaseSync.prototype.prepare;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("FROM mh_session_list_metadata WHERE")) throw new Error("检查点读取失败");
+    return prepare.call(this, sql);
+  });
+  await handle.append([event(0)]);
+  const locker = new DatabaseSync(path); locker.exec("BEGIN IMMEDIATE");
+  try { await handle.close(); } finally { locker.exec("ROLLBACK"); locker.close(); }
+  t.mock.timers.tick(5000);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+});
+
+test("投影读取持续失败时仍按首个提交期限保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-rebuild-deadline-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const prepare = DatabaseSync.prototype.prepare; let fail = true; let reads = 0;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("FROM mh_session_list_metadata WHERE")) { reads++; if (fail) throw new Error("目录读取失败"); }
+    return prepare.call(this, sql);
+  });
+  await handle.append([event(0)]); fail = false;
+  const initialReads = reads; t.mock.timers.tick(250);
+  assert.equal(reads, initialReads);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(4749); assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(1); assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  await handle.close();
+});
+
+test("turn/end 回执丢失和同步核实失败后后台独立保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-uncertain-end-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush(); await handle.append([event(0)]);
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); }
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("同步核实不可用");
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([{ type: "turn/end", seq: 1, time: 3, data: { turn: 1, reason: { kind: "completed" } } }]));
+  t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.eventCount, 2);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  const db = new DatabaseSync(path, { readOnly: true });
+  try { assert.equal(db.prepare("SELECT COUNT(*) AS count FROM mh_events WHERE session_id='s'").get()?.count, 2); } finally { db.close(); }
+  failVerify = false; await handle.close();
+});
+
+test("后台核实不会采用仍在原事务中的 turn/end", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-uncommitted-end-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; let writer: DatabaseSync | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") writer = this;
+    if (this === writer && fail && (sql === "COMMIT" || sql === "ROLLBACK")) throw new Error("事务仍未结束");
+    return exec.call(this, sql);
+  });
+  await assert.rejects(handle.append([{ type: "turn/end", seq: 0, time: 3, data: { turn: 1, reason: { kind: "completed" } } }]));
+  t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.eventCount, 0);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  fail = false; assert.ok(writer); exec.call(writer, "ROLLBACK"); t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  await handle.close();
+});
+
+test("投影重建遇独占锁时零等待并在解锁后保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-rebuild-lock-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const prepare = DatabaseSync.prototype.prepare; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (fail && sql.includes("FROM mh_session_list_metadata WHERE")) throw new Error("目录读取失败");
+    return prepare.call(this, sql);
+  });
+  await handle.append([event(0)]); fail = false;
+  const locker = new DatabaseSync(path); locker.exec("BEGIN EXCLUSIVE");
+  try { const started = performance.now(); t.mock.timers.tick(5000); assert.ok(performance.now() - started < 1000); }
+  finally { locker.exec("ROLLBACK"); locker.close(); }
+  t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  await handle.close();
+});
+
+test("投影读取持续失败仍按多批次累计 200 条触发", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-failed-read-count-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const prepare = DatabaseSync.prototype.prepare;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("FROM mh_session_list_metadata WHERE")) throw new Error("目录读取失败");
+    return prepare.call(this, sql);
+  });
+  await handle.append(Array.from({ length: 100 }, (_, i) => event(i)));
+  await handle.append(Array.from({ length: 99 }, (_, i) => event(i + 100)));
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  await handle.append([event(199)]);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 200);
+  await handle.close();
+});
+
+test("待核实 turn/end 在句柄释放后由存储继续保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-uncertain-release-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); }
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("同步核实不可用");
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([{ type: "turn/end", seq: 0, time: 3, data: { turn: 1, reason: { kind: "completed" } } }]));
+  await assert.rejects(handle.close());
+  t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.eventCount, 1);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+});
+
+for (const count of [1, 200]) test(`普通批次 ${count} 条回执丢失后后台按期限保存`, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-ordinary-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); }
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("同步核实不可用");
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append(Array.from({ length: count }, (_, i) => event(i))));
+  t.mock.timers.tick(count === 1 ? 4999 : 249);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(1);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, count);
+  assert.equal((await store.list())[0]?.eventCount, count);
+  failVerify = false; await handle.close();
+});
+
+test("普通待核实批次实际回滚不更新检查点", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-rollback-")); const store = new SqliteSessionPersistence(join(dir, "db.sqlite")); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (fail && sql === "COMMIT" && this.isTransaction) throw new Error("提交失败");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (fail && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("核实失败");
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([event(0)])); t.mock.timers.tick(5500);
+  assert.equal((await store.list())[0]?.eventCount, 0); assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  fail = false; await handle.close();
+});
+
+test("到期检查点锁解除后追赶重试前提交的尾部", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-retry-tail-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush(); await handle.append([event(0)]);
+  const locker = new DatabaseSync(path); locker.exec("BEGIN IMMEDIATE");
+  t.mock.timers.tick(5000); locker.exec("ROLLBACK"); locker.close();
+  await handle.append([event(1)]); t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.eventCount, 2);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  await handle.close();
+});
+
+test("重开后待核实批次按已有落后检查点累计 200 条", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-existing-count-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.append(Array.from({ length: 199 }, (_, i) => event(i))); await first.close();
+  const fixture = new DatabaseSync(path); fixture.exec("UPDATE mh_session_list_metadata SET blank=1,event_count=0"); fixture.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql); if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); } return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("核实失败"); return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([event(199)])); t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 200);
+  failVerify = false; await handle.close();
+});
+
+test("检查点写入前另一连接追加时保留候选并追赶", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-atomic-race-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush(); await handle.append([event(0)]);
+  const fixture = new DatabaseSync(path); const prepare = DatabaseSync.prototype.prepare; let inject = true;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (inject && sql.startsWith("INSERT INTO mh_session_list_metadata (session_id")) {
+      inject = false;
+      fixture.prepare("INSERT INTO mh_events VALUES (?, ?, ?)").run("s", 1, JSON.stringify(event(1)));
+      fixture.prepare("UPDATE mh_sessions SET event_count=2 WHERE session_id=?").run("s");
+    }
+    return prepare.call(this, sql);
+  });
+  t.mock.timers.tick(5000); assert.equal((await store.list())[0]?.listMetadata?.eventCount, 0);
+  t.mock.timers.tick(250); assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  fixture.close(); await handle.close();
+});
+
+test("普通待核实批次释放时提前核实检查点", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-release-ordinary-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); await handle.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql); if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); } return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("核实失败"); return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([event(0)])); await assert.rejects(handle.close()); t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+});
+
+test("待核实批次释放后新句柄追加仍能追赶保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-successor-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql); if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); } return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (failVerify && sql.startsWith("SELECT header_json, inherited_count")) throw new Error("核实失败"); return prepare.call(this, sql);
+  });
+  await assert.rejects(first.append([event(0)])); await assert.rejects(first.close());
+  const next = await store.open("s", "write"); assert.ok(next); await next.append([event(1)]);
+  t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.eventCount, 2);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 2);
+  failVerify = false; await next.close();
+});
+
+test("旧库非规范 header JSON 也能更新检查点", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-header-json-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.close();
+  const fixture = new DatabaseSync(path); fixture.prepare("UPDATE mh_sessions SET header_json=? WHERE session_id=?").run('{ "sessionId": "s", "createdAt": 1 }', "s"); fixture.close();
+  const next = await store.open("s", "write"); assert.ok(next); await next.append([event(0)]);
+  t.mock.timers.tick(5000);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 1);
+  await next.close();
+});
+
+test("重开后投影读取失败且第 200 条回执丢失时后台立即保存", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const dir = await mkdtemp(join(tmpdir(), "mh-uncertain-count-no-projection-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); store.upgradeDirectoryMetadata();
+  t.after(async () => { await store.close().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+  const first = await store.create(header); await first.flush(); await first.append(Array.from({ length: 199 }, (_, i) => event(i))); await first.close();
+  const fixture = new DatabaseSync(path); fixture.exec("UPDATE mh_session_list_metadata SET blank=1,event_count=0"); fixture.close();
+  const handle = await store.open("s", "write"); assert.ok(handle);
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare; let lose = true; let failVerify = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql); if (sql === "COMMIT" && lose) { lose = false; failVerify = true; throw new Error("回执丢失"); } return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("FROM mh_session_list_metadata WHERE") || (failVerify && sql.startsWith("SELECT header_json, inherited_count"))) throw new Error("读取失败");
+    return prepare.call(this, sql);
+  });
+  await assert.rejects(handle.append([event(199)])); t.mock.timers.tick(250);
+  assert.equal((await store.list())[0]?.listMetadata?.eventCount, 200);
+  failVerify = false; await handle.close();
+});
