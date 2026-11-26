@@ -51,3 +51,45 @@ test("独立进程竞争并在持有者退出后释放所有权", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("锁连接关闭失败后再次释放不能虚报成功", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-owner-close-"));
+  const db = join(dir, "session.sqlite");
+  const lock = await acquireSessionOwnership(db, "a");
+  const { DatabaseSync } = await import("node:sqlite");
+  const close = DatabaseSync.prototype.close;
+  let fail = true;
+  let failedConnection: InstanceType<typeof DatabaseSync> | undefined;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: InstanceType<typeof DatabaseSync>) {
+    if (fail && (!failedConnection || failedConnection === this)) { failedConnection = this; throw new Error("close fault"); }
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(lock.release(), /close fault/);
+    await assert.rejects(lock.release(), /close fault/);
+    await assert.rejects(acquireSessionOwnership(db, "a"), OwnershipConflictError);
+    fail = false;
+    await lock.release();
+    const next = await acquireSessionOwnership(db, "a");
+    await next.release();
+  } finally { fail = false; await lock.release(); if (failedConnection) { try { close.call(failedConnection); } catch {} } await rm(dir, { recursive: true, force: true }); }
+});
+
+test("连接实际关闭但回执异常时认可锁已释放", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-owner-receipt-"));
+  const db = join(dir, "session.sqlite");
+  const lock = await acquireSessionOwnership(db, "a");
+  const { DatabaseSync } = await import("node:sqlite");
+  const close = DatabaseSync.prototype.close;
+  let first = true;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: InstanceType<typeof DatabaseSync>) {
+    close.call(this);
+    if (first) { first = false; throw new Error("receipt fault"); }
+  });
+  try {
+    await lock.release();
+    await lock.release();
+    const next = await acquireSessionOwnership(db, "a");
+    await next.release();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

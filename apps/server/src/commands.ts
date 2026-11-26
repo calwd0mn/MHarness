@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { selectForkCut } from "@mharness/session/server";
+import { createPersistedSession, selectForkCut, Session, type SessionPersistence } from "@mharness/session/server";
+import type { SessionHeader } from "@mharness/session/server";
+import { isDeepStrictEqual } from "node:util";
+import type { SessionDirectory } from "./session/directory.ts";
 import { sessionParamsSchema, type CompactRequest, type CompactResponse, type PromptRequest, type PromptResponse } from "@mharness/session/contracts";
 import { AgentManager } from "./agent/manager.ts";
 import { AgentError } from "./agent/react-agent.ts";
@@ -8,8 +11,75 @@ import type { CommitCompactionSummaryOptions } from "./agent/commit-compaction-s
 
 type CompactCommandResult = CompactResponse | { code: "compaction_id_conflict" } | { commandId: string; result: { kind: "error"; text: string } };
 
+type CreationResult = Awaited<ReturnType<typeof createPersistedSession>> | { status: "conflict" };
+type CreationAttempt = { header: SessionHeader; result: Promise<CreationResult>; timer?: ReturnType<typeof setTimeout>; registered?: boolean };
+
+/** 管理会话首次创建的共享尝试与后台核实，关闭后不再调度或应用核实结果。 */
+export class SessionCreationController {
+  readonly #attempts = new Map<string, CreationAttempt>();
+  #closed = false;
+  /** @param persistence - 创建会话的持久化存储。 @param directory - 当前目录投影。 */
+  constructor(private readonly persistence: SessionPersistence, private readonly directory: () => SessionDirectory) {}
+
+  /**
+   * 共享相同身份的创建结果，同标识不同身份返回冲突。
+   * @param header - 固定的会话身份。
+   * @param reportCloseError - 记录写句柄关闭错误。
+   * @returns 首次提交的结果；未知结果在后台继续核实。
+   */
+  create(header: SessionHeader, reportCloseError?: (error: unknown) => void): Promise<CreationResult> {
+    const existing = this.#attempts.get(header.sessionId);
+    if (existing) return isDeepStrictEqual(existing.header, header) ? existing.result : Promise.resolve({ status: "conflict" });
+    if (this.#closed) return Promise.resolve({ status: "conflict" });
+    const fixed = Object.freeze({ ...header });
+    const attempt: CreationAttempt = { header: fixed, result: Promise.resolve({ status: "conflict" }) };
+    this.#attempts.set(fixed.sessionId, attempt);
+    attempt.result = createPersistedSession(this.persistence, fixed, reportCloseError, () => {
+      if (!this.#closed && this.#attempts.get(fixed.sessionId) === attempt) {
+        const directory = this.directory();
+        attempt.registered = directory.register(new Session(fixed), true);
+      }
+    }).then(result => {
+      if (this.#closed || this.#attempts.get(fixed.sessionId) !== attempt) return result;
+      if (result.status === "committed") { if (attempt.registered) this.directory().confirm(fixed.sessionId); }
+      else if (result.status === "failed") {
+        if (attempt.registered && this.directory().isPending(fixed.sessionId)) this.directory().remove(fixed.sessionId);
+        this.#attempts.delete(fixed.sessionId);
+      } else {
+        if (attempt.registered) this.directory().markUnknown(fixed.sessionId);
+        this.#schedule(attempt, result.verify, 250);
+      }
+      return result;
+    });
+    return attempt.result;
+  }
+
+  #schedule(attempt: CreationAttempt, verify: () => Promise<"committed" | "failed" | "unknown">, delay: number): void {
+    if (this.#closed || this.#attempts.get(attempt.header.sessionId) !== attempt) return;
+    attempt.timer = setTimeout(() => {
+      if (this.#closed || this.#attempts.get(attempt.header.sessionId) !== attempt) return;
+      void verify().catch(() => "unknown" as const).then(result => {
+        if (this.#closed || this.#attempts.get(attempt.header.sessionId) !== attempt) return;
+        if (result === "unknown") this.#schedule(attempt, verify, Math.min(delay * 2, 10_000));
+        else if (result === "committed") {
+          if (attempt.registered) this.directory().confirm(attempt.header.sessionId);
+          attempt.result = Promise.resolve({ status: "committed" });
+        }
+        else { if (attempt.registered && this.directory().isPending(attempt.header.sessionId)) this.directory().remove(attempt.header.sessionId); this.#attempts.delete(attempt.header.sessionId); }
+      });
+    }, delay);
+  }
+
+  /** 停止后续调度；已启动的核实结果不再改变目录。 */
+  close(): void {
+    this.#closed = true;
+    for (const attempt of this.#attempts.values()) if (attempt.timer) clearTimeout(attempt.timer);
+  }
+}
+
 /** 按命令选择激活策略；prompt 和手动压缩按需加载，取消只查询已加载实例。 */
 export class SessionCommandController {
+  #creation?: SessionCreationController;
   /**
    * 绑定会话命令的 Agent 管理器及可选摘要配置。
    * @param agents - 会话执行对象及其写入资源的所有者。
@@ -20,6 +90,15 @@ export class SessionCommandController {
     prepareCompaction?: () => CommitCompactionSummaryOptions,
   ) {
     if (prepareCompaction) this.compact = request => this.#compact(request, prepareCompaction);
+  }
+  /**
+   * 绑定本实例的会话创建控制器，重复调用返回同一实例。
+   * @param persistence - 创建会话的持久化存储。
+   * @param directory - 当前目录投影。
+   * @returns 应用关闭时须停止的创建控制器。
+   */
+  creationController(persistence: SessionPersistence, directory: () => SessionDirectory): SessionCreationController {
+    return this.#creation ??= new SessionCreationController(persistence, directory);
   }
   /**
    * 从同一次父会话观察快照派生子会话，并以持久化的初始前缀发布子 Agent。

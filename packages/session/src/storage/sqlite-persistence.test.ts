@@ -522,3 +522,539 @@ test("范围读取 BEGIN 已生效后抛错不会污染后续读取", async (t) 
     assert.deepEqual(await handle.read(), [event(0)]);
   } finally { fault.mock.restore(); await store.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test("初始空会话与检查点原子提交并可在只读重开后查询", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-checkpoint-"));
+  const path = join(dir, "events.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  store.upgradeDirectoryMetadata();
+  const pending = await store.create({ sessionId: "pending", createdAt: 1 });
+  const blank = await store.create({ sessionId: "blank", createdAt: 2 });
+  await blank.flush();
+  await blank.close();
+  const reader = new SqliteSessionPersistence(path, { readOnly: true });
+  try {
+    assert.deepEqual(await reader.list(), [{ header: { sessionId: "blank", createdAt: 2 }, inheritedEventCount: 0, eventCount: 0, listMetadata: { blank: true, lastPromptAt: null, eventCount: 0, inheritedEventCount: 0 } }]);
+  } finally { await reader.close(); await pending.close(); }
+});
+
+test("损坏的目录检查点表在打开时拒绝", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-schema-"));
+  const path = join(dir, "events.sqlite");
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const store = new SqliteSessionPersistence(path);
+  store.upgradeDirectoryMetadata();
+  await store.close();
+  const db = new DatabaseSync(path);
+  db.exec("DROP TABLE mh_session_list_metadata");
+  db.close();
+  assert.throws(() => new SqliteSessionPersistence(path, { readOnly: true }), /格式/);
+});
+
+test("关闭失败后原创建尝试可重试清理且不影响后续事务", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-attempt-cleanup-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header);
+  let writer: DatabaseSync | undefined;
+  let faulty = true;
+  const exec = DatabaseSync.prototype.exec;
+  const close = DatabaseSync.prototype.close;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") writer = this;
+    if (this === writer && faulty && (sql === "COMMIT" || sql === "ROLLBACK")) throw new Error("事务故障");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this === writer && faulty) throw new Error("连接关闭故障");
+    return close.call(this);
+  });
+  await assert.rejects(handle.flush());
+  await assert.rejects(handle.close());
+  assert.equal(await handle.confirmCreationEnded?.(), false);
+  assert.equal(await store.stat("s"), undefined);
+  faulty = false;
+  assert.equal(await handle.confirmCreationEnded?.(), true);
+  assert.equal(await store.stat("s"), undefined);
+  const next = await store.create({ sessionId: "next", createdAt: 2 });
+  await next.flush();
+  assert.equal(await handle.confirmCreationEnded?.(), true);
+  assert.ok(await store.stat("next"));
+  await next.close();
+});
+
+test("旧版本只读打开与拒绝升级不修改数据库", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-checkpoint-readonly-"));
+  const path = join(dir, "events.sqlite");
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const old = new SqliteSessionPersistence(path);
+  const handle = await old.create(header);
+  await handle.flush(); await handle.close(); await old.close();
+  const before = await readFile(path);
+  const reader = new SqliteSessionPersistence(path, { readOnly: true });
+  assert.equal((await reader.list())[0]?.listMetadata, undefined);
+  assert.throws(() => reader.upgradeDirectoryMetadata(), /只读/);
+  await reader.close();
+  assert.deepEqual(await readFile(path), before);
+});
+
+test("首次创建核实不依赖陈旧的共享读取", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-fresh-creation-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = store.create.bind(store);
+  t.mock.method(store, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    const flush = handle.flush.bind(handle);
+    t.mock.method(handle, "flush", async () => { await flush(); throw new Error("丢失回执"); });
+    return handle;
+  });
+  t.mock.method(store, "stat", async () => undefined);
+  const { createPersistedSession } = await import("../api/use-cases.ts");
+  assert.equal((await createPersistedSession(store, header)).status, "committed");
+});
+
+test("首次新读缺失后事务确认期间出现提交，第二次新读发现会话", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-creation-second-read-"));
+  const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header);
+  const verify = handle.creationVerifier!();
+  await handle.close();
+  const close = DatabaseSync.prototype.close;
+  let injected = false;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    close.call(this);
+    if (!injected) {
+      injected = true;
+      const writer = new DatabaseSync(path);
+      try { writer.prepare("INSERT INTO mh_sessions VALUES (?, ?, 0, 0)").run(header.sessionId, JSON.stringify(header)); }
+      finally { close.call(writer); }
+    }
+  });
+  assert.equal(await verify(), "committed");
+});
+
+test("WAL 共享连接停留旧快照时首次创建核实仍读到提交", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-wal-stale-"));
+  const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const setup = new DatabaseSync(path);
+  setup.exec("PRAGMA journal_mode=WAL"); setup.close();
+  const prepare = DatabaseSync.prototype.prepare;
+  let shared: DatabaseSync | undefined;
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === "SELECT * FROM mh_sessions WHERE session_id=?" && !shared) shared = this;
+    return prepare.call(this, sql);
+  });
+  await store.stat(header.sessionId);
+  assert.ok(shared);
+  shared.exec("BEGIN");
+  assert.equal(prepare.call(shared, "SELECT * FROM mh_sessions WHERE session_id=?").get(header.sessionId), undefined);
+  const create = store.create.bind(store);
+  t.mock.method(store, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    const flush = handle.flush.bind(handle);
+    t.mock.method(handle, "flush", async () => { await flush(); throw new Error("丢失回执"); });
+    return handle;
+  });
+  try {
+    const { createPersistedSession } = await import("../api/use-cases.ts");
+    assert.equal((await createPersistedSession(store, header)).status, "committed");
+    assert.equal(await store.stat(header.sessionId), undefined);
+  } finally { shared.exec("ROLLBACK"); }
+  assert.ok(await store.stat(header.sessionId));
+});
+
+test("首次创建未提交但锁释放未确认时保持未知并在恢复后失败", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-lock-fault-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = store.create.bind(store);
+  let fail = true;
+  let lockConnection: DatabaseSync | undefined;
+  const close = DatabaseSync.prototype.close;
+  t.mock.method(store, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+    t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+      if (fail && (!lockConnection || lockConnection === this)) { lockConnection = this; throw new Error("lock close fault"); }
+      return close.call(this);
+    });
+    return handle;
+  });
+  const { createPersistedSession } = await import("../api/use-cases.ts");
+  const result = await createPersistedSession(store, header, () => {});
+  assert.equal(result.status, "unknown");
+  if (result.status !== "unknown") throw new Error("预期未知结果");
+  fail = false;
+  assert.equal(await result.verify(), "failed");
+  const next = await store.create(header);
+  await next.close();
+});
+
+test("原创建事务核实不会回滚或释放同句柄后续事务的写入权", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-creation-transaction-token-"));
+  const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path);
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header);
+  const verify = handle.creationVerifier!();
+  let commits = 0;
+  let verification: Promise<"committed" | "failed" | "unknown"> | undefined;
+  const exec = DatabaseSync.prototype.exec;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "COMMIT" && ++commits === 1) throw new Error("首次失败");
+    if (sql === "COMMIT" && commits === 2) verification = verify();
+    return exec.call(this, sql);
+  });
+  await assert.rejects(handle.flush());
+  await handle.flush();
+  assert.equal(await verification, "unknown");
+  await assert.rejects(store.open(header.sessionId, "write"));
+  await handle.close();
+});
+
+test("已提交会话的锁关闭失败后由存储重试释放", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-storage-lock-retry-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header);
+  await handle.flush();
+  const close = DatabaseSync.prototype.close;
+  let fail = true;
+  let lock: DatabaseSync | undefined;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && (!lock || lock === this)) { lock = this; throw new Error("lock close fault"); }
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.close(), /lock close fault/);
+    await assert.rejects(store.open("s", "write"), { name: "OwnershipConflictError" });
+    fail = false;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const next = await store.open("s", "write");
+    assert.ok(next);
+    await next.close();
+  } finally { fail = false; await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("创建准备失败且锁未释放时保留核实能力", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-storage-prepare-lock-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const controller = new AbortController();
+  const exec = DatabaseSync.prototype.exec;
+  const close = DatabaseSync.prototype.close;
+  let lock: DatabaseSync | undefined;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    exec.call(this, sql);
+    if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE") { lock = this; controller.abort(); }
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && this === lock) throw new Error("lock close fault");
+    return close.call(this);
+  });
+  try {
+    const { createPersistedSession } = await import("../api/use-cases.ts");
+    const originalCreate = store.create.bind(store);
+    t.mock.method(store, "create", (value: Parameters<typeof originalCreate>[0]) => originalCreate(value, { signal: controller.signal }));
+    const result = await createPersistedSession(store, header);
+    assert.equal(result.status, "unknown");
+    if (result.status !== "unknown") throw new Error("预期未知结果");
+    assert.equal(await result.verify(), "unknown");
+    await assert.rejects(originalCreate(header), { name: "OwnershipConflictError" });
+    fail = false;
+    assert.equal(await result.verify(), "failed");
+    const next = await originalCreate(header);
+    await next.close();
+  } finally { fail = false; await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test("存储关闭时停止重试并汇总未释放的锁错误", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-storage-close-retry-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header);
+  await handle.flush();
+  const close = DatabaseSync.prototype.close;
+  let lock: DatabaseSync | undefined;
+  let attempts = 0;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && (!lock || lock === this)) { lock = this; attempts++; throw new Error("lock close fault"); }
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.close(), /lock close fault/);
+    await assert.rejects(store.close(), (error: unknown) => error instanceof AggregateError && error.errors.some((item: unknown) => item instanceof Error && /lock close fault/.test(item.message)));
+    const stopped = attempts;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(attempts, stopped);
+  } finally { fail = false; if (lock?.isOpen) close.call(lock); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("并发核实同一未释放锁只保留一个后台重试", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-storage-concurrent-cleanup-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header);
+  const verify = handle.creationVerifier!();
+  const close = DatabaseSync.prototype.close;
+  let lock: DatabaseSync | undefined;
+  let attempts = 0;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && (!lock || lock === this)) { lock = this; attempts++; throw new Error("lock close fault"); }
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.close(), /lock close fault/);
+    assert.deepEqual(await Promise.all([verify(), verify()]), ["unknown", "unknown"]);
+    await assert.rejects(store.close(), AggregateError);
+    const before = attempts;
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.equal(attempts, before);
+  } finally { fail = false; if (lock?.isOpen) close.call(lock); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("关闭扫尾等待在途释放失败后独立重试", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-close-race-"));
+  const path = join(dir, "db.sqlite"); const store = new SqliteSessionPersistence(path);
+  const handle = await store.create(header); await handle.flush();
+  const close = DatabaseSync.prototype.close; let failures = 0; let lock: DatabaseSync | undefined;
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this.isTransaction && failures++ === 0) { lock = this; throw new Error("transient close"); }
+    return close.call(this);
+  });
+  try {
+    const releasing = handle.close();
+    const closing = store.close();
+    await assert.rejects(releasing, /transient close/);
+    await closing;
+    const { acquireSessionOwnership } = await import("./ownership.ts");
+    const next = await acquireSessionOwnership(path, header.sessionId); await next.release();
+  } finally { if (lock?.isOpen) close.call(lock); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("取得锁后回执丢失且关闭失败时创建保持未知直到释放", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-acquire-receipt-"));
+  const path = join(dir, "db.sqlite"); const store = new SqliteSessionPersistence(path);
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let lock: DatabaseSync | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    exec.call(this, sql);
+    if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE" && !lock) { lock = this; throw new Error("lost receipt"); }
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && this === lock) throw new Error("close fault"); return close.call(this);
+  });
+  try {
+    const { createPersistedSession } = await import("../api/use-cases.ts");
+    const result = await createPersistedSession(store, header);
+    assert.equal(result.status, "unknown");
+    if (result.status !== "unknown") throw new Error("预期未知结果");
+    assert.equal(await result.verify(), "unknown");
+    fail = false;
+    assert.equal(await result.verify(), "failed");
+    const next = await store.create(header); await next.close();
+  } finally { fail = false; await store.close(); if (lock?.isOpen) close.call(lock); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("打开写句柄时取得锁回执丢失会后台释放遗留锁", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-open-acquire-receipt-"));
+  const path = join(dir, "db.sqlite"); const store = new SqliteSessionPersistence(path);
+  const handle = await store.create(header); await handle.flush(); await handle.close();
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let lock: DatabaseSync | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    exec.call(this, sql);
+    if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE" && !lock) { lock = this; throw new Error("lost receipt"); }
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (fail && this === lock) throw new Error("close fault"); return close.call(this);
+  });
+  try {
+    await assert.rejects(store.open(header.sessionId, "write"), /清理待确认/);
+    fail = false;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const next = await store.open(header.sessionId, "write"); assert.ok(next); await next.close();
+  } finally { fail = false; await store.close(); if (lock?.isOpen) close.call(lock); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("主库开始事务回执丢失且清理受阻时保持未知，恢复后确认失败", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-main-begin-receipt-"));
+  const path = join(dir, "db.sqlite"); const store = new SqliteSessionPersistence(path);
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let writer: DatabaseSync | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && !writer) {
+      writer = this; exec.call(this, sql); throw new Error("begin receipt lost");
+    }
+    if (this === writer && sql === "ROLLBACK" && fail) throw new Error("rollback fault");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this === writer && fail) throw new Error("writer close fault");
+    return close.call(this);
+  });
+  try {
+    const { createPersistedSession } = await import("../api/use-cases.ts");
+    const result = await createPersistedSession(store, header, () => {});
+    assert.equal(result.status, "unknown");
+    if (result.status !== "unknown") throw new Error("预期未知结果");
+    assert.equal(await result.verify(), "unknown");
+    assert.equal(writer?.isTransaction, true);
+    fail = false;
+    assert.equal(await result.verify(), "failed");
+    assert.equal(writer?.isTransaction, false);
+    const next = await store.create(header); await next.flush(); await next.close();
+  } finally { fail = false; await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("首次批次回滚后重试会核实新的创建事务", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-retry-token-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let writer: DatabaseSync | undefined; let begins = 0; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") {
+      writer = this; begins++; exec.call(this, sql);
+      if (begins === 2) throw new Error("begin receipt lost");
+      return;
+    }
+    if (this === writer && sql === "COMMIT" && begins === 1) throw new Error("first commit failed");
+    if (this === writer && sql === "ROLLBACK" && begins === 2 && fail) throw new Error("rollback fault");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this === writer && fail) throw new Error("close fault"); return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.flush());
+    await assert.rejects(handle.flush());
+    await assert.rejects(handle.close());
+    assert.equal(await verify(), "unknown");
+    fail = false;
+    assert.equal(await verify(), "failed");
+  } finally { fail = false; await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("存储关闭写连接后仍能核实未提交的创建", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-closed-writer-"));
+  const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let writer: DatabaseSync | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") { writer = this; exec.call(this, sql); throw new Error("begin receipt lost"); }
+    if (this === writer && sql === "ROLLBACK" && fail) throw new Error("rollback fault");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this === writer && fail) throw new Error("close fault"); return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.flush()); await assert.rejects(handle.close());
+    assert.equal(await verify(), "unknown");
+    fail = false; await store.close();
+    assert.equal(await verify(), "failed");
+  } finally { fail = false; if (writer?.isOpen) close.call(writer); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("活跃句柄的旧核实不会中断重试中的初始事务", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-retry-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare;
+  let begins = 0; let verification: Promise<"committed" | "failed" | "unknown"> | undefined;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && ++begins === 1) throw new Error("首次失败");
+    const result = exec.call(this, sql);
+    if (sql === "BEGIN IMMEDIATE" && begins === 2) verification = verify();
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === "INSERT INTO mh_events VALUES (?, ?, ?)" && begins === 2) throw new Error("事件写入失败");
+    return prepare.call(this, sql);
+  });
+  try {
+    await assert.rejects(handle.append([event(0)]));
+    await assert.rejects(handle.append([event(0)]));
+    assert.equal(await verification, "unknown");
+    assert.equal(await store.stat(header.sessionId), undefined);
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal(db.prepare("SELECT COUNT(*) AS count FROM mh_events").get()?.count, 0); } finally { db.close(); }
+  } finally { t.mock.restoreAll(); await handle.close().catch(() => {}); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("活跃句柄的核实可确认已提交的同身份头", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-live-")); const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await store.create(header); const verify = handle.creationVerifier!(); await handle.flush();
+  assert.equal(await verify(), "committed");
+});
+
+test("旧创建标记不会使核实清理后续目录迁移事务", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-migration-")); const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; let writer: DatabaseSync | undefined; let failBegin = true; let failMigration = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && failBegin) { failBegin = false; writer = this; exec.call(this, sql); throw new Error("BEGIN 回执丢失"); }
+    if (sql.startsWith("BEGIN IMMEDIATE;\n        CREATE TABLE") && failMigration) { exec.call(this, "BEGIN IMMEDIATE"); throw new Error("迁移失败"); }
+    if (this === writer && sql === "ROLLBACK" && failMigration && !failBegin && this.isTransaction && migrationStarted) throw new Error("迁移回滚失败");
+    return exec.call(this, sql);
+  });
+  let migrationStarted = false;
+  try {
+    await assert.rejects(handle.flush()); await handle.close();
+    migrationStarted = true; assert.throws(() => store.upgradeDirectoryMetadata());
+    assert.equal(await verify(), "failed");
+    assert.equal(writer?.isOpen, true); assert.equal(writer?.isTransaction, true);
+  } finally { failMigration = false; if (writer?.isOpen && writer.isTransaction) exec.call(writer, "ROLLBACK"); t.mock.restoreAll(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const afterClose of [false, true]) test(`关闭写连接${afterClose ? "后" : "前"}报错时核实事务`, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-close-")); const store = new SqliteSessionPersistence(join(dir, "db.sqlite"));
+  const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close; let writer: DatabaseSync | undefined; let fault = true; let closes = 0;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") writer = this;
+    if (this === writer && fault && (sql === "COMMIT" || sql === "ROLLBACK")) throw new Error("事务故障");
+    return exec.call(this, sql);
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    if (this === writer && fault) { if (afterClose && ++closes > 1) close.call(this); throw new Error("关闭故障"); }
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(handle.flush()); await assert.rejects(handle.close());
+    assert.equal(await verify(), afterClose ? "failed" : "unknown");
+    fault = false; assert.equal(await verify(), "failed");
+  } finally { fault = false; t.mock.restoreAll(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("关闭中的公开事务确认等待写入与关闭结束", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-confirm-close-order-")); const path = join(dir, "db.sqlite");
+  const store = new SqliteSessionPersistence(path); const handle = await store.create(header); const verify = handle.creationVerifier!();
+  const exec = DatabaseSync.prototype.exec; const prepare = DatabaseSync.prototype.prepare;
+  let activeDuringWrite = false; let closing: Promise<void> | undefined; let confirmation: Promise<boolean> | undefined; let verification: Promise<"committed" | "failed" | "unknown"> | undefined;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = exec.call(this, sql);
+    if (sql === "BEGIN IMMEDIATE") {
+      closing = handle.close(); confirmation = handle.confirmCreationEnded!(); verification = verify();
+      activeDuringWrite = this.isTransaction;
+    }
+    return result;
+  });
+  t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === "INSERT INTO mh_events VALUES (?, ?, ?)") throw new Error("事件写入失败");
+    return prepare.call(this, sql);
+  });
+  try {
+    await assert.rejects(handle.append([event(0)])); await closing;
+    assert.equal(activeDuringWrite, true); assert.equal(await confirmation, true); assert.equal(await verification, "failed");
+    assert.equal(await store.stat(header.sessionId), undefined);
+  } finally { t.mock.restoreAll(); await store.close(); await rm(dir, { recursive: true, force: true }); }
+});

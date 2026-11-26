@@ -12,6 +12,14 @@ export interface SessionPersistenceCreateOptions {
   readonly signal?: AbortSignal;
 }
 
+/** 创建准备失败但写入权尚待释放，调用方须保留核实函数直至得到终态。 */
+export class SessionCreationCleanupError extends Error {
+  /** @param cause - 创建准备阶段的原始错误。 @param verify - 锁释放后返回 failed，未确认释放时返回 unknown。 */
+  constructor(cause: unknown, readonly verify: () => Promise<"failed" | "unknown">) {
+    super("会话创建准备失败，写入权清理待确认", { cause });
+  }
+}
+
 /** 一次查询中已提交的会话元数据，不包含尚在准备的 header。 */
 export interface SessionPersistenceSnapshot {
   readonly header: SessionHeader;
@@ -19,6 +27,16 @@ export interface SessionPersistenceSnapshot {
   readonly inheritedEventCount: number;
   /** 已提交事件总数，包含继承事件和 seed 标记。 */
   readonly eventCount: number;
+  /** 对应已提交前缀的目录检查点；缺失或无效时不可用于恢复摘要。 */
+  readonly listMetadata?: SessionListMetadata;
+}
+
+/** 绑定会话及其已提交事件前缀的目录检查点。 */
+export interface SessionListMetadata {
+  readonly blank: boolean;
+  readonly lastPromptAt: number | null;
+  readonly eventCount: number;
+  readonly inheritedEventCount: number;
 }
 
 /** 绑定单个会话的持久化访问；持有者负责关闭句柄。 */
@@ -27,6 +45,19 @@ export interface SessionHandle {
   readonly header: SessionHeader;
   readonly access: SessionAccess;
   readonly inheritedEventCount: number;
+
+  /**
+   * 核实本句柄首次创建的原写事务已经终止，并在仍属本次尝试时重试清理。
+   * 关闭开始前返回 false；关闭开始后等待关闭结束再核实。关闭后仍可调用，无法确认时返回 false，不影响后续事务。
+   * @returns 原事务确定结束时为 true。
+   */
+  confirmCreationEnded?(): Promise<boolean>;
+
+  /**
+   * 取得首次创建的独立核实能力；关闭句柄或存储后仍可调用。
+   * @returns 返回异步核实函数：只有身份匹配才为 committed，原事务结束且写入权释放才为 failed，无法确认时为 unknown。
+   */
+  creationVerifier?(): () => Promise<"committed" | "failed" | "unknown">;
 
   /**
    * 读取同一截点的已提交前缀，不排空待写缓冲。
@@ -58,8 +89,8 @@ export interface SessionHandle {
 
   /**
    * 关闭句柄并释放其资源；已发布的写句柄先处理待写事件，准备中的句柄只释放资源和写入权。
-   * 关闭不可取消且幂等；处理失败仍释放写入权并报告错误，关闭后其他操作均拒绝。
-   * @returns 资源和写入权释放后兑现。
+   * 关闭不可取消且幂等；处理失败时仍尝试释放写入权并报告错误，关闭后其他操作均拒绝。
+   * @returns 资源和写入权释放后兑现；释放失败时拒绝。
    */
   close(): Promise<void>;
 }
@@ -71,7 +102,7 @@ export abstract class SessionPersistence {
    * @param header - 新会话元数据。
    * @param options - 继承数与取得写句柄期间的取消信号。
    * @returns 由调用方负责关闭的写句柄。
-   * @throws 标识无效、所有权冲突或取得句柄被取消时拒绝；冲突须可与其他错误区分。
+   * @throws 标识无效、所有权冲突或取得句柄被取消时拒绝；冲突须可与其他错误区分。准备失败且释放未确认时以 SessionCreationCleanupError 提供核实能力。
    */
   abstract create(header: SessionHeader, options?: SessionPersistenceCreateOptions): Promise<SessionHandle>;
 

@@ -1,3 +1,4 @@
+import { SessionDirectory } from "./directory.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -136,7 +137,7 @@ for (const mode of ["uncommitted", "committed"] as const) test(`SQLite 修剪待
   const agent = new ReActAgent(session, driver, handle);
   const agents = { get: () => agent, onLoaded: () => () => {} };
   const app = Fastify();
-  registerSessionRoutes(app, "/sessions", observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents);
+  registerSessionRoutes(app, "/sessions", observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents, () => new SessionDirectory());
   const signal = new AbortController();
   const stream = followSession(agents, async () => undefined, "sql", signal.signal);
   assert.match((await stream.next()).value ?? "", /"cursor":1/);

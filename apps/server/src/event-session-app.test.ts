@@ -347,3 +347,73 @@ test("不同端口的独立进程不能抢占在线库，持有者退出后可�
     }
   }
 });
+
+test("生产关闭先失效在途创建核实再关闭 Agent", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-production-close-"));
+  let app: Awaited<ReturnType<typeof createEventSessionApp>> | undefined;
+  let entered!: () => void;
+  let release!: () => void;
+  const reached = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  t.after(async () => {
+    release();
+    try { await app?.close(); }
+    finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  let checks = 0;
+  const originalCreate = SqliteSessionPersistence.prototype.create;
+  t.mock.method(SqliteSessionPersistence.prototype, "create", async function (this: SqliteSessionPersistence, ...args: Parameters<typeof originalCreate>) {
+    const handle = await originalCreate.apply(this, args);
+    t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+    handle.creationVerifier = () => async () => {
+      checks++;
+      if (checks === 1) return "unknown";
+      entered();
+      await gate;
+      return "failed";
+    };
+    return handle;
+  });
+  const { SessionCommandController } = await import("./commands.ts");
+  const originalController = SessionCommandController.prototype.creationController;
+  let controller: ReturnType<typeof originalController> | undefined;
+  let creationStopped = false;
+  let stoppedAtFirstAgentClose: boolean | undefined;
+  let snapshot: (() => ReturnType<ReturnType<Parameters<typeof originalController>[1]>["snapshot"]>) | undefined;
+  t.mock.method(SessionCommandController.prototype, "creationController", function (this: InstanceType<typeof SessionCommandController>, persistence: Parameters<typeof originalController>[0], directory: Parameters<typeof originalController>[1]) {
+    const current = originalController.call(this, persistence, directory);
+    if (!controller) {
+      const close = current.close.bind(current);
+      t.mock.method(current, "close", () => { close(); creationStopped = true; });
+    }
+    controller = current;
+    snapshot = () => directory().snapshot();
+    return controller;
+  });
+  const originalClose = AgentManager.prototype.close;
+  t.mock.method(AgentManager.prototype, "close", async function (this: AgentManager) {
+    stoppedAtFirstAgentClose ??= creationStopped;
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    return originalClose.call(this);
+  });
+  app = await createEventSessionApp(join(dir, "events.sqlite"));
+  await app.ready();
+  const response = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  assert.equal(response.statusCode, 503);
+  const { sessionId } = response.json();
+  await reached;
+  assert.ok(snapshot);
+  const before = snapshot();
+  assert.ok(controller);
+  const attempt = controller;
+  const original = await attempt.create({ sessionId, createdAt: before.sessions[0]!.createdAt });
+  assert.equal(original.status, "unknown");
+  await app.close();
+  assert.equal(stoppedAtFirstAgentClose, true, "关停 Agent 前必须先停止创建核实");
+  assert.deepEqual(snapshot(), before);
+  assert.equal((await attempt.create({ sessionId, createdAt: before.sessions[0]!.createdAt })).status, "unknown");
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(checks, 2);
+});

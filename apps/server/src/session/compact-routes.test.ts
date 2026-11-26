@@ -1,3 +1,4 @@
+import { SessionDirectory } from "./directory.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import Fastify from "fastify";
@@ -21,7 +22,7 @@ test("压缩路由等待终态，解析错误和内部错误使用安全响应",
   registerSessionRoutes(app, "/api/sessions", persistence, {
     prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
     compact: async () => { calls++; return { compactionId, commandId: "cmd", status: "succeeded" }; },
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     const response = await app.inject({ method: "POST", url: "/api/sessions/s/compact", payload: { compactionId } });
     assert.equal(response.statusCode, 200);
@@ -55,7 +56,7 @@ test("压缩路由映射明确拒绝并脱敏异常和无效结果", async () =>
       if (sessionId === "json") throw Object.assign(new Error("private-compact-secret"), { code: "FST_ERR_CTP_INVALID_JSON_BODY" });
       return { compactionId: "c78a67b6-0f09-47da-bcdd-e794cd0f4f0f", commandId: "cmd", status: "succeeded" };
     },
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     for (const [id, status, code] of [["conflict", 409, "compaction_id_conflict"], ["missing", 404, "session/not-found"], ["blocked", 503, "storage_blocked"], ["secret", 500, "compaction_internal_error"], ["wrong", 500, "compaction_internal_error"], ["parser", 500, "compaction_internal_error"], ["json", 500, "compaction_internal_error"]] as const) {
       const response = await app.inject({ method: "POST", url: `/api/sessions/${id}/compact`, payload: { compactionId } });
@@ -89,7 +90,7 @@ test("压缩路由等待处理器完成", async () => {
       entered?.(); await gate;
       return { compactionId, commandId: "cmd", status: "cancelled" };
     },
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     let completed = false;
     const response = Promise.resolve(app.inject({ method: "POST", url: "/api/sessions/s/compact", payload: { compactionId } })).then((value) => { completed = true; return value; });
@@ -137,7 +138,7 @@ test("替身明确拒绝重复标识，不复用先前成功结果", async () =>
       seen.add(request.compactionId);
       return { compactionId: request.compactionId, commandId: "cmd", status: "succeeded" };
     },
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     const post = () => app.inject({ method: "POST", url: "/api/sessions/s/compact", payload: { compactionId } });
     assert.deepEqual((await post()).json(), { compactionId, commandId: "cmd", status: "succeeded" });
@@ -154,7 +155,7 @@ for (const type of ["application/json;", "application/json; ; charset=utf-8", "a
   registerSessionRoutes(app, "/api/sessions", persistence, {
     prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
     compact: async () => ({ compactionId, commandId: "cmd", status: "succeeded" }),
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     const response = await app.inject({ method: "POST", url: "/api/sessions/s/compact", headers: { "content-type": type }, payload: JSON.stringify({ compactionId }) });
     assert.equal(response.statusCode, 200);
@@ -174,7 +175,7 @@ test("压缩入口拒绝媒体类型与无效正文且不调用命令", async ()
   registerSessionRoutes(app, "/api/sessions", persistence, {
     prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
     compact: async () => { calls++; return { compactionId, commandId: "cmd", status: "succeeded" }; },
-  }, manager);
+  }, manager, () => new SessionDirectory());
   const abort = new AbortController();
   const follow = followSession(manager, () => readPersistedSessionHistory(persistence, "s"), "s", abort.signal);
   try {

@@ -19,6 +19,11 @@ export const cancelTurnParamsSchema = sessionParamsSchema.extend({ turnId: z.str
 /** 创建成功仅表示空会话已持久化。 */
 export const createSessionResponseSchema = sessionParamsSchema;
 
+/** 创建结果待核实，可使用已有会话读取入口核对同一个 ID。 */
+export const sessionCreationPendingSchema = sessionParamsSchema.extend({
+  code: z.literal("session_creation_unknown"),
+});
+
 /** 提交成功表示用户消息和初始 Turn 已持久化，回复尚未完成。 */
 export const submitMessageResponseSchema = sessionParamsSchema.extend({ turnId: z.string().min(1) });
 

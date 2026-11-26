@@ -13,8 +13,15 @@ export class OwnershipConflictError extends Error {
 
 /** 持有操作系统锁的资源；调用方必须在使用结束后释放。 */
 export interface Ownership {
-  /** 释放锁；重复调用不会重新释放。 */
+  /** 释放锁；关闭失败时可重试，成功后重复调用无操作。 */
   release(): Promise<void>;
+}
+
+/** 锁已取得但关闭未确认，持有者必须继续尝试释放。 */
+export class OwnershipAcquisitionCleanupError extends Error {
+  constructor(cause: unknown, readonly ownership: Ownership) {
+    super("取得写入权失败，锁清理待确认", { cause });
+  }
 }
 
 async function canonicalDatabasePath(path: string): Promise<string> {
@@ -39,28 +46,33 @@ async function acquire(path: string, scope: "instance" | "session", sessionId?: 
   await mkdir(lockDir, { recursive: true });
   const name = scope === "instance" ? "instance.sqlite" : `session-${createHash("sha256").update(sessionId ?? "").digest("hex")}.sqlite`;
   const db = new DatabaseSync(join(lockDir, name));
+  let released = false;
+  const ownership: Ownership = { async release() {
+    if (released) return;
+    try { db.close(); } catch (error) { if (db.isOpen) throw error; }
+    released = true;
+  } };
   try {
     db.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
   } catch (error) {
-    db.close();
+    const acquired = db.isTransaction;
+    try { await ownership.release(); } catch (closeError) {
+      if (acquired) throw new OwnershipAcquisitionCleanupError(error, ownership);
+      throw closeError;
+    }
     if (error instanceof Error && "errcode" in error && error.errcode === 5) {
       throw new OwnershipConflictError(scope, sessionId);
     }
     throw error;
   }
-  let released = false;
-  return { async release() {
-    if (released) return;
-    released = true;
-    db.close();
-  } };
+  return ownership;
 }
 
 /**
  * 按数据库规范路径取得跨进程实例锁；目录须已存在，锁文件保留供后续进程复用。
  * @param databasePath - 数据库文件路径，支持相对路径及已存在父目录的链接别名。
  * @returns 调用方须持有至存储关闭并负责释放的锁。
- * @throws 所有权冲突时以 OwnershipConflictError 拒绝，路径或数据库错误原样报告。
+ * @throws 所有权冲突时以 OwnershipConflictError 拒绝，路径或数据库错误原样报告；取得锁后关闭未确认时抛出携带清理责任的 OwnershipAcquisitionCleanupError。
  */
 export function acquireInstanceOwnership(databasePath: string): Promise<Ownership> {
   return acquire(databasePath, "instance");
@@ -71,7 +83,7 @@ export function acquireInstanceOwnership(databasePath: string): Promise<Ownershi
  * @param databasePath - 数据库文件路径。
  * @param sessionId - 会话标识，锁文件使用其 SHA-256 摘要。
  * @returns 调用方须在写句柄关闭时释放的锁。
- * @throws 同一会话已被持有时以 OwnershipConflictError 拒绝。
+ * @throws 同一会话已被持有时以 OwnershipConflictError 拒绝；取得锁后关闭未确认时抛出携带清理责任的 OwnershipAcquisitionCleanupError。
  */
 export function acquireSessionOwnership(databasePath: string, sessionId: string): Promise<Ownership> {
   return acquire(databasePath, "session", sessionId);

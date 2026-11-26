@@ -10,16 +10,19 @@ import {
   promptRequestSchema,
   promptResponseSchema,
   rawSessionHistorySchema,
+  sessionCreationPendingSchema,
   sessionParamsSchema,
+  sessionDirectorySnapshotSchema,
 } from "@mharness/session/contracts";
-import { createPersistedSession, readPersistedSessionHistory, type SessionPersistence } from "@mharness/session/server";
+import { readPersistedSessionHistory, type SessionPersistence } from "@mharness/session/server";
 import type { FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import type { AgentManager } from "../agent/manager.ts";
 import { AgentError } from "../agent/react-agent.ts";
-import type { SessionCommandController } from "../commands.ts";
+import { SessionCreationController, type SessionCommandController } from "../commands.ts";
 import { followSession } from "./follow.ts";
+import { SessionDirectory } from "./directory.ts";
 
 const jsonMediaType = /^[\t ]*application\/json[\t ]*(?:;[\t ]*(?:[!#$%&'*+.^_`|~\w-]+=(?:[!#$%&'*+.^_`|~\w-]+|"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t -~\x80-\xff])*")[\t ]*)?)*$/i;
 
@@ -36,17 +39,23 @@ export interface CompactCommands {
  * @param persistence - 在线存储，创建提交及历史读取在此完成。
  * @param commands - 接收已校验的提交和取消命令；未提供压缩处理器时返回不可用。
  * @param agents - 供 follow 观察已加载 Agent，订阅不触发加载。
+ * @param directoryProvider - 提供当前实例的目录投影，必须在装配时提供。
  */
 export function registerSessionRoutes(
   app: FastifyInstance,
   path: string,
   persistence: SessionPersistence,
-  commands: Pick<SessionCommandController, "prompt" | "cancel"> & CompactCommands,
+  commands: Pick<SessionCommandController, "prompt" | "cancel"> & Partial<Pick<SessionCommandController, "creationController">> & CompactCommands,
   agents: Pick<AgentManager, "get" | "onLoaded">,
+  directoryProvider: () => SessionDirectory,
 ): void {
+  if (!directoryProvider) throw new Error("缺少目录查询依赖");
+  const getDirectory = directoryProvider;
   const single = `${path}/:sessionId`;
   const connections = new Set<() => void>();
+  const creations = commands.creationController?.(persistence, getDirectory) ?? new SessionCreationController(persistence, getDirectory);
   app.addHook("preClose", async () => {
+    creations.close();
     for (const close of connections) close();
   });
 
@@ -55,9 +64,23 @@ export function registerSessionRoutes(
       return reply.code(400).send({ code: "invalid_request" });
     }
     const sessionId = randomUUID();
-    await createPersistedSession(persistence, { sessionId, createdAt: Date.now() });
+    const header = { sessionId, createdAt: Date.now() };
+    const result = await creations.create(header, (error) => {
+      request.log.error({ err: error, sessionId }, "关闭新会话句柄失败");
+    });
+    if (result.status === "unknown") {
+      request.log.error({ err: result.error, sessionId }, "无法确认新会话是否已提交");
+      return reply.code(503).send(sessionCreationPendingSchema.parse({ code: "session_creation_unknown", sessionId }));
+    }
+    if (result.status === "failed") {
+      request.log.error({ err: result.error, sessionId }, "创建会话失败");
+      return reply.code(500).send({ code: "session_creation_failed" });
+    }
+    if (result.status === "conflict") return reply.code(409).send({ code: "session_creation_conflict" });
     return reply.code(201).send(createSessionResponseSchema.parse({ sessionId }));
   });
+
+  app.get(path, async () => sessionDirectorySnapshotSchema.parse(await getDirectory().query(persistence, (id) => agents.get(id))));
 
   app.post(`${single}/messages`, async (request, reply) => {
     const params = sessionParamsSchema.safeParse(request.params);
@@ -130,7 +153,9 @@ export function registerSessionRoutes(
     const params = sessionParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send({ code: "invalid_request" });
     const history = await readPersistedSessionHistory(persistence, params.data.sessionId);
-    if (!history) return reply.code(404).send({ code: "session_not_found" });
+    if (!history) {
+      return reply.code(404).send({ code: "session_not_found" });
+    }
     return rawSessionHistorySchema.parse(history);
   });
 

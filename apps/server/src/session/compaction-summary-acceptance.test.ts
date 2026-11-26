@@ -1,3 +1,4 @@
+import { SessionDirectory } from "./directory.ts";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -166,7 +167,7 @@ for (const kind of ["manual", "turn"] as const) test(`SQLite 摘要身份与用�
   const controller = new AbortController();
   const reconnectController = new AbortController();
   const app = Fastify();
-  registerSessionRoutes(app, "/api/sessions", f.observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, { get: () => f.agent, onLoaded: () => () => {} });
+  registerSessionRoutes(app, "/api/sessions", f.observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, { get: () => f.agent, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     if (kind === "manual") {
       f.session.append({ type: "command/run", data: { commandId: "command-fixed", name: "compact", source: { kind: "user" } } });
@@ -243,7 +244,7 @@ for (const mode of ["成功", "回滚", "提交结果未知"] as const) test(`SQ
   const reconnectController = new AbortController();
   const app = Fastify();
   const agents = { get: () => f.agent, onLoaded: () => () => {} };
-  registerSessionRoutes(app, "/api/sessions", f.observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents);
+  registerSessionRoutes(app, "/api/sessions", f.observer, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents, () => new SessionDirectory());
   const entered = deferred(); const release = deferred();
   let captured: ModelInput | undefined;
   const runtime = new LlmRuntime({ mock: { async *generate(input) {

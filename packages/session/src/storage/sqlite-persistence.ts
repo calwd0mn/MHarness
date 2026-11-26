@@ -3,11 +3,11 @@ import { lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { snapshotSessionEvent, type SessionEvent } from "../events.ts";
-import { SessionPersistence, type SessionAccess, type SessionHandle, type SessionPersistenceCreateOptions, type SessionPersistenceSnapshot } from "../persistence.ts";
+import { SessionCreationCleanupError, SessionPersistence, type SessionAccess, type SessionHandle, type SessionPersistenceCreateOptions, type SessionPersistenceSnapshot } from "../persistence.ts";
 import { isValidSessionId } from "../session-id.ts";
 import type { Session, SessionHeader, StagedPersistenceResult } from "../session.ts";
 import { SessionWriter } from "../writer.ts";
-import { acquireSessionOwnership, type Ownership } from "./ownership.ts";
+import { acquireSessionOwnership, OwnershipAcquisitionCleanupError, type Ownership } from "./ownership.ts";
 
 type Row = Record<string, unknown>;
 type Pending = { events: readonly SessionEvent[]; start: number; first: boolean; fromWriter?: boolean; staged?: boolean; preflightFailed?: boolean };
@@ -16,9 +16,13 @@ class StagedPrefixError extends Error {}
 interface HandleStorage {
   readonly db: DatabaseSync;
   readonly reader: DatabaseSync;
-  beginWrite(owner: SqliteHandle): void;
+  beginWrite(owner: SqliteHandle, transaction: object): void;
   rollbackWrite(owner: SqliteHandle): void;
+  clearEndedTransaction(): void;
   abortWriteConnection(owner: SqliteHandle): void;
+  confirmCreationEnded(owner: SqliteHandle, transaction: object | undefined): boolean;
+  readFresh(id: string): SessionPersistenceSnapshot | undefined;
+  release(ownership: Ownership): Promise<void>;
   forget(handle: SqliteHandle): void;
 }
 
@@ -58,7 +62,14 @@ function metadata(row: Row): SessionPersistenceSnapshot {
     (header.isSeeded === true ? row.inherited_count >= row.event_count : row.inherited_count !== 0)) {
     throw new Error("会话元数据无效");
   }
-  return { header, inheritedEventCount: row.inherited_count, eventCount: row.event_count };
+  const result: SessionPersistenceSnapshot = { header, inheritedEventCount: row.inherited_count, eventCount: row.event_count };
+  if ((row.blank === 0 || row.blank === 1) && (row.last_prompt_at === null || position(row.last_prompt_at)) &&
+      (row.event_count !== 0 || row.last_prompt_at === null) &&
+      position(row.checkpoint_event_count) && position(row.checkpoint_inherited_count)) {
+    return { ...result, listMetadata: { blank: row.blank === 1, lastPromptAt: row.last_prompt_at,
+      eventCount: row.checkpoint_event_count, inheritedEventCount: row.checkpoint_inherited_count } };
+  }
+  return result;
 }
 
 function verifySchema(db: DatabaseSync): void {
@@ -70,6 +81,11 @@ function verifySchema(db: DatabaseSync): void {
   ] as const) {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => `${row.name}:${row.type}:${row.pk}`);
     if (!isDeepStrictEqual(columns, expected)) throw new Error("数据库格式无效");
+  }
+  if (db.prepare("PRAGMA user_version").get()?.user_version === 2) {
+    const table = db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'mh_session_list_metadata' AND type = 'table'").get();
+    const columns = db.prepare("PRAGMA table_info(mh_session_list_metadata)").all().map((row) => `${row.name}:${row.type}:${row.pk}`);
+    if (table?.strict !== 1 || !isDeepStrictEqual(columns, ["session_id:TEXT:1", "blank:INTEGER:0", "last_prompt_at:INTEGER:0", "event_count:INTEGER:0", "inherited_count:INTEGER:0"])) throw new Error("数据库格式无效");
   }
 }
 
@@ -88,10 +104,14 @@ export class SqliteSessionPersistence extends SessionPersistence {
   readonly #reader: DatabaseSync;
   readonly #handleStorage: HandleStorage;
   readonly #handles = new Set<SqliteHandle>();
+  readonly #cleanup = new Map<Ownership, ReturnType<typeof setTimeout> | undefined>();
+  readonly #releasing = new Map<Ownership, Promise<void>>();
+  readonly #acquiring = new Set<Promise<Ownership>>();
   readonly #readOnly: boolean;
   #closing?: Promise<void>;
   #writeClosed = false;
   #transactionOwner?: SqliteHandle;
+  #transaction?: object;
 
   /**
    * 打开或初始化新版库；已有旧格式及未知版本均拒绝打开。
@@ -108,7 +128,7 @@ export class SqliteSessionPersistence extends SessionPersistence {
     if (existed) {
       const probe = new DatabaseSync(this.#path, { readOnly: true });
       try {
-        if (probe.prepare("PRAGMA user_version").get()?.user_version !== 1) throw new Error("不支持的数据库格式或版本");
+        if (![1, 2].includes(Number(probe.prepare("PRAGMA user_version").get()?.user_version))) throw new Error("不支持的数据库格式或版本");
         verifySchema(probe);
       } finally { probe.close(); }
     }
@@ -122,17 +142,31 @@ export class SqliteSessionPersistence extends SessionPersistence {
           CREATE TABLE mh_events (session_id TEXT NOT NULL REFERENCES mh_sessions(session_id), seq INTEGER NOT NULL CHECK(seq >= 0), event_json TEXT NOT NULL, PRIMARY KEY(session_id, seq)) STRICT;
           PRAGMA user_version = 1;
           COMMIT;`);
-      } else if (version !== 1) throw new Error("不支持的数据库格式或版本");
+      } else if (version !== 1 && version !== 2) throw new Error("不支持的数据库格式或版本");
       verifySchema(this.#db);
       this.#reader = new DatabaseSync(this.#path, { readOnly: true, timeout: 5000 });
     } catch (error) { this.#db.close(); throw error; }
     this.#handleStorage = {
       db: this.#db,
       reader: this.#reader,
-      beginWrite: (owner) => this.#beginWrite(owner),
+      beginWrite: (owner, transaction) => this.#beginWrite(owner, transaction),
       rollbackWrite: (owner) => this.#rollbackWrite(owner),
+      clearEndedTransaction: () => this.#clearEndedTransaction(),
       abortWriteConnection: (owner) => this.#abortWriteConnection(owner),
+      confirmCreationEnded: (owner, transaction) => {
+        if (!transaction || this.#transaction !== transaction || this.#transactionOwner !== owner || this.#writeClosed || !this.#db.isTransaction) return true;
+        try { this.#rollbackWrite(owner); } catch { try { this.#abortWriteConnection(owner); } catch { if (!this.#writeClosed) return false; } }
+        return this.#writeClosed || !this.#db.isTransaction || this.#transactionOwner !== owner;
+      },
+      readFresh: (id) => {
+        const reader = new DatabaseSync(this.#path, { readOnly: true, timeout: 5000 });
+        try {
+          const row = reader.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(id);
+          return row ? metadata(row) : undefined;
+        } finally { reader.close(); }
+      },
       forget: (handle) => this.#handles.delete(handle),
+      release: (ownership) => this.#release(ownership),
     };
   }
 
@@ -142,13 +176,29 @@ export class SqliteSessionPersistence extends SessionPersistence {
     const inherited = options.inheritedEventCount ?? 0;
     if (!position(inherited) || (checked.isSeeded !== true && inherited !== 0)) throw new Error("继承数量无效");
     options.signal?.throwIfAborted();
-    const ownership = await acquireSessionOwnership(this.#path, checked.sessionId);
+    let ownership: Ownership;
+    try { ownership = await this.#acquire(checked.sessionId); }
+    catch (error) {
+      if (error instanceof OwnershipAcquisitionCleanupError) {
+        throw new SessionCreationCleanupError(error, async () => {
+          try { await this.#release(error.ownership); return "failed"; } catch { return "unknown"; }
+        });
+      }
+      throw error;
+    }
     try {
       options.signal?.throwIfAborted();
       this.#assertOpen();
       if (this.#stat(checked.sessionId)) throw new Error("会话已存在");
       return this.#track(new SqliteHandle(this.#handleStorage, checked, "write", inherited, ownership, false));
-    } catch (error) { await ownership.release(); throw error; }
+    } catch (error) {
+      try { await this.#release(ownership); } catch {
+        throw new SessionCreationCleanupError(error, async () => {
+          try { await this.#release(ownership); return "failed"; } catch { return "unknown"; }
+        });
+      }
+      throw error;
+    }
   }
 
   async open(sessionId: string, access: SessionAccess): Promise<SessionHandle | undefined> {
@@ -158,13 +208,13 @@ export class SqliteSessionPersistence extends SessionPersistence {
     }
     if (access === "write") this.#writable();
     if (!this.#stat(sessionId)) return undefined;
-    const ownership = access === "write" ? await acquireSessionOwnership(this.#path, sessionId) : undefined;
+    const ownership = access === "write" ? await this.#acquire(sessionId) : undefined;
     try {
       this.#assertOpen();
       const info = this.#stat(sessionId);
-      if (!info) { await ownership?.release(); return undefined; }
+      if (!info) { if (ownership) await this.#release(ownership); return undefined; }
       return this.#track(new SqliteHandle(this.#handleStorage, info.header, access, info.inheritedEventCount, ownership, true));
-    } catch (error) { await ownership?.release(); throw error; }
+    } catch (error) { if (ownership) await this.#release(ownership); throw error; }
   }
 
   async stat(sessionId: string): Promise<SessionPersistenceSnapshot | undefined> {
@@ -174,7 +224,31 @@ export class SqliteSessionPersistence extends SessionPersistence {
   }
   async list(): Promise<readonly SessionPersistenceSnapshot[]> {
     this.#assertOpen();
-    return this.#reader.prepare("SELECT * FROM mh_sessions ORDER BY session_id").all().map(metadata);
+    const version = this.#reader.prepare("PRAGMA user_version").get()?.user_version;
+    return this.#reader.prepare(version === 2
+      ? `SELECT s.*,
+          CASE WHEN c.blank BETWEEN 0 AND 9007199254740991 THEN c.blank END AS blank,
+          CASE WHEN c.last_prompt_at BETWEEN 0 AND 9007199254740991 THEN c.last_prompt_at WHEN c.last_prompt_at IS NULL THEN NULL ELSE -1 END AS last_prompt_at,
+          CASE WHEN c.event_count BETWEEN 0 AND 9007199254740991 THEN c.event_count END AS checkpoint_event_count,
+          CASE WHEN c.inherited_count BETWEEN 0 AND 9007199254740991 THEN c.inherited_count END AS checkpoint_inherited_count
+        FROM mh_sessions s LEFT JOIN mh_session_list_metadata c USING(session_id) ORDER BY s.session_id`
+      : "SELECT * FROM mh_sessions ORDER BY session_id").all().map(metadata);
+  }
+
+  /**
+   * 显式升级目录检查点结构；调用方须先独占实例，旧事件不会被扫描。
+   * @throws 只读、存储关闭或升级事务失败时抛出。
+   */
+  upgradeDirectoryMetadata(): void {
+    this.#writable();
+    if (this.#db.prepare("PRAGMA user_version").get()?.user_version === 2) return;
+    this.#clearEndedTransaction();
+    try {
+      this.#db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE mh_session_list_metadata (session_id TEXT PRIMARY KEY NOT NULL REFERENCES mh_sessions(session_id), blank INTEGER NOT NULL, last_prompt_at INTEGER, event_count INTEGER NOT NULL, inherited_count INTEGER NOT NULL) STRICT;
+        PRAGMA user_version = 2;
+        COMMIT;`);
+    } catch (error) { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); throw error; }
   }
 
   /**
@@ -208,7 +282,7 @@ export class SqliteSessionPersistence extends SessionPersistence {
   }
 
   /**
-   * 关闭各句柄并释放连接。任一关闭失败时仍处理其余资源，重复调用共享关闭结果。
+   * 关闭各句柄并释放连接，停止写入权清理重试并尝试释放余留锁。任一关闭失败时仍处理其余资源，重复调用共享关闭结果。
    * @returns 所有资源处理完毕后兑现。
    * @throws 排空或关闭失败时以 AggregateError 汇总。
    */
@@ -219,36 +293,90 @@ export class SqliteSessionPersistence extends SessionPersistence {
 
   async #closeHandles(): Promise<void> {
     const errors: unknown[] = [];
+    await Promise.allSettled(this.#acquiring);
     for (const handle of [...this.#handles]) { try { await handle.close(); } catch (error) { errors.push(error); } }
+    for (const [ownership, timer] of this.#cleanup) {
+      if (timer) clearTimeout(timer);
+      const inFlight = this.#releasing.get(ownership);
+      if (inFlight) { try { await inFlight; } catch { /* 扫尾须在在途释放结束后独立重试。 */ } }
+      if (this.#cleanup.has(ownership)) {
+        try { await this.#release(ownership); } catch (error) { errors.push(error); }
+      }
+    }
     for (const connection of this.#writeClosed ? [this.#reader] : [this.#reader, this.#db]) {
       try { connection.close(); } catch (error) { errors.push(error); }
+      finally { if (connection === this.#db && !connection.isOpen) { this.#writeClosed = true; this.#clearEndedTransaction(); } }
     }
     if (errors.length) throw new AggregateError(errors, "关闭存储失败");
   }
 
   #assertOpen(): void { if (this.#closing) throw new Error("存储已关闭"); }
+  #acquire(sessionId: string): Promise<Ownership> {
+    const acquiring = acquireSessionOwnership(this.#path, sessionId).then((ownership) => {
+      this.#cleanup.set(ownership, undefined);
+      return ownership;
+    }, (error: unknown) => {
+      if (error instanceof OwnershipAcquisitionCleanupError) this.#scheduleCleanup(error.ownership);
+      throw error;
+    });
+    this.#acquiring.add(acquiring);
+    void acquiring.finally(() => this.#acquiring.delete(acquiring)).catch(() => {});
+    return acquiring;
+  }
+  #release(ownership: Ownership): Promise<void> {
+    const existing = this.#releasing.get(ownership);
+    if (existing) return existing;
+    const releasing = this.#performRelease(ownership);
+    this.#releasing.set(ownership, releasing);
+    void releasing.finally(() => this.#releasing.delete(ownership)).catch(() => {});
+    return releasing;
+  }
+  async #performRelease(ownership: Ownership): Promise<void> {
+    const timer = this.#cleanup.get(ownership);
+    if (timer) clearTimeout(timer);
+    this.#cleanup.set(ownership, undefined);
+    try {
+      await ownership.release();
+      this.#cleanup.delete(ownership);
+    } catch (error) {
+      this.#scheduleCleanup(ownership);
+      throw error;
+    }
+  }
+  #scheduleCleanup(ownership: Ownership): void {
+    if (this.#closing) { this.#cleanup.set(ownership, undefined); return; }
+    const retry = setTimeout(() => { void this.#release(ownership).catch(() => {}); }, 250);
+    retry.unref();
+    this.#cleanup.set(ownership, retry);
+  }
   #writable(): void { this.#assertOpen(); if (this.#readOnly || this.#writeClosed) throw new Error("存储为只读或写连接已关闭"); }
   #track(handle: SqliteHandle): SqliteHandle { this.#handles.add(handle); return handle; }
   #stat(id: string): SessionPersistenceSnapshot | undefined {
     const row = this.#reader.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(id);
     return row ? metadata(row) : undefined;
   }
-  #beginWrite(owner: SqliteHandle): void {
+  #beginWrite(owner: SqliteHandle, transaction: object): void {
     if (this.#db.isTransaction) throw new Error("其他事务尚未结束");
+    this.#clearEndedTransaction();
     this.#transactionOwner = owner;
+    this.#transaction = transaction;
     this.#db.exec("BEGIN IMMEDIATE");
   }
   #rollbackWrite(owner: SqliteHandle): void {
     // 失败批次的核对可能晚于另一会话开始写入，只有原所有者可以回滚其事务。
-    if (this.#transactionOwner !== owner || this.#writeClosed || !this.#db.isTransaction) return;
-    this.#db.exec("ROLLBACK");
+    if (this.#transactionOwner !== owner) return;
+    if (this.#writeClosed || !this.#db.isTransaction) { this.#clearEndedTransaction(); return; }
+    try { this.#db.exec("ROLLBACK"); } finally { this.#clearEndedTransaction(); }
     if (this.#db.isTransaction) throw new Error("原事务尚未结束");
   }
   #abortWriteConnection(owner: SqliteHandle): void {
     if (this.#transactionOwner === owner && !this.#writeClosed && this.#db.isTransaction) {
-      this.#db.close();
-      this.#writeClosed = true;
+      try { this.#db.close(); }
+      finally { if (!this.#db.isOpen) this.#writeClosed = true; this.#clearEndedTransaction(); }
     }
+  }
+  #clearEndedTransaction(): void {
+    if (this.#writeClosed || !this.#db.isTransaction) { this.#transactionOwner = undefined; this.#transaction = undefined; }
   }
 }
 
@@ -258,9 +386,31 @@ class SqliteHandle implements SessionHandle {
   #pending?: Pending;
   #writer?: SessionWriter;
   #session?: Session;
+  #creationTransaction?: object;
   constructor(private readonly store: HandleStorage, readonly header: SessionHeader, readonly access: SessionAccess,
     readonly inheritedEventCount: number, private readonly ownership: Ownership | undefined, public published: boolean) { this.id = header.sessionId; }
   get writer(): SessionWriter | undefined { return this.#closing ? undefined : this.#writer; }
+
+  async confirmCreationEnded(): Promise<boolean> {
+    if (!this.#closing) return false;
+    try { await this.#closing; } catch { /* 关闭失败后仍须核实事务。 */ }
+    return this.store.confirmCreationEnded(this, this.#creationTransaction);
+  }
+
+  creationVerifier(): () => Promise<"committed" | "failed" | "unknown"> {
+    return async () => {
+      try {
+        const first = this.store.readFresh(this.id);
+        if (first) return isDeepStrictEqual(first.header, this.header) ? "committed" : "unknown";
+        if (!await this.confirmCreationEnded()) return "unknown";
+        const second = this.store.readFresh(this.id);
+        if (second) return isDeepStrictEqual(second.header, this.header) ? "committed" : "unknown";
+        if (!this.#closing) return "unknown";
+        try { if (this.ownership) await this.store.release(this.ownership); } catch { return "unknown"; }
+        return "failed";
+      } catch { return "unknown"; }
+    };
+  }
 
   bindWriter(session: Session, reportError?: (error: unknown) => void): void {
     this.#check(true);
@@ -395,14 +545,16 @@ class SqliteHandle implements SessionHandle {
     } catch (error) {
       this.store.abortWriteConnection(this);
       throw error;
-    } finally { this.store.forget(this); await this.ownership?.release(); }
+    } finally { this.store.forget(this); if (this.ownership) await this.store.release(this.ownership); }
   }
   #commit(batch: Pending): void {
     const db = this.store.db;
     if (db.isTransaction) throw new Error("其他事务尚未结束");
     this.#pending = batch;
     try {
-      this.store.beginWrite(this);
+      const transaction = {};
+      if (batch.first) this.#creationTransaction = transaction;
+      this.store.beginWrite(this, transaction);
       if (batch.staged) {
         const meta = db.prepare("SELECT * FROM mh_sessions WHERE session_id=?").get(this.id);
         const rows = db.prepare("SELECT COUNT(*) AS count, MIN(seq) AS first, MAX(seq) AS last FROM mh_events WHERE session_id=?").get(this.id);
@@ -416,11 +568,14 @@ class SqliteHandle implements SessionHandle {
         batch.preflightFailed = false;
       }
       if (batch.first) db.prepare("INSERT INTO mh_sessions VALUES (?, ?, ?, 0)").run(this.id, JSON.stringify(this.header), this.inheritedEventCount);
+      if (batch.first && batch.events.length === 0 && db.prepare("PRAGMA user_version").get()?.user_version === 2) {
+        db.prepare("INSERT INTO mh_session_list_metadata VALUES (?, 1, NULL, 0, 0)").run(this.id);
+      }
       const insert = db.prepare("INSERT INTO mh_events VALUES (?, ?, ?)");
       for (const event of batch.events) insert.run(this.id, event.seq, JSON.stringify(event));
       const result = db.prepare("UPDATE mh_sessions SET event_count=? WHERE session_id=? AND event_count=?").run(batch.start + batch.events.length, this.id, batch.start);
       if (result.changes !== 1) throw new Error("持久游标冲突");
-      db.exec("COMMIT");
+      try { db.exec("COMMIT"); } finally { this.store.clearEndedTransaction(); }
       this.published = true;
       this.#pending = undefined;
     } catch (error) {

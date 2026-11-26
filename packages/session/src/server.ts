@@ -3,7 +3,7 @@ export { createPersistedSession, readPersistedSessionHistory } from "./api/use-c
 export { SessionStore } from "./storage/sqlite.ts";
 export type { AcceptTurnResult, SessionHistory, SessionUpdate } from "./storage/sqlite.ts";
 export { SessionPersistence } from "./persistence.ts";
-export type { SessionAccess, SessionHandle, SessionPersistenceCreateOptions, SessionPersistenceSnapshot } from "./persistence.ts";
+export type { SessionAccess, SessionHandle, SessionListMetadata, SessionPersistenceCreateOptions, SessionPersistenceSnapshot } from "./persistence.ts";
 export { projectInterruptedSession, recoverInterruptedSession } from "./recovery.ts";
 export { Session, SessionStore as MemorySessionStore } from "./session.ts";
 export { selectForkCut } from "./fork.ts";

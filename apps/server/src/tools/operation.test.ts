@@ -1,3 +1,4 @@
+import { SessionDirectory } from "../session/directory.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -92,7 +93,7 @@ test("已接受 follow 和提交后 HTTP 历史保留同一操作前缀", async 
   persistence.bindWriter(handle, session);
   const agent = new ReActAgent(session, async () => {}, handle);
   const agents = { get: () => agent, onLoaded: () => () => {} };
-  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents);
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) }, agents, () => new SessionDirectory());
   const abort = new AbortController();
   const follow = followSession(agents, async () => undefined, "s", abort.signal);
   try {

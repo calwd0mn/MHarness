@@ -114,6 +114,8 @@ export class Session {
   #surface: SurfaceNode[] = [];
   #messages: SessionMessage[] | undefined = [];
   #replaceGeneration = 0;
+  #listBlank = true;
+  #lastPromptAt: number | null = null;
 
   /** 此 Session 持有的独立元数据快照。 */
   readonly header: SessionHeader;
@@ -164,6 +166,11 @@ export class Session {
   /** 已接受的事件数，也是下一次追加分配的位置。 */
   get seq(): number {
     return this.#events.length;
+  }
+
+  /** @returns 已接受事件的目录投影；活动时间仅包含真实用户消息。 */
+  get listMetadata(): Readonly<{ blank: boolean; lastPromptAt: number | null }> {
+    return { blank: this.#listBlank, lastPromptAt: this.#lastPromptAt };
   }
 
   /**
@@ -265,6 +272,8 @@ export class Session {
     draft.#surface = this.#surface.slice();
     draft.#messages = this.#messages?.slice();
     draft.#replaceGeneration = this.#replaceGeneration;
+    draft.#listBlank = this.#listBlank;
+    draft.#lastPromptAt = this.#lastPromptAt;
     const candidates = build(this.seq);
     if (!Array.isArray(candidates as unknown) || candidates.length === 0) throw new Error("写入批次不能为空");
     let endIds: Set<string> | undefined;
@@ -289,6 +298,8 @@ export class Session {
     this.#surface = draft.#surface;
     this.#messages = draft.#messages;
     this.#replaceGeneration = draft.#replaceGeneration;
+    this.#listBlank = draft.#listBlank;
+    this.#lastPromptAt = draft.#lastPromptAt;
   }
 
   #accept(event: SessionEvent): void {
@@ -319,6 +330,8 @@ export class Session {
     if ("surfaceOp" in event) this.#acceptSurface(event);
     recordToolCall?.();
     this.#events.push(event);
+    if (event.type === "turn/start") this.#listBlank = false;
+    if (event.type === "user/message" && event.data.source.kind === "user") this.#lastPromptAt = Math.max(this.#lastPromptAt ?? 0, event.time);
   }
 
   #assertPruneComplete(): void {

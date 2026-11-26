@@ -29,6 +29,7 @@ import { createDeepSeekAdapter } from "./model/providers/deepseek.ts";
 import type { ModelConfig } from "./model/runtime.ts";
 import { LlmRuntime } from "./model/runtime.ts";
 import { registerSessionRoutes } from "./session/routes.ts";
+import { SessionDirectory } from "./session/directory.ts";
 import { ApprovalService } from "./approval/service.ts";
 import { registerApprovalRoutes } from "./approval/routes.ts";
 
@@ -197,6 +198,12 @@ export async function createEventSessionApp(path: string, logger = false, runTur
     await ownership.release();
     throw error;
   }
+  try {
+    persistence.upgradeDirectoryMetadata();
+  } catch (error) {
+    try { await persistence.close(); } finally { await ownership.release(); }
+    throw error;
+  }
   const app = createHttpApp(logger, true);
   const approvalService = options.approvalService ?? new ApprovalService();
   const runtime = new LlmRuntime({ mock: { ...createMockAdapter((request) => {
@@ -231,6 +238,8 @@ export async function createEventSessionApp(path: string, logger = false, runTur
       reason => warnCompaction(context, "context-overflow", reason)),
   });
   const agents = new AgentManager(persistence, driver);
+  let directory = new SessionDirectory();
+  agents.onSessionCreated((session) => directory.register(session));
   const commands = new SessionCommandController(agents, () => {
     const businessModel = runtime.prepare(configuredModel(), { recordable: true });
     const businessTools = options.toolRegistry?.definitions() ?? [];
@@ -252,9 +261,11 @@ export async function createEventSessionApp(path: string, logger = false, runTur
         await handle.close();
       }
     }
+    directory = await SessionDirectory.restore(persistence);
     recovered = true;
   });
   app.addHook("preClose", async () => {
+    commands.creationController(persistence, () => directory).close();
     // 活动 /compact 要先收到取消才能结束 HTTP 请求，关闭错误由 onClose 汇总。
     void agents.close().catch(() => {});
   });
@@ -269,7 +280,7 @@ export async function createEventSessionApp(path: string, logger = false, runTur
       await ownership.release();
     }
   });
-  registerSessionRoutes(app, sessionsPath, persistence, commands, agents);
+  registerSessionRoutes(app, sessionsPath, persistence, commands, agents, () => directory);
   registerApprovalRoutes(app, sessionsPath, persistence, agents, approvalService);
   return app;
 }

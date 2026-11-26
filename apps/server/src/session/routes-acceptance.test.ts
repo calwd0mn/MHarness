@@ -13,18 +13,191 @@ import { ReActAgent } from "../agent/react-agent.ts";
 import { createEventSessionApp } from "../app.ts";
 import { injectCompactionSqliteFault } from "./compaction-settlement-sqlite-fixture.ts";
 import { compactResponseSchema, rawSessionHistorySchema } from "@mharness/session/contracts";
-import { Session } from "@mharness/session/server";
+import { Session, type SessionPersistence } from "@mharness/session/server";
 import { SessionCommandController } from "../commands.ts";
 import { defineLocalTool, ToolRegistry } from "../tools/registry.ts";
 import { defineLocalToolOutput } from "../tools/result.ts";
 import { registerSessionRoutes } from "./routes.ts";
+import { SessionDirectory } from "./directory.ts";
+
+test("创建提交前可见，失败后撤回且查询不加载 Agent", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-directory-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  let unblock!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { unblock = resolve; });
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+    const handle = await create(header);
+    t.mock.method(handle, "flush", async () => { entered(); await gate; throw new Error("flush fault"); });
+    return handle;
+  });
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, {
+    prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
+  }, { get: () => { throw new Error("不应加载 Agent"); }, onLoaded: () => () => {} }, () => directory);
+  const post = app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  await reached;
+  const during = await app.inject({ method: "GET", url: "/api/sessions" });
+  assert.equal(during.statusCode, 200);
+  assert.equal(during.json().revision, 1);
+  assert.equal(during.json().sessions.length, 1);
+  const pendingId: string = during.json().sessions[0].sessionId;
+  assert.equal((await app.inject({ method: "GET", url: `/api/sessions/${pendingId}` })).statusCode, 404);
+  assert.equal((await app.inject({ method: "GET", url: "/api/sessions" })).json().revision, 1);
+  unblock();
+  assert.equal((await post).statusCode, 500);
+  const after = await app.inject({ method: "GET", url: "/api/sessions" });
+  assert.deepEqual(after.json(), { revision: 2, sessions: [] });
+});
+
+test("历史 GET 缺失不会裁决未知创建结果", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-unknown-directory-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+    const handle = await create(header);
+    t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+    handle.creationVerifier = () => async () => "unknown";
+    return handle;
+  });
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, {
+    prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  const response = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  assert.equal(response.statusCode, 503);
+  const { sessionId } = response.json() as { sessionId: string };
+  const open = persistence.open.bind(persistence);
+  const fault = t.mock.method(persistence, "open", async () => { throw new Error("read fault"); });
+  assert.equal((await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` })).statusCode, 500);
+  assert.equal(directory.snapshot().revision, 1);
+  fault.mock.restore();
+  assert.equal((await open(sessionId, "read")), undefined);
+  assert.equal((await app.inject({ method: "GET", url: `/api/sessions/${sessionId}` })).statusCode, 404);
+  assert.equal(directory.snapshot().revision, 1);
+  assert.equal(directory.snapshot().sessions.length, 1);
+});
+
+test("服务重启从已提交头恢复目录且重置版本", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-directory-restart-"));
+  const path = join(dir, "events.sqlite");
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const first = await createEventSessionApp(path);
+  const created = await first.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  const { sessionId } = created.json() as { sessionId: string };
+  assert.equal((await first.inject({ method: "GET", url: "/api/sessions" })).json().revision, 1);
+  await first.close();
+  const second = await createEventSessionApp(path);
+  try {
+    const snapshot = (await second.inject({ method: "GET", url: "/api/sessions" })).json();
+    assert.equal(snapshot.revision, 0);
+    assert.equal(snapshot.sessions.length, 1);
+    assert.equal(snapshot.sessions[0].sessionId, sessionId);
+    assert.equal(snapshot.sessions[0].blank, true);
+  } finally { await second.close(); }
+});
+
+test("旧分支的无效父 ID 不阻断服务重启后的目录", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mharness-directory-legacy-parent-"));
+  const path = join(dir, "events.sqlite");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const persistence = new SqliteSessionPersistence(path);
+  const parentSession = "parent\u0000old";
+  const branch = new Session({ sessionId: "branch", createdAt: 2, isSeeded: true, parentSession },
+    { seed: { kind: "fork", events: [] } });
+  try {
+    const ordinaryHandle = await persistence.create({ sessionId: "ordinary", createdAt: 1 });
+    try { await ordinaryHandle.flush(); } finally { await ordinaryHandle.close(); }
+    const branchHandle = await persistence.create(branch.header, { inheritedEventCount: branch.inheritedEventCount });
+    try { await branchHandle.append(branch.snapshot().events); } finally { await branchHandle.close(); }
+  } finally { await persistence.close(); }
+
+  const app = await createEventSessionApp(path);
+  try {
+    const response = await app.inject({ method: "GET", url: "/api/sessions" });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), { revision: 0, sessions: [
+      { sessionId: "branch", createdAt: 2, updatedAt: 2, running: false, blank: false },
+      { sessionId: "ordinary", createdAt: 1, updatedAt: 1, running: false, blank: false },
+    ] });
+  } finally { await app.close(); }
+
+  const reopened = new SqliteSessionPersistence(path, { readOnly: true });
+  try {
+    const saved = await reopened.stat("branch");
+    assert.equal(saved?.header.parentSession, parentSession);
+  } finally { await reopened.close(); }
+});
+
+test("创建会话按实际提交结果响应，关闭失败单独记录", async (t) => {
+  for (const scenario of [
+    { name: "提交成功后关闭失败", commit: true, flushFails: false, closeFails: true, statFails: false, status: 201 },
+    { name: "提交报错但已写入", commit: true, flushFails: true, closeFails: false, statFails: false, status: 201 },
+    { name: "确认未写入", commit: false, flushFails: true, closeFails: true, statFails: false, status: 500 },
+    { name: "暂时无法核实", commit: true, flushFails: true, closeFails: false, statFails: true, status: 503 },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const dir = await mkdtemp(join(tmpdir(), "mharness-create-"));
+      const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+      const app = Fastify();
+      t.after(async () => {
+        await app.close();
+        await persistence.close();
+        await rm(dir, { recursive: true, force: true });
+      });
+      const logged = t.mock.method(app.log, "error");
+      const create = persistence.create.bind(persistence);
+      let createdId: string | undefined;
+      t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+        createdId = header.sessionId;
+        const handle = await create(header);
+        const flush = handle.flush.bind(handle);
+        const close = handle.close.bind(handle);
+        t.mock.method(handle, "flush", async () => {
+          if (scenario.commit) await flush();
+          if (scenario.flushFails) throw new Error("flush fault");
+        });
+        t.mock.method(handle, "close", async () => {
+          await close();
+          if (scenario.closeFails) throw new Error("close fault");
+        });
+        if (scenario.statFails) handle.creationVerifier = () => async () => "unknown";
+        return handle;
+      });
+      const directory = new SessionDirectory();
+      registerSessionRoutes(app, "/api/sessions", persistence, {
+        prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }),
+      }, { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+
+      const response = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+      assert.ok(createdId);
+      assert.equal(response.statusCode, scenario.status);
+      assert.equal(logged.mock.calls.some((call) => call.arguments[1] === "关闭新会话句柄失败"), scenario.closeFails);
+      assert.deepEqual(response.json(), scenario.status === 201 ? { sessionId: createdId }
+        : scenario.status === 503 ? { code: "session_creation_unknown", sessionId: createdId }
+        : { code: "session_creation_failed" });
+      assert.equal(directory.snapshot().revision, scenario.status === 500 ? 2 : 1);
+      assert.equal(directory.snapshot().sessions.length, scenario.status === 500 ? 0 : 1);
+      const recovered = await app.inject({ method: "GET", url: `/api/sessions/${createdId}` });
+      assert.equal(recovered.statusCode, scenario.commit ? 200 : 404);
+      assert.equal(directory.snapshot().revision, scenario.status === 500 ? 2 : 1);
+      assert.equal((await persistence.list()).length, Number(scenario.commit));
+    });
+  }
+});
 
 test("维护任务占用期间会话取消传递信号并等待任务退出", { timeout: 8000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "mharness-maintenance-"));
   const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
   const manager = new AgentManager(persistence, async () => {});
   const app = Fastify();
-  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
   let release: (() => void) | undefined;
   try {
     const handle = await persistence.create({ sessionId: "s", createdAt: 1 });
@@ -81,7 +254,7 @@ test("命令路由校验请求并映射受理、忙碌和未知会话", async ()
       if (id === "missing") throw new AgentError("session/not-found");
       return { accept: true };
     },
-  }, { get: () => undefined, onLoaded: () => () => {} });
+  }, { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
   try {
     const content = [{ type: "text", text: "hello" }];
     const post = (id: string, requestId: string) => app.inject({ method: "POST", url: `/api/sessions/${id}/messages`, payload: { requestId, content } });
@@ -112,7 +285,7 @@ test("真实 SSE 首帧快照读取失败只发送一个安全终止帧", { time
   const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
   const app = Fastify();
   const manager = new AgentManager(persistence, async () => {});
-  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
   try {
     persistence.open = async () => { throw new Error("private-storage-secret"); };
     const origin = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -278,7 +451,7 @@ test("创建、历史和 follow 不加载 Agent", { timeout: 8000 }, async () =>
   const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
   const manager = new AgentManager(persistence, async () => {});
   const app = Fastify();
-  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
   const controller = new AbortController();
   try {
     const origin = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -330,7 +503,7 @@ for (const failSettlement of [false, true]) {
       try { await driver(context); } finally { context.session.append = append; }
     });
     const app = Fastify();
-    registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+    registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
     const controller = new AbortController();
     try {
       const origin = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -1040,6 +1213,12 @@ test("真实启动应用的 fork 历史和 follow 保留原事件，继承编号
     const commands = app.getDecorator<SessionCommandController>("sessionCommands");
     const { sessionId } = await commands.fork({ sessionId: "parent", atSeq: 2 });
     assert.equal(calls.length, 0);
+    const directory = (await app.inject({ method: "GET", url: "/api/sessions" })).json();
+    assert.equal(directory.revision, 1);
+    const child = directory.sessions.find((item: { sessionId: string }) => item.sessionId === sessionId);
+    assert.equal(child.parentSessionId, "parent");
+    assert.equal(child.blank, false);
+    assert.equal(child.updatedAt, Math.max(child.createdAt, seed[2].time));
     const url = `/api/sessions/${sessionId}`;
     const get = await app.inject({ method: "GET", url });
     assert.equal(get.statusCode, 200);
@@ -1099,7 +1278,7 @@ test("HTTP 受理不等待首步，重发去重且新请求保持忙碌", async 
     session.append({ type: "turn/end", data: { turn, reason: { kind: "completed" } } });
   });
   const app = Fastify();
-  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
   try {
     const handle = await persistence.create({ sessionId: "s", createdAt: 1 }); await handle.flush(); await handle.close();
     const post = (requestId: string, text: string) => app.inject({ method: "POST", url: "/api/sessions/s/messages", payload: { requestId, content: [{ type: "text", text }] } });
@@ -1125,7 +1304,7 @@ test("真实 SSE 在 pre-step 等待时交付受理前缀并在开步后发布�
   const driver = createModelTurnDriver({ runtime: new LlmRuntime({ mock: createMockAdapter(() => { calls++; return [{ chunk: { type: "text", delta: "答" } }, { chunk: { type: "finish", reason: { kind: "stop" } } }]; }) }),
     config: () => ({ provider: "mock", model: "m" }), systemPrompt: () => "", preStep: async () => { entered(); await gate; } });
   const manager = new AgentManager(persistence, driver); const app = Fastify();
-  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => new SessionDirectory());
   const controller = new AbortController();
   try {
     const origin = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -1149,4 +1328,503 @@ test("真实 SSE 在 pre-step 等待时交付受理前缀并在开步后发布�
     assert.equal(calls, 1); await first.reader.cancel(); await second.reader.cancel();
     const agent = manager.get(sessionId); assert.ok(agent); await agent.waitForIdle();
   } finally { release(); controller.abort(); await app.close(); await manager.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("目录 GET 读取已提交清单并传播读取失败", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-list-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const handle = await persistence.create({ sessionId: "cold", createdAt: 10 });
+  await handle.flush(); await handle.close();
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => new SessionDirectory());
+  const response = await app.inject({ method: "GET", url: "/api/sessions" });
+  assert.deepEqual(response.json(), { revision: 0, sessions: [{ sessionId: "cold", createdAt: 10, updatedAt: 10, running: false, blank: false }] });
+  t.mock.method(persistence, "list", async () => { throw new Error("list fault"); });
+  assert.equal((await app.inject({ method: "GET", url: "/api/sessions" })).statusCode, 500);
+});
+
+test("目录 GET 对同 ID 身份冲突采用已提交的冷摘要", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-identity-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  persistence.upgradeDirectoryMetadata();
+  const header = { sessionId: "same", createdAt: 10 };
+  const handle = await persistence.create(header);
+  await handle.flush();
+  await handle.close();
+
+  const online = new Session({ ...header, createdAt: 20 });
+  online.append({ type: "turn/start", time: 21, data: { turn: 1 } });
+  const agent = new ReActAgent(online, async () => {}, handle);
+  t.mock.getter(agent, "state", () => "running");
+  const diagnostic = t.mock.method(console, "error", () => {});
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence,
+    { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => agent, onLoaded: () => () => {} }, () => directory);
+
+  const response = await app.inject({ method: "GET", url: "/api/sessions" });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), { revision: 0, sessions: [{ ...header, updatedAt: 10, running: false, blank: true }] });
+  assert.equal(diagnostic.mock.calls.length, 1);
+});
+
+test("已提交但未发布 Agent 的分支由目录 GET 补齐且不推进版本", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-unpublished-fork-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const manager = new AgentManager(persistence, async () => {});
+  const directory = new SessionDirectory();
+  const app = Fastify();
+  let committed!: () => void;
+  let releasePublication!: () => void;
+  const reached = new Promise<void>((resolve) => { committed = resolve; });
+  const gate = new Promise<void>((resolve) => { releasePublication = resolve; });
+  t.after(async () => {
+    releasePublication();
+    await app.close(); await manager.close(); await persistence.close(); await rm(dir, { recursive: true, force: true });
+  });
+  manager.onSessionCreated((session) => directory.register(session));
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    const append = handle.append.bind(handle);
+    t.mock.method(handle, "append", async (...batch: Parameters<typeof append>) => {
+      await append(...batch);
+      committed();
+      await gate;
+    });
+    return handle;
+  });
+  const load = t.mock.method(manager, "load", async () => { throw new Error("目录查询不应加载 Agent"); });
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => directory);
+  const header = { sessionId: "child", createdAt: 42, isSeeded: true, parentSession: "parent" } as const;
+  const fork = manager.initializeFork(header, async () => []);
+  try {
+    await Promise.race([reached, fork.then(() => { throw new Error("未拦截分支发布"); })]);
+    assert.equal(manager.get(header.sessionId), undefined);
+    const response = await app.inject({ method: "GET", url: "/api/sessions" });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), { revision: 0, sessions: [
+      { sessionId: "child", createdAt: 42, updatedAt: 42, running: false, blank: false, parentSessionId: "parent" },
+    ] });
+    assert.equal(manager.get(header.sessionId), undefined);
+    assert.equal(load.mock.calls.length, 0);
+    assert.equal(directory.snapshot().revision, 0);
+  } finally {
+    releasePublication();
+    await fork;
+  }
+  assert.ok(manager.get(header.sessionId));
+  assert.equal(directory.snapshot().revision, 1);
+});
+
+test("并发创建确认后，旧清单请求重读并覆盖注册版本", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-handoff-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const directory = new SessionDirectory();
+  const list = persistence.list.bind(persistence);
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  let calls = 0;
+  t.mock.method(persistence, "list", async () => {
+    const result = await list();
+    if (++calls === 1) { entered(); await gate; }
+    return result;
+  });
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  const first = app.inject({ method: "GET", url: "/api/sessions" });
+  await reached;
+  const created = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  assert.equal(created.statusCode, 201);
+  release();
+  const snapshot = (await first).json();
+  assert.equal(calls, 2);
+  assert.equal(snapshot.revision, 1);
+  assert.equal(snapshot.sessions.length, 1);
+  assert.equal(snapshot.sessions[0].sessionId, created.json().sessionId);
+});
+
+test("未知创建结果由后台核实并撤回，无需历史请求", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-background-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+    const handle = await create(header);
+    t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+    handle.creationVerifier = () => verify;
+    return handle;
+  });
+  let calls = 0;
+  const verify = async (): Promise<"failed" | "unknown"> => ++calls === 1 ? "unknown" : "failed";
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  const response = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  assert.equal(response.statusCode, 503);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(directory.snapshot(), { revision: 2, sessions: [] });
+});
+
+test("缺少目录依赖时路由装配失败", () => {
+  const app = Fastify();
+  assert.throws(() => registerSessionRoutes(app, "/api/sessions", {} as SessionPersistence,
+    { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, undefined as unknown as () => SessionDirectory), /目录/);
+});
+
+test("应用关闭后迟到的创建核实结果不会改变目录", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-verify-close-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+    const handle = await create(header);
+    t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+    handle.creationVerifier = () => verify;
+    return handle;
+  });
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  let calls = 0;
+  const verify = async (): Promise<"failed" | "unknown"> => {
+    if (++calls === 1) return "unknown";
+    if (calls === 2) { entered(); await gate; }
+    return "failed";
+  };
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  assert.equal((await app.inject({ method: "POST", url: "/api/sessions", payload: {} })).statusCode, 503);
+  await reached;
+  await app.close();
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(directory.snapshot().revision, 1);
+  assert.equal(directory.snapshot().sessions.length, 1);
+});
+
+test("提交前开始的历史缺失结果迟到时不撤回待核实项", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-delayed-history-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  let id = "";
+  let prepared!: () => void;
+  let resume!: () => void;
+  const ready = new Promise<void>((resolve) => { prepared = resolve; });
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  t.mock.method(persistence, "create", async (header: Parameters<typeof create>[0]) => {
+    id = header.sessionId;
+    const handle = await create(header);
+    t.mock.method(handle, "flush", async () => { prepared(); await gate; throw new Error("flush fault"); });
+    handle.creationVerifier = () => async () => "unknown";
+    return handle;
+  });
+  let releaseRead!: () => void;
+  let readEntered!: () => void;
+  const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const readReady = new Promise<void>((resolve) => { readEntered = resolve; });
+  const open = persistence.open.bind(persistence);
+  t.mock.method(persistence, "open", async (...args: Parameters<typeof open>) => {
+    const result = await open(...args);
+    readEntered(); await readGate;
+    return result;
+  });
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  const post = app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+  await ready;
+  const history = app.inject({ method: "GET", url: `/api/sessions/${id}` });
+  await readReady;
+  resume();
+  assert.equal((await post).statusCode, 503);
+  releaseRead();
+  assert.equal((await history).statusCode, 404);
+  assert.equal(directory.snapshot().revision, 1);
+  assert.equal(directory.snapshot().sessions.length, 1);
+});
+
+test("创建控制器合并同一意图并拒绝同标识不同身份", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-controller-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  t.after(async () => { await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  let creates = 0;
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (...args: Parameters<typeof create>) => {
+    creates++;
+    const handle = await create(...args);
+    const flush = handle.flush.bind(handle);
+    t.mock.method(handle, "flush", async () => { entered(); await gate; await flush(); });
+    return handle;
+  });
+  const { SessionCreationController } = await import("../commands.ts");
+  const directory = new SessionDirectory();
+  const controller = new SessionCreationController(persistence, () => directory);
+  const header = { sessionId: "same", createdAt: 1 };
+  const first = controller.create(header);
+  await reached;
+  const second = controller.create(header);
+  assert.equal((await controller.create({ ...header, createdAt: 2 })).status, "conflict");
+  release();
+  assert.equal((await first).status, "committed");
+  assert.equal((await second).status, "committed");
+  assert.equal(creates, 1);
+  assert.equal(directory.snapshot().revision, 1);
+  controller.close();
+});
+
+test("未知创建重复调用共享结果与核实任务，失败后允许重试", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-retry-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  t.after(async () => { await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  let creates = 0;
+  let checks = 0;
+  t.mock.method(persistence, "create", async (...args: Parameters<typeof create>) => {
+    creates++;
+    const handle = await create(...args);
+    if (creates === 1) {
+      t.mock.method(handle, "flush", async () => { throw new Error("flush fault"); });
+      handle.creationVerifier = () => async () => ++checks === 1 ? "unknown" : "failed";
+    }
+    return handle;
+  });
+  const { SessionCreationController } = await import("../commands.ts");
+  const directory = new SessionDirectory();
+  const controller = new SessionCreationController(persistence, () => directory);
+  t.after(() => controller.close());
+  const header = { sessionId: "same", createdAt: 1 };
+  assert.equal((await controller.create(header)).status, "unknown");
+  assert.equal((await controller.create(header)).status, "unknown");
+  assert.equal(creates, 1);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(checks, 2);
+  assert.equal(directory.snapshot().revision, 2);
+  assert.equal((await controller.create(header)).status, "committed");
+  assert.equal(creates, 2);
+  assert.equal(directory.snapshot().revision, 3);
+});
+
+test("后台确认提交后同意图返回已提交结果", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-confirm-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  t.after(async () => { await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    const flush = handle.flush.bind(handle);
+    t.mock.method(handle, "flush", async () => { await flush(); throw new Error("丢失回执"); });
+    let checks = 0;
+    handle.creationVerifier = () => async () => ++checks === 1 ? "unknown" : "committed";
+    return handle;
+  });
+  const { SessionCreationController } = await import("../commands.ts");
+  const directory = new SessionDirectory();
+  const controller = new SessionCreationController(persistence, () => directory);
+  t.after(() => controller.close());
+  const header = { sessionId: "same", createdAt: 1 };
+  assert.equal((await controller.create(header)).status, "unknown");
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal((await controller.create(header)).status, "committed");
+  assert.equal(directory.snapshot().revision, 1);
+});
+
+test("真实请求跨越关闭进入未知后不再调度核实", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-create-network-close-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const app = Fastify();
+  t.after(async () => { await app.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  let entered!: () => void;
+  let release!: () => void;
+  let closingEntered!: () => void;
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const closingReached = new Promise<void>((resolve) => { closingEntered = resolve; });
+  let checks = 0;
+  const create = persistence.create.bind(persistence);
+  t.mock.method(persistence, "create", async (...args: Parameters<typeof create>) => {
+    const handle = await create(...args);
+    t.mock.method(handle, "flush", async () => { entered(); await gate; throw new Error("flush fault"); });
+    handle.creationVerifier = () => async () => { checks++; return "unknown"; };
+    return handle;
+  });
+  const directory = new SessionDirectory();
+  registerSessionRoutes(app, "/api/sessions", persistence, { prompt: async () => ({ accepted: true }), cancel: async () => ({ accept: true }) },
+    { get: () => undefined, onLoaded: () => () => {} }, () => directory);
+  app.addHook("preClose", async () => { closingEntered(); });
+  const address = await app.listen({ port: 0, host: "127.0.0.1" });
+  const post = fetch(`${address}/api/sessions`, { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: "{}" });
+  await reached;
+  const closing = app.close();
+  await closingReached;
+  release();
+  assert.equal((await post).status, 503);
+  await closing;
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(checks, 1);
+  assert.equal(directory.snapshot().revision, 1);
+});
+
+test("真实 GET 挂起时合并在线运行与维护状态及活动时间且不加载或写入", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mh-directory-live-network-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  for (const id of ["running", "maintenance"]) {
+    const handle = await persistence.create({ sessionId: id, createdAt: 1 });
+    await handle.flush(); await handle.close();
+  }
+  let releaseWork!: () => void;
+  const workGate = new Promise<void>((resolve) => { releaseWork = resolve; });
+  const manager = new AgentManager(persistence, async () => { await workGate; });
+  const running = await manager.load("running");
+  const maintenance = await manager.load("maintenance");
+  const app = Fastify();
+  t.after(async () => { releaseWork(); await app.close(); await manager.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); });
+  const directory = await SessionDirectory.restore(persistence);
+  registerSessionRoutes(app, "/api/sessions", persistence, new SessionCommandController(manager), manager, () => directory);
+  let entered!: () => void;
+  let releaseList!: () => void;
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { releaseList = resolve; });
+  const list = persistence.list.bind(persistence);
+  t.mock.method(persistence, "list", async () => { const snapshot = await list(); entered(); await gate; return snapshot; });
+  const load = t.mock.method(manager, "load", async () => { throw new Error("GET 不应加载"); });
+  const open = t.mock.method(persistence, "open", async () => { throw new Error("GET 不应读取事件"); });
+  const create = t.mock.method(persistence, "create", async () => { throw new Error("GET 不应写入"); });
+  const address = await app.listen({ port: 0, host: "127.0.0.1" });
+  const request = fetch(`${address}/api/sessions`, { headers: { connection: "close" } });
+  await reached;
+  const work = maintenance.runMaintenance(async () => { await workGate; });
+  await running.prompt({ requestId: "r", content: [{ type: "text", text: "你好" }] });
+  releaseList();
+  const response = await request;
+  assert.equal(response.status, 200);
+  const body = await response.json() as { revision: number; sessions: Array<{ sessionId: string; running: boolean; blank: boolean; updatedAt: number }> };
+  assert.equal(body.revision, 0);
+  const active = body.sessions.find((item) => item.sessionId === "running");
+  const maintained = body.sessions.find((item) => item.sessionId === "maintenance");
+  assert.equal(active?.running, true);
+  assert.equal(active?.blank, false);
+  assert.ok((active?.updatedAt ?? 0) > 1);
+  assert.equal(maintained?.running, false);
+  assert.equal(load.mock.calls.length, 0);
+  assert.equal(open.mock.calls.length, 0);
+  assert.equal(create.mock.calls.length, 0);
+  releaseWork();
+  await work;
+});
+
+test("创建已提交时锁释放故障不改变 201，恢复后首次消息取得写入权", async (t) => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = await mkdtemp(join(tmpdir(), "mharness-create-lock-retry-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const manager = new AgentManager(persistence, async () => {});
+  const app = Fastify();
+  const commands = new SessionCommandController(manager);
+  registerSessionRoutes(app, "/api/sessions", persistence, commands, manager, () => new SessionDirectory());
+  const exec = DatabaseSync.prototype.exec;
+  const close = DatabaseSync.prototype.close;
+  let lock: InstanceType<typeof DatabaseSync> | undefined;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+    exec.call(this, sql);
+    if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE" && !lock) lock = this;
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: InstanceType<typeof DatabaseSync>) {
+    if (fail && this === lock) throw new Error("lock close fault");
+    return close.call(this);
+  });
+  try {
+    const created = await app.inject({ method: "POST", url: "/api/sessions", payload: {} });
+    assert.equal(created.statusCode, 201);
+    const { sessionId } = created.json() as { sessionId: string };
+    fail = false;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const response = await app.inject({ method: "POST", url: `/api/sessions/${sessionId}/messages`, payload: {
+      requestId: "first", content: [{ type: "text", text: "hello" }],
+    } });
+    assert.equal(response.statusCode, 202);
+  } finally {
+    fail = false;
+    await app.close(); await manager.close(); await persistence.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("创建准备失败时控制器保留同一尝试直到旧锁释放", async (t) => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { SessionCreationController } = await import("../commands.ts");
+  const dir = await mkdtemp(join(tmpdir(), "mharness-prepare-lock-controller-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const controller = new SessionCreationController(persistence, () => new SessionDirectory());
+  const abort = new AbortController();
+  const exec = DatabaseSync.prototype.exec;
+  const close = DatabaseSync.prototype.close;
+  let lock: InstanceType<typeof DatabaseSync> | undefined;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+    exec.call(this, sql);
+    if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE" && !lock) { lock = this; abort.abort(); }
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: InstanceType<typeof DatabaseSync>) {
+    if (fail && this === lock) throw new Error("lock close fault");
+    return close.call(this);
+  });
+  const create = persistence.create.bind(persistence);
+  const override = t.mock.method(persistence, "create", (value: Parameters<typeof create>[0]) => create(value, { signal: abort.signal }));
+  const fixed = { sessionId: "same", createdAt: 1 };
+  try {
+    const first = await controller.create(fixed);
+    assert.equal(first.status, "unknown");
+    assert.equal(await controller.create(fixed), first);
+    await assert.rejects(create(fixed), { name: "OwnershipConflictError" });
+    fail = false;
+    override.mock.restore();
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal((await controller.create(fixed)).status, "committed");
+  } finally { fail = false; controller.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("已提交同 ID 的准备失败核实不移除目录项", async (t) => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { SessionCreationController } = await import("../commands.ts");
+  const dir = await mkdtemp(join(tmpdir(), "mh-existing-create-"));
+  const persistence = new SqliteSessionPersistence(join(dir, "events.sqlite"));
+  const fixed = { sessionId: "same", createdAt: 1 };
+  const existing = await persistence.create(fixed); await existing.flush(); await existing.close();
+  const directory = await SessionDirectory.restore(persistence);
+  const before = directory.snapshot();
+  const controller = new SessionCreationController(persistence, () => directory);
+  const exec = DatabaseSync.prototype.exec; const close = DatabaseSync.prototype.close;
+  let lock: InstanceType<typeof DatabaseSync> | undefined; let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+    exec.call(this, sql); if (sql === "PRAGMA busy_timeout = 0; BEGIN IMMEDIATE") lock = this;
+  });
+  t.mock.method(DatabaseSync.prototype, "close", function (this: InstanceType<typeof DatabaseSync>) {
+    if (fail && this === lock) throw new Error("lock close fault"); return close.call(this);
+  });
+  try {
+    assert.equal((await controller.create(fixed)).status, "unknown");
+    fail = false;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.deepEqual(directory.snapshot(), before);
+  } finally { fail = false; controller.close(); await persistence.close(); await rm(dir, { recursive: true, force: true }); }
 });
